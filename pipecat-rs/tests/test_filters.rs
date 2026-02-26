@@ -358,8 +358,8 @@ async fn test_wake_check_no_wake_word() {
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TranscriptionFrame::new(
-            "test".to_string(),
             "Phrase 1".to_string(),
+            "test".to_string(),
             "".to_string(),
         )),
     ];
@@ -386,13 +386,13 @@ async fn test_wake_check_with_wake_word() {
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TranscriptionFrame::new(
-            "test".to_string(),
             "Hey, Pipecat".to_string(),
+            "test".to_string(),
             "".to_string(),
         )),
         Arc::new(TranscriptionFrame::new(
-            "test".to_string(),
             "Phrase 1".to_string(),
+            "test".to_string(),
             "".to_string(),
         )),
     ];
