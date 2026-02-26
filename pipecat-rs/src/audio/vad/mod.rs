@@ -3,6 +3,8 @@
 
 //! Voice Activity Detection (VAD) subsystem.
 
+pub mod analyzer;
+
 use serde::{Deserialize, Serialize};
 
 /// VAD state machine states.

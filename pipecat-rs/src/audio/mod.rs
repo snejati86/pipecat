@@ -9,4 +9,5 @@ pub mod interruptions;
 pub mod mixers;
 pub mod resamplers;
 pub mod turn;
+pub mod utils;
 pub mod vad;

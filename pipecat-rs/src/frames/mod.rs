@@ -2087,6 +2087,29 @@ impl STTUpdateSettingsFrame {
 impl_frame_display_simple!(STTUpdateSettingsFrame);
 impl_control_uninterruptible_frame!(STTUpdateSettingsFrame);
 
+/// Frame for updating VAD parameters at runtime.
+///
+/// A control frame containing a request to update VAD params. Intended
+/// to be pushed upstream from RTVI processor or other control sources.
+#[derive(Debug)]
+pub struct VADParamsUpdateFrame {
+    pub fields: FrameFields,
+    /// New VAD parameters to apply.
+    pub params: crate::audio::vad::VADParams,
+}
+
+impl VADParamsUpdateFrame {
+    pub fn new(params: crate::audio::vad::VADParams) -> Self {
+        Self {
+            fields: FrameFields::new("VADParamsUpdateFrame"),
+            params,
+        }
+    }
+}
+
+impl_frame_display_simple!(VADParamsUpdateFrame);
+impl_control_frame!(VADParamsUpdateFrame);
+
 declare_simple_frame!(
     /// Base control frame for audio filter operations.
     FilterControlFrame, control

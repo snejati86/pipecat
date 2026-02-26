@@ -3,6 +3,8 @@
 
 //! AI service integrations (LLM, STT, TTS, Vision, Image Generation).
 
+pub mod deepgram;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
