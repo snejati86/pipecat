@@ -634,23 +634,13 @@ impl DeepgramSTTService {
 
 /// Return the current time as an ISO 8601 string.
 fn now_iso8601() -> String {
-    // Use chrono if available; otherwise fall back to a simple SystemTime approach.
-    #[cfg(feature = "chrono")]
-    {
-        chrono::Utc::now().to_rfc3339()
-    }
-
-    #[cfg(not(feature = "chrono"))]
-    {
-        use std::time::SystemTime;
-        let duration = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        // Produce a simple ISO-8601-ish timestamp.
-        let secs = duration.as_secs();
-        let millis = duration.subsec_millis();
-        format!("{}.{:03}Z", secs, millis)
-    }
+    use std::time::SystemTime;
+    let duration = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs();
+    let millis = duration.subsec_millis();
+    format!("{}.{:03}Z", secs, millis)
 }
 
 // ---------------------------------------------------------------------------

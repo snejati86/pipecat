@@ -44,6 +44,8 @@ impl Default for TransportParams {
     }
 }
 
+pub mod websocket;
+
 /// Base trait for transports.
 #[async_trait]
 pub trait Transport: Send + Sync {

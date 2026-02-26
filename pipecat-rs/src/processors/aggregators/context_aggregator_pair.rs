@@ -92,7 +92,6 @@ impl LLMContextAggregatorPair {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[tokio::test]
     async fn pair_shares_context() {

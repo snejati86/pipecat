@@ -648,12 +648,6 @@ mod tests {
         LLMFullResponseEndFrame, LLMFullResponseStartFrame, TextFrame, TranscriptionFrame,
         UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
     };
-    use crate::processors::drive_processor;
-
-    /// Helper to create an Arc<Mutex<dyn FrameProcessor>> from an aggregator.
-    fn wrap_processor<T: FrameProcessor + 'static>(p: T) -> Arc<Mutex<dyn FrameProcessor>> {
-        Arc::new(Mutex::new(p))
-    }
 
     #[tokio::test]
     async fn response_aggregator_accumulates_text() {

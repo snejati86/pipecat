@@ -3,7 +3,9 @@
 
 //! AI service integrations (LLM, STT, TTS, Vision, Image Generation).
 
+pub mod cartesia;
 pub mod deepgram;
+pub mod openai;
 
 use std::sync::Arc;
 
