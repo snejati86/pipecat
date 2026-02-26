@@ -104,13 +104,34 @@ impl Default for FrameProcessorSetup {
 /// Frame processors receive frames, process them, and push results to the
 /// next or previous processor in the chain. Frames are buffered during
 /// processing and forwarded after the processor's lock is released.
+///
+/// # Reducing boilerplate
+///
+/// Most methods have default implementations that delegate to `self.base()` or
+/// `self.base_mut()`. Implementors only need to provide:
+///
+/// - [`base()`](FrameProcessor::base) / [`base_mut()`](FrameProcessor::base_mut) -- accessors for the `BaseProcessor` field.
+/// - [`process_frame()`](FrameProcessor::process_frame) -- the custom frame-handling logic.
+///
+/// Override other methods (e.g. `setup`, `cleanup`, `is_direct_mode`,
+/// `processors`) only when the default delegation is insufficient.
 #[async_trait]
 pub trait FrameProcessor: Send + Sync + fmt::Debug + fmt::Display {
+    /// Return a shared reference to the underlying [`BaseProcessor`].
+    fn base(&self) -> &BaseProcessor;
+
+    /// Return a mutable reference to the underlying [`BaseProcessor`].
+    fn base_mut(&mut self) -> &mut BaseProcessor;
+
     /// Get the unique identifier for this processor.
-    fn id(&self) -> u64;
+    fn id(&self) -> u64 {
+        self.base().id()
+    }
 
     /// Get the name of this processor.
-    fn name(&self) -> &str;
+    fn name(&self) -> &str {
+        self.base().name()
+    }
 
     /// Get the list of sub-processors (for pipelines).
     fn processors(&self) -> Vec<Arc<Mutex<dyn FrameProcessor>>> {
@@ -123,11 +144,13 @@ pub trait FrameProcessor: Send + Sync + fmt::Debug + fmt::Display {
     }
 
     /// Check if direct mode is enabled.
-    fn is_direct_mode(&self) -> bool;
+    fn is_direct_mode(&self) -> bool {
+        self.base().direct_mode
+    }
 
     /// Set up the processor with required components.
     async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        let _ = setup;
+        self.base_mut().observer = setup.observer.clone();
     }
 
     /// Clean up processor resources.
@@ -152,20 +175,30 @@ pub trait FrameProcessor: Send + Sync + fmt::Debug + fmt::Display {
     }
 
     /// Link this processor to the next processor in the pipeline.
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>);
+    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
+        self.base_mut().next = Some(next);
+    }
 
     /// Set the previous processor in the pipeline.
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>);
+    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
+        self.base_mut().prev = Some(prev);
+    }
 
     /// Get a reference to the next processor.
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>>;
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
+        self.base().next.clone()
+    }
 
     /// Get a reference to the previous processor.
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>>;
+    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
+        self.base().prev.clone()
+    }
 
     /// Get mutable access to the pending frames buffer.
     /// This is used by `drive_processor` to drain buffered frames after processing.
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)>;
+    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
+        &mut self.base_mut().pending_frames
+    }
 
     /// Buffer a frame for later forwarding by `drive_processor`.
     /// This is the primary mechanism for processors to send frames to
@@ -305,21 +338,8 @@ impl_base_debug_display!(PassthroughProcessor);
 
 #[async_trait]
 impl FrameProcessor for PassthroughProcessor {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(
         &mut self,
@@ -327,25 +347,5 @@ impl FrameProcessor for PassthroughProcessor {
         direction: FrameDirection,
     ) {
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }

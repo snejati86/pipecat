@@ -107,17 +107,8 @@ impl_base_display!(LLMResponseAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMResponseAggregator {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        false
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Check for LLMFullResponseStartFrame
@@ -175,26 +166,6 @@ impl FrameProcessor for LLMResponseAggregator {
 
         // All other frames pass through
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -288,17 +259,8 @@ impl_base_display!(LLMUserContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMUserContextAggregator {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        false
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // UserStartedSpeakingFrame
@@ -379,26 +341,6 @@ impl FrameProcessor for LLMUserContextAggregator {
 
         // All other frames pass through
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -501,17 +443,8 @@ impl_base_display!(LLMAssistantContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMAssistantContextAggregator {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        false
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // LLMFullResponseStartFrame
@@ -607,26 +540,6 @@ impl FrameProcessor for LLMAssistantContextAggregator {
 
         // All other frames pass through
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

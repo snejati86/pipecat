@@ -59,7 +59,7 @@ use crate::frames::{
     InterruptionFrame, OutputAudioRawFrame, OutputTransportMessageFrame,
 };
 use crate::impl_base_debug_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 use crate::serializers::{FrameSerializer, SerializedFrame};
 use crate::transports::{Transport, TransportParams};
 
@@ -236,7 +236,20 @@ impl WebSocketTransport {
     pub async fn connect(self: &Arc<Self>, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("WebSocketTransport: connecting to {}", url);
 
-        let (ws_stream, _response) = connect_async(url).await?;
+        let ws_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_async(url),
+        )
+        .await;
+        let (ws_stream, _response) = match ws_result {
+            Ok(Ok((stream, resp))) => (stream, resp),
+            Ok(Err(e)) => {
+                return Err(Box::new(e) as Box<dyn std::error::Error>);
+            }
+            Err(_) => {
+                return Err("WebSocket connection timed out after 10s".into());
+            }
+        };
         let (sink, stream) = ws_stream.split();
 
         // Store the write half.
@@ -467,7 +480,7 @@ impl WebSocketTransport {
         input: &Arc<Mutex<WebSocketInputProcessor>>,
         params: &TransportParams,
     ) {
-        let frame = match serializer.deserialize(data).await {
+        let frame = match serializer.deserialize(data) {
             Some(f) => f,
             None => return,
         };
@@ -539,21 +552,8 @@ impl_base_debug_display!(WebSocketInputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketInputProcessor {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     /// Process an incoming frame from the WebSocket.
     ///
@@ -568,26 +568,6 @@ impl FrameProcessor for WebSocketInputProcessor {
     ) {
         // For input, we always push downstream.
         self.push_frame(frame, FrameDirection::Downstream).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -655,7 +635,7 @@ impl WebSocketOutputProcessor {
             return;
         }
 
-        let serialized = match self.serializer.serialize(frame).await {
+        let serialized = match self.serializer.serialize(frame) {
             Some(s) => s,
             None => return,
         };
@@ -714,21 +694,8 @@ impl_base_debug_display!(WebSocketOutputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketOutputProcessor {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     /// Process a frame from the pipeline for output over the WebSocket.
     ///
@@ -806,26 +773,6 @@ impl FrameProcessor for WebSocketOutputProcessor {
 
         // For all other frames, push in the direction they came.
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

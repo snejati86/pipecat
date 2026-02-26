@@ -206,9 +206,8 @@ impl std::fmt::Display for UpstreamPusher {
 
 #[async_trait::async_trait]
 impl FrameProcessor for UpstreamPusher {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { false }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame.clone(), direction).await;
@@ -216,14 +215,6 @@ impl FrameProcessor for UpstreamPusher {
             let text = Arc::new(TextFrame::new("upstream".to_string()));
             self.push_frame(text, FrameDirection::Upstream).await;
         }
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

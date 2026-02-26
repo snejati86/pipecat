@@ -29,7 +29,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::frames::{
@@ -39,7 +38,7 @@ use crate::frames::{
 };
 use crate::impl_base_display;
 use crate::metrics::{LLMTokenUsage, LLMUsageMetricsData, MetricsData};
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 use crate::services::{AIService, LLMService, TTSService};
 
 // ---------------------------------------------------------------------------
@@ -232,7 +231,9 @@ impl OpenAILLMService {
     /// * `api_key` — OpenAI API key.
     /// * `model` — Model identifier (e.g. `"gpt-4o"`). Pass an empty string
     ///   to use [`Self::DEFAULT_MODEL`].
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let api_key = api_key.into();
+        let model = model.into();
         let model = if model.is_empty() {
             Self::DEFAULT_MODEL.to_string()
         } else {
@@ -247,7 +248,11 @@ impl OpenAILLMService {
             api_key,
             model,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             messages: Vec::new(),
             tools: None,
             tool_choice: None,
@@ -256,9 +261,15 @@ impl OpenAILLMService {
         }
     }
 
+    /// Builder method: set the model identifier.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
     /// Builder method: set a custom base URL (for Azure OpenAI, local proxies, etc.).
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
         self
     }
 
@@ -371,16 +382,16 @@ impl OpenAILLMService {
         // parse each `data:` line.
 
         // Accumulators for tool/function calls.
-        let mut functions: Vec<String> = Vec::new();
-        let mut arguments: Vec<String> = Vec::new();
-        let mut tool_ids: Vec<String> = Vec::new();
+        let mut functions: Vec<String> = Vec::with_capacity(4);
+        let mut arguments: Vec<String> = Vec::with_capacity(4);
+        let mut tool_ids: Vec<String> = Vec::with_capacity(4);
         let mut current_func_idx: usize = 0;
         let mut current_function_name = String::new();
         let mut current_arguments = String::new();
         let mut current_tool_call_id = String::new();
 
         // Buffer for incomplete SSE lines (the byte stream may split mid-line).
-        let mut line_buffer = String::new();
+        let mut line_buffer = String::with_capacity(256);
 
         let mut byte_stream = response.bytes_stream();
 
@@ -585,21 +596,8 @@ impl_base_display!(OpenAILLMService);
 
 #[async_trait]
 impl FrameProcessor for OpenAILLMService {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // --- LLMMessagesAppendFrame: accumulate messages and trigger inference ---
@@ -650,26 +648,6 @@ impl FrameProcessor for OpenAILLMService {
 
         // --- Default: pass the frame through in the same direction ---
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -794,7 +772,14 @@ impl OpenAITTSService {
     /// * `api_key` — OpenAI API key.
     /// * `model` — TTS model name. Pass an empty string for the default.
     /// * `voice` — Voice identifier. Pass an empty string for `"alloy"`.
-    pub fn new(api_key: String, model: String, voice: String) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        voice: impl Into<String>,
+    ) -> Self {
+        let api_key = api_key.into();
+        let model = model.into();
+        let voice = voice.into();
         let model = if model.is_empty() {
             Self::DEFAULT_MODEL.to_string()
         } else {
@@ -815,15 +800,31 @@ impl OpenAITTSService {
             model,
             voice,
             base_url: OpenAILLMService::DEFAULT_BASE_URL.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             sample_rate: Self::OPENAI_SAMPLE_RATE,
             speed: None,
         }
     }
 
+    /// Builder method: set the TTS model.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Builder method: set the voice identifier.
+    pub fn with_voice(mut self, voice: impl Into<String>) -> Self {
+        self.voice = voice.into();
+        self
+    }
+
     /// Builder: set a custom base URL.
-    pub fn with_base_url(mut self, base_url: String) -> Self {
-        self.base_url = base_url;
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
         self
     }
 
@@ -960,21 +961,8 @@ impl_base_display!(OpenAITTSService);
 
 #[async_trait]
 impl FrameProcessor for OpenAITTSService {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // TextFrame triggers TTS synthesis.
@@ -995,26 +983,6 @@ impl FrameProcessor for OpenAITTSService {
 
         // Pass all other frames through.
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-
 use crate::audio::utils::{calculate_rms, exp_smoothing};
 use crate::audio::vad::{VADParams, VADState};
 use crate::frames::{
@@ -28,7 +26,7 @@ use crate::frames::{
     UserStoppedSpeakingFrame, VADParamsUpdateFrame,
 };
 use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 /// Trait for providing voice confidence from an audio buffer.
 ///
@@ -165,7 +163,7 @@ impl VADAnalyzer {
             base: BaseProcessor::new(Some("VADAnalyzer".to_string()), false),
             params,
             state: VADState::Quiet,
-            vad_buffer: Vec::new(),
+            vad_buffer: Vec::with_capacity(4096),
             vad_frames: 0,
             vad_frames_num_bytes: 0,
             vad_start_frames: 0,
@@ -375,21 +373,8 @@ impl_base_display!(VADAnalyzer);
 
 #[async_trait]
 impl FrameProcessor for VADAnalyzer {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(
         &mut self,
@@ -458,26 +443,6 @@ impl FrameProcessor for VADAnalyzer {
 
         // All other frames pass through unchanged.
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

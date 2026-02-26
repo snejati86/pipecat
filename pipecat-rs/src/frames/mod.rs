@@ -631,16 +631,16 @@ pub struct ErrorFrame {
 }
 
 impl ErrorFrame {
-    pub fn new(error: String, fatal: bool) -> Self {
+    pub fn new(error: impl Into<String>, fatal: bool) -> Self {
         Self {
             fields: FrameFields::new("ErrorFrame"),
-            error,
+            error: error.into(),
             fatal,
         }
     }
 
     /// Convenience constructor for non-fatal errors.
-    pub fn non_fatal(error: String) -> Self {
+    pub fn non_fatal(error: impl Into<String>) -> Self {
         Self::new(error, false)
     }
 }
@@ -1337,14 +1337,26 @@ pub struct TextFrame {
 }
 
 impl TextFrame {
-    pub fn new(text: String) -> Self {
+    pub fn new(text: impl Into<String>) -> Self {
         Self {
             fields: FrameFields::new("TextFrame"),
-            text,
+            text: text.into(),
             skip_tts: None,
             includes_inter_frame_spaces: false,
             append_to_context: true,
         }
+    }
+}
+
+impl From<&str> for TextFrame {
+    fn from(text: &str) -> Self {
+        TextFrame::new(text)
+    }
+}
+
+impl From<String> for TextFrame {
+    fn from(text: String) -> Self {
+        TextFrame::new(text)
     }
 }
 
@@ -1529,12 +1541,12 @@ pub struct TranscriptionFrame {
 }
 
 impl TranscriptionFrame {
-    pub fn new(text: String, user_id: String, timestamp: String) -> Self {
+    pub fn new(text: impl Into<String>, user_id: impl Into<String>, timestamp: impl Into<String>) -> Self {
         Self {
             fields: FrameFields::new("TranscriptionFrame"),
-            text,
-            user_id,
-            timestamp,
+            text: text.into(),
+            user_id: user_id.into(),
+            timestamp: timestamp.into(),
             language: None,
             result: None,
             finalized: false,
@@ -1571,12 +1583,12 @@ pub struct InterimTranscriptionFrame {
 }
 
 impl InterimTranscriptionFrame {
-    pub fn new(text: String, user_id: String, timestamp: String) -> Self {
+    pub fn new(text: impl Into<String>, user_id: impl Into<String>, timestamp: impl Into<String>) -> Self {
         Self {
             fields: FrameFields::new("InterimTranscriptionFrame"),
-            text,
-            user_id,
-            timestamp,
+            text: text.into(),
+            user_id: user_id.into(),
+            timestamp: timestamp.into(),
             language: None,
             result: None,
         }

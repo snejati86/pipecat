@@ -160,9 +160,8 @@ async fn test_pipeline_with_upstream_pusher() {
 
     #[async_trait::async_trait]
     impl FrameProcessor for UpstreamPusher {
-        fn id(&self) -> u64 { self.base.id() }
-        fn name(&self) -> &str { self.base.name() }
-        fn is_direct_mode(&self) -> bool { false }
+        fn base(&self) -> &BaseProcessor { &self.base }
+        fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
         async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
             // Push downstream
@@ -172,14 +171,6 @@ async fn test_pipeline_with_upstream_pusher() {
                 let error = Arc::new(ErrorFrame::new("test error".to_string(), false));
                 self.push_frame(error, FrameDirection::Upstream).await;
             }
-        }
-
-        fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-        fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-        fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-        fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-        fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-            &mut self.base.pending_frames
         }
     }
 

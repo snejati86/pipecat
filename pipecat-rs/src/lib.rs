@@ -13,6 +13,7 @@ pub mod frames;
 pub mod metrics;
 pub mod observers;
 pub mod pipeline;
+pub mod prelude;
 pub mod processors;
 pub mod serializers;
 pub mod services;

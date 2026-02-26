@@ -19,11 +19,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::frames::{Frame, InterruptionFrame, StartFrame, UserStartedSpeakingFrame};
 use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 /// VAD-based user turn start strategy.
 ///
@@ -91,21 +90,8 @@ impl_base_display!(VADUserTurnStartStrategy);
 
 #[async_trait]
 impl FrameProcessor for VADUserTurnStartStrategy {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(
         &mut self,
@@ -144,26 +130,6 @@ impl FrameProcessor for VADUserTurnStartStrategy {
 
         // Pass all other frames through unchanged.
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

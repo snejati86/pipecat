@@ -8,12 +8,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::impl_base_debug_display;
 use crate::frames::Frame;
 use crate::processors::{
-    BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup,
+    BaseProcessor, FrameDirection, FrameProcessor,
 };
 
 /// Identity filter that passes all frames through unchanged.
@@ -39,25 +38,12 @@ impl_base_debug_display!(IdentityFilter);
 
 #[async_trait]
 impl FrameProcessor for IdentityFilter {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { false }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Pass everything through
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -83,27 +69,14 @@ impl_base_debug_display!(FrameFilter);
 
 #[async_trait]
 impl FrameProcessor for FrameFilter {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { false }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
         if frame.is_system_frame() || (self.type_checker)(frame.as_ref()) {
             self.push_frame(frame, direction).await;
         }
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -144,13 +117,8 @@ impl_base_debug_display!(FunctionFilter);
 
 #[async_trait]
 impl FrameProcessor for FunctionFilter {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { false }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
@@ -173,14 +141,6 @@ impl FrameProcessor for FunctionFilter {
             // Direction doesn't match filter direction, pass through
             self.push_frame(frame, direction).await;
         }
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -205,13 +165,8 @@ impl_base_debug_display!(WakeCheckFilter);
 
 #[async_trait]
 impl FrameProcessor for WakeCheckFilter {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { false }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
@@ -238,13 +193,5 @@ impl FrameProcessor for WakeCheckFilter {
         } else {
             self.push_frame(frame, direction).await;
         }
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }

@@ -15,7 +15,7 @@ use crate::impl_base_debug_display;
 use crate::frames::{EndFrame, Frame, SleepFrame, StartFrame};
 use crate::observers::Observer;
 use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 /// A processor that captures frames in a queue for testing.
 pub struct QueuedFrameProcessor {
@@ -51,13 +51,10 @@ impl_base_debug_display!(QueuedFrameProcessor);
 
 #[async_trait]
 impl FrameProcessor for QueuedFrameProcessor {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { true }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn is_direct_mode(&self) -> bool { true }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         if direction == self.queue_direction {
@@ -68,14 +65,6 @@ impl FrameProcessor for QueuedFrameProcessor {
             }
         }
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

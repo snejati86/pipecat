@@ -20,7 +20,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 
 use crate::frames::{
     Frame, InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame,
@@ -81,7 +80,7 @@ impl SentenceAggregator {
     pub fn new() -> Self {
         Self {
             base: BaseProcessor::new(Some("SentenceAggregator".to_string()), false),
-            aggregation: String::new(),
+            aggregation: String::with_capacity(256),
         }
     }
 
@@ -110,17 +109,8 @@ impl_base_display!(SentenceAggregator);
 
 #[async_trait]
 impl FrameProcessor for SentenceAggregator {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        false
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Ignore interim transcription frames
@@ -167,26 +157,6 @@ impl FrameProcessor for SentenceAggregator {
 
         // All other frames pass through
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

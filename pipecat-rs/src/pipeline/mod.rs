@@ -37,24 +37,11 @@ impl_base_debug_display!(PipelineSource);
 
 #[async_trait]
 impl FrameProcessor for PipelineSource {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { true }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -76,24 +63,11 @@ impl_base_debug_display!(PipelineSink);
 
 #[async_trait]
 impl FrameProcessor for PipelineSink {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
-    fn is_direct_mode(&self) -> bool { true }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -170,8 +144,9 @@ impl_base_debug_display!(Pipeline);
 
 #[async_trait]
 impl FrameProcessor for Pipeline {
-    fn id(&self) -> u64 { self.base.id() }
-    fn name(&self) -> &str { self.base.name() }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+
     fn is_direct_mode(&self) -> bool { true }
 
     fn processors(&self) -> Vec<Arc<Mutex<dyn FrameProcessor>>> {
@@ -225,14 +200,6 @@ impl FrameProcessor for Pipeline {
             FrameDirection::Upstream => self.processors[self.sink_idx].clone(),
         };
         drive_processor(entry, frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) { self.base.next = Some(next); }
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) { self.base.prev = Some(prev); }
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.next.clone() }
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> { self.base.prev.clone() }
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -425,4 +392,128 @@ impl Default for PipelineRunner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Builder patterns
+// ---------------------------------------------------------------------------
+
+/// A builder for constructing a [`Pipeline`] with a fluent API.
+///
+/// Instead of manually wrapping every processor in `Arc<Mutex<>>`, the builder
+/// provides ergonomic helpers that do the wrapping for you.
+///
+/// # Examples
+///
+/// ```ignore
+/// let pipeline = Pipeline::builder()
+///     .with_processor(PassthroughProcessor::new(None))
+///     .with_processor(MyCustomProcessor::new())
+///     .build();
+/// ```
+pub struct PipelineBuilder {
+    processors: Vec<Arc<Mutex<dyn FrameProcessor>>>,
+}
+
+impl Pipeline {
+    /// Create a builder for constructing a Pipeline with a fluent API.
+    pub fn builder() -> PipelineBuilder {
+        PipelineBuilder {
+            processors: Vec::new(),
+        }
+    }
+}
+
+impl PipelineBuilder {
+    /// Add an already-wrapped processor.
+    pub fn with(mut self, processor: Arc<Mutex<dyn FrameProcessor>>) -> Self {
+        self.processors.push(processor);
+        self
+    }
+
+    /// Add a processor, automatically wrapping it in `Arc<Mutex<>>`.
+    pub fn with_processor<P: FrameProcessor + 'static>(mut self, processor: P) -> Self {
+        self.processors.push(Arc::new(Mutex::new(processor)));
+        self
+    }
+
+    /// Build the pipeline.
+    pub fn build(self) -> Pipeline {
+        Pipeline::new(self.processors)
+    }
+}
+
+/// A builder for constructing a [`PipelineTask`] with sensible defaults.
+///
+/// # Examples
+///
+/// ```ignore
+/// let task = PipelineTask::builder(pipeline)
+///     .params(PipelineParams { allow_interruptions: true, ..Default::default() })
+///     .observer(my_observer)
+///     .build();
+/// ```
+pub struct PipelineTaskBuilder {
+    pipeline: Pipeline,
+    params: PipelineParams,
+    observers: Vec<Arc<dyn Observer>>,
+    cancel_on_idle_timeout: bool,
+}
+
+impl PipelineTask {
+    /// Create a builder for a PipelineTask with sensible defaults.
+    pub fn builder(pipeline: Pipeline) -> PipelineTaskBuilder {
+        PipelineTaskBuilder {
+            pipeline,
+            params: PipelineParams::default(),
+            observers: Vec::new(),
+            cancel_on_idle_timeout: false,
+        }
+    }
+}
+
+impl PipelineTaskBuilder {
+    /// Set the pipeline parameters.
+    pub fn params(mut self, params: PipelineParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Add an observer.
+    pub fn observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    /// Set whether to cancel on idle timeout.
+    pub fn cancel_on_idle_timeout(mut self, cancel: bool) -> Self {
+        self.cancel_on_idle_timeout = cancel;
+        self
+    }
+
+    /// Build the pipeline task.
+    pub fn build(self) -> PipelineTask {
+        PipelineTask::new(
+            self.pipeline,
+            self.params,
+            self.observers,
+            self.cancel_on_idle_timeout,
+        )
+    }
+}
+
+/// Create a pipeline from a list of processors, auto-wrapping each in `Arc<Mutex<>>`.
+///
+/// # Examples
+///
+/// ```ignore
+/// let p = pipeline![proc1, proc2, proc3];
+/// ```
+#[macro_export]
+macro_rules! pipeline {
+    ($($proc:expr),* $(,)?) => {
+        $crate::pipeline::Pipeline::new(vec![
+            $(std::sync::Arc::new(tokio::sync::Mutex::new($proc))),*
+        ])
+    };
 }

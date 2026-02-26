@@ -39,7 +39,7 @@ use crate::frames::{
     TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
 use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 use crate::services::{AIService, STTService};
 
 // ---------------------------------------------------------------------------
@@ -212,11 +212,11 @@ impl DeepgramSTTService {
     /// - channels: `1`
     /// - interim_results: `true`
     /// - punctuate: `true`
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: impl Into<String>) -> Self {
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         Self {
             base: BaseProcessor::new(Some("DeepgramSTTService".to_string()), false),
-            api_key,
+            api_key: api_key.into(),
             model: "nova-2".to_string(),
             language: Some("en".to_string()),
             sample_rate: 16000,
@@ -375,9 +375,20 @@ impl DeepgramSTTService {
                 .map_err(|e| format!("Invalid API key header value: {}", e))?,
         );
 
-        let (ws_stream, _response) = connect_async(request)
-            .await
-            .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect_async(request),
+        )
+        .await;
+        let (ws_stream, _response) = match ws_result {
+            Ok(Ok((stream, resp))) => (stream, resp),
+            Ok(Err(e)) => {
+                return Err(format!("WebSocket connection failed: {}", e));
+            }
+            Err(_) => {
+                return Err("WebSocket connection timed out after 10s".to_string());
+            }
+        };
 
         tracing::debug!("DeepgramSTTService: WebSocket connection established");
 
@@ -672,21 +683,8 @@ impl_base_display!(DeepgramSTTService);
 
 #[async_trait]
 impl FrameProcessor for DeepgramSTTService {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
-
-    async fn setup(&mut self, setup: &FrameProcessorSetup) {
-        self.base.observer = setup.observer.clone();
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     async fn cleanup(&mut self) {
         self.disconnect().await;
@@ -773,26 +771,6 @@ impl FrameProcessor for DeepgramSTTService {
 
         // -- All other frames: pass through ----------------------------------
         self.push_frame(frame, direction).await;
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 

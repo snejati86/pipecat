@@ -30,15 +30,15 @@
 //! # async fn example() {
 //! // HTTP-based (simpler, higher latency)
 //! let mut http_tts = CartesiaHttpTTSService::new(
-//!     "your-api-key".into(),
-//!     "voice-id-here".into(),
+//!     "your-api-key",
+//!     "voice-id-here",
 //! );
 //! let frames = http_tts.run_tts("Hello, world!").await;
 //!
 //! // WebSocket-based (streaming, lower latency)
 //! let mut ws_tts = CartesiaTTSService::new(
-//!     "your-api-key".into(),
-//!     "voice-id-here".into(),
+//!     "your-api-key",
+//!     "voice-id-here",
 //! );
 //! ws_tts.connect().await;
 //! let frames = ws_tts.run_tts("Hello, world!").await;
@@ -272,11 +272,11 @@ impl CartesiaTTSService {
     ///
     /// * `api_key` - Cartesia API key for authentication.
     /// * `voice_id` - ID of the voice to use for synthesis.
-    pub fn new(api_key: String, voice_id: String) -> Self {
+    pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
         Self {
             base: BaseProcessor::new(Some("CartesiaTTSService".to_string()), false),
-            api_key,
-            voice_id,
+            api_key: api_key.into(),
+            voice_id: voice_id.into(),
             model: "sonic-2".to_string(),
             sample_rate: 24000,
             encoding: "pcm_s16le".to_string(),
@@ -290,45 +290,51 @@ impl CartesiaTTSService {
         }
     }
 
-    /// Configure the TTS model (e.g., "sonic-2", "sonic-3").
-    pub fn with_model(mut self, model: String) -> Self {
-        self.model = model;
+    /// Builder method: set the TTS model (e.g., "sonic-2", "sonic-3").
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
         self
     }
 
-    /// Configure the audio sample rate in Hz.
+    /// Builder method: set the voice identifier.
+    pub fn with_voice_id(mut self, voice_id: impl Into<String>) -> Self {
+        self.voice_id = voice_id.into();
+        self
+    }
+
+    /// Builder method: set the audio sample rate in Hz.
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
         self
     }
 
-    /// Configure the audio encoding (e.g., "pcm_s16le", "pcm_f32le").
-    pub fn with_encoding(mut self, encoding: String) -> Self {
-        self.encoding = encoding;
+    /// Builder method: set the audio encoding (e.g., "pcm_s16le", "pcm_f32le").
+    pub fn with_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = encoding.into();
         self
     }
 
-    /// Configure the audio container format (e.g., "raw").
-    pub fn with_container(mut self, container: String) -> Self {
-        self.container = container;
+    /// Builder method: set the audio container format (e.g., "raw").
+    pub fn with_container(mut self, container: impl Into<String>) -> Self {
+        self.container = container.into();
         self
     }
 
-    /// Configure the language code.
-    pub fn with_language(mut self, language: Option<String>) -> Self {
-        self.language = language;
+    /// Builder method: set the language code (e.g., "en", "fr", "de").
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
         self
     }
 
-    /// Configure the Cartesia API version string.
-    pub fn with_cartesia_version(mut self, version: String) -> Self {
-        self.cartesia_version = version;
+    /// Builder method: set the Cartesia API version string.
+    pub fn with_cartesia_version(mut self, version: impl Into<String>) -> Self {
+        self.cartesia_version = version.into();
         self
     }
 
-    /// Configure the WebSocket URL.
-    pub fn with_ws_url(mut self, url: String) -> Self {
-        self.ws_url = url;
+    /// Builder method: set the WebSocket URL.
+    pub fn with_ws_url(mut self, url: impl Into<String>) -> Self {
+        self.ws_url = url.into();
         self
     }
 
@@ -356,14 +362,24 @@ impl CartesiaTTSService {
 
         tracing::debug!(service = %self.base.name(), "Connecting to Cartesia WebSocket");
 
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((stream, _response)) => {
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await;
+        match ws_result {
+            Ok(Ok((stream, _response))) => {
                 tracing::info!(service = %self.base.name(), "Connected to Cartesia WebSocket");
                 *ws_guard = Some(stream);
                 Ok(())
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let msg = format!("Failed to connect to Cartesia WebSocket: {e}");
+                tracing::error!(service = %self.base.name(), "{}", msg);
+                Err(msg)
+            }
+            Err(_) => {
+                let msg = "Cartesia WebSocket connection timed out after 10s".to_string();
                 tracing::error!(service = %self.base.name(), "{}", msg);
                 Err(msg)
             }
@@ -651,17 +667,8 @@ impl_base_display!(CartesiaTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaTTSService {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     /// Process incoming frames.
     ///
@@ -690,26 +697,6 @@ impl FrameProcessor for CartesiaTTSService {
             // Pass all other frames through in their original direction.
             self.push_frame(frame, direction).await;
         }
-    }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
     }
 }
 
@@ -780,11 +767,11 @@ impl CartesiaHttpTTSService {
     ///
     /// * `api_key` - Cartesia API key for authentication.
     /// * `voice_id` - ID of the voice to use for synthesis.
-    pub fn new(api_key: String, voice_id: String) -> Self {
+    pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
         Self {
             base: BaseProcessor::new(Some("CartesiaHttpTTSService".to_string()), false),
-            api_key,
-            voice_id,
+            api_key: api_key.into(),
+            voice_id: voice_id.into(),
             model: "sonic-2".to_string(),
             sample_rate: 24000,
             encoding: "pcm_s16le".to_string(),
@@ -793,50 +780,60 @@ impl CartesiaHttpTTSService {
             cartesia_version: "2024-11-13".to_string(),
             base_url: "https://api.cartesia.ai".to_string(),
             params: CartesiaInputParams::default(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             last_metrics: None,
         }
     }
 
-    /// Configure the TTS model (e.g., "sonic-2", "sonic-3").
-    pub fn with_model(mut self, model: String) -> Self {
-        self.model = model;
+    /// Builder method: set the TTS model (e.g., "sonic-2", "sonic-3").
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
         self
     }
 
-    /// Configure the audio sample rate in Hz.
+    /// Builder method: set the voice identifier.
+    pub fn with_voice_id(mut self, voice_id: impl Into<String>) -> Self {
+        self.voice_id = voice_id.into();
+        self
+    }
+
+    /// Builder method: set the audio sample rate in Hz.
     pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = sample_rate;
         self
     }
 
-    /// Configure the audio encoding (e.g., "pcm_s16le", "pcm_f32le").
-    pub fn with_encoding(mut self, encoding: String) -> Self {
-        self.encoding = encoding;
+    /// Builder method: set the audio encoding (e.g., "pcm_s16le", "pcm_f32le").
+    pub fn with_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = encoding.into();
         self
     }
 
-    /// Configure the audio container format (e.g., "raw").
-    pub fn with_container(mut self, container: String) -> Self {
-        self.container = container;
+    /// Builder method: set the audio container format (e.g., "raw").
+    pub fn with_container(mut self, container: impl Into<String>) -> Self {
+        self.container = container.into();
         self
     }
 
-    /// Configure the language code.
-    pub fn with_language(mut self, language: Option<String>) -> Self {
-        self.language = language;
+    /// Builder method: set the language code (e.g., "en", "fr", "de").
+    pub fn with_language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
         self
     }
 
-    /// Configure the Cartesia API version string.
-    pub fn with_cartesia_version(mut self, version: String) -> Self {
-        self.cartesia_version = version;
+    /// Builder method: set the Cartesia API version string.
+    pub fn with_cartesia_version(mut self, version: impl Into<String>) -> Self {
+        self.cartesia_version = version.into();
         self
     }
 
-    /// Configure the base URL for the Cartesia HTTP API.
-    pub fn with_base_url(mut self, url: String) -> Self {
-        self.base_url = url;
+    /// Builder method: set the base URL for the Cartesia HTTP API.
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
         self
     }
 
@@ -986,17 +983,8 @@ impl_base_display!(CartesiaHttpTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaHttpTTSService {
-    fn id(&self) -> u64 {
-        self.base.id()
-    }
-
-    fn name(&self) -> &str {
-        self.base.name()
-    }
-
-    fn is_direct_mode(&self) -> bool {
-        self.base.direct_mode
-    }
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
     /// Process incoming frames.
     ///
@@ -1026,26 +1014,6 @@ impl FrameProcessor for CartesiaHttpTTSService {
             self.push_frame(frame, direction).await;
         }
     }
-
-    fn link(&mut self, next: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.next = Some(next);
-    }
-
-    fn set_prev(&mut self, prev: Arc<Mutex<dyn FrameProcessor>>) {
-        self.base.prev = Some(prev);
-    }
-
-    fn next_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.next.clone()
-    }
-
-    fn prev_processor(&self) -> Option<Arc<Mutex<dyn FrameProcessor>>> {
-        self.base.prev.clone()
-    }
-
-    fn pending_frames_mut(&mut self) -> &mut Vec<(Arc<dyn Frame>, FrameDirection)> {
-        &mut self.base.pending_frames
-    }
 }
 
 #[async_trait]
@@ -1074,7 +1042,7 @@ mod tests {
 
     #[test]
     fn test_cartesia_http_tts_default_config() {
-        let service = CartesiaHttpTTSService::new("test-key".into(), "test-voice".into());
+        let service = CartesiaHttpTTSService::new("test-key", "test-voice");
         assert_eq!(service.model, "sonic-2");
         assert_eq!(service.sample_rate, 24000);
         assert_eq!(service.encoding, "pcm_s16le");
@@ -1085,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_cartesia_ws_tts_default_config() {
-        let service = CartesiaTTSService::new("test-key".into(), "test-voice".into());
+        let service = CartesiaTTSService::new("test-key", "test-voice");
         assert_eq!(service.model, "sonic-2");
         assert_eq!(service.sample_rate, 24000);
         assert_eq!(service.encoding, "pcm_s16le");
@@ -1096,12 +1064,12 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let service = CartesiaHttpTTSService::new("key".into(), "voice".into())
-            .with_model("sonic-3".into())
+        let service = CartesiaHttpTTSService::new("key", "voice")
+            .with_model("sonic-3")
             .with_sample_rate(16000)
-            .with_encoding("pcm_f32le".into())
-            .with_language(Some("fr".into()))
-            .with_base_url("https://custom.api.com".into());
+            .with_encoding("pcm_f32le")
+            .with_language("fr")
+            .with_base_url("https://custom.api.com");
 
         assert_eq!(service.model, "sonic-3");
         assert_eq!(service.sample_rate, 16000);
@@ -1112,10 +1080,10 @@ mod tests {
 
     #[test]
     fn test_ws_builder_pattern() {
-        let service = CartesiaTTSService::new("key".into(), "voice".into())
-            .with_model("sonic-3".into())
+        let service = CartesiaTTSService::new("key", "voice")
+            .with_model("sonic-3")
             .with_sample_rate(16000)
-            .with_ws_url("wss://custom.ws.com/tts".into());
+            .with_ws_url("wss://custom.ws.com/tts");
 
         assert_eq!(service.model, "sonic-3");
         assert_eq!(service.sample_rate, 16000);
@@ -1124,7 +1092,7 @@ mod tests {
 
     #[test]
     fn test_voice_config_without_emotions() {
-        let service = CartesiaHttpTTSService::new("key".into(), "voice-123".into());
+        let service = CartesiaHttpTTSService::new("key", "voice-123");
         let config = service.build_voice_config();
         assert_eq!(config.mode, "id");
         assert_eq!(config.id, "voice-123");
@@ -1137,7 +1105,7 @@ mod tests {
             emotion: Some(vec!["excited".into(), "happy".into()]),
             ..Default::default()
         };
-        let service = CartesiaHttpTTSService::new("key".into(), "voice-123".into())
+        let service = CartesiaHttpTTSService::new("key", "voice-123")
             .with_params(params);
         let config = service.build_voice_config();
         assert_eq!(config.mode, "id");
@@ -1150,10 +1118,10 @@ mod tests {
 
     #[test]
     fn test_output_format() {
-        let service = CartesiaHttpTTSService::new("key".into(), "voice".into())
+        let service = CartesiaHttpTTSService::new("key", "voice")
             .with_sample_rate(44100)
-            .with_encoding("pcm_f32le".into())
-            .with_container("wav".into());
+            .with_encoding("pcm_f32le")
+            .with_container("wav");
 
         let format = service.build_output_format();
         assert_eq!(format.container, "wav");
@@ -1189,7 +1157,7 @@ mod tests {
 
     #[test]
     fn test_http_request_serialization() {
-        let service = CartesiaHttpTTSService::new("key".into(), "voice-id".into());
+        let service = CartesiaHttpTTSService::new("key", "voice-id");
         let request = CartesiaHttpRequest {
             model_id: service.model.clone(),
             transcript: "Hello world".to_string(),
@@ -1222,7 +1190,7 @@ mod tests {
             generation_config: Some(gen_config),
             ..Default::default()
         };
-        let service = CartesiaHttpTTSService::new("key".into(), "voice".into())
+        let service = CartesiaHttpTTSService::new("key", "voice")
             .with_params(params);
         assert!(service.params.generation_config.is_some());
         let gc = service.params.generation_config.unwrap();
@@ -1232,22 +1200,22 @@ mod tests {
 
     #[test]
     fn test_model_trait() {
-        let ws_service = CartesiaTTSService::new("key".into(), "voice".into());
+        let ws_service = CartesiaTTSService::new("key", "voice");
         assert_eq!(AIService::model(&ws_service), Some("sonic-2"));
 
-        let http_service = CartesiaHttpTTSService::new("key".into(), "voice".into());
+        let http_service = CartesiaHttpTTSService::new("key", "voice");
         assert_eq!(AIService::model(&http_service), Some("sonic-2"));
     }
 
     #[test]
     fn test_display_and_debug() {
-        let ws_svc = CartesiaTTSService::new("key".into(), "voice".into());
+        let ws_svc = CartesiaTTSService::new("key", "voice");
         let display = format!("{}", ws_svc);
         assert!(display.contains("CartesiaTTSService"));
         let debug = format!("{:?}", ws_svc);
         assert!(debug.contains("CartesiaTTSService"));
 
-        let http_svc = CartesiaHttpTTSService::new("key".into(), "voice".into());
+        let http_svc = CartesiaHttpTTSService::new("key", "voice");
         let display = format!("{}", http_svc);
         assert!(display.contains("CartesiaHttpTTSService"));
         let debug = format!("{:?}", http_svc);
@@ -1267,8 +1235,8 @@ mod tests {
     async fn test_http_tts_run_returns_started_and_stopped() {
         // Without a real API key, the HTTP request will fail, but we should
         // still get TTSStartedFrame, ErrorFrame, and TTSStoppedFrame.
-        let mut service = CartesiaHttpTTSService::new("invalid-key".into(), "voice".into())
-            .with_base_url("http://localhost:1".into()); // unreachable port
+        let mut service = CartesiaHttpTTSService::new("invalid-key", "voice")
+            .with_base_url("http://localhost:1"); // unreachable port
 
         let frames = service.run_tts("test").await;
 
