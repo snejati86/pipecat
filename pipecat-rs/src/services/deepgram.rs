@@ -18,6 +18,7 @@
 //! ```
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,6 +38,7 @@ use crate::frames::{
     EndFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame,
     TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 use crate::services::{AIService, STTService};
 
@@ -195,9 +197,9 @@ pub struct DeepgramSTTService {
     /// Handle for the background task that reads WebSocket messages.
     ws_reader_task: Option<JoinHandle<()>>,
     /// Channel used by the reader task to push frames back into the processor.
-    frame_tx: tokio::sync::mpsc::UnboundedSender<Arc<dyn Frame>>,
+    frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
     /// Receiving end -- drained in `process_frame` to push frames downstream.
-    frame_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<dyn Frame>>,
+    frame_rx: tokio::sync::mpsc::Receiver<Arc<dyn Frame>>,
 }
 
 impl DeepgramSTTService {
@@ -211,7 +213,7 @@ impl DeepgramSTTService {
     /// - interim_results: `true`
     /// - punctuate: `true`
     pub fn new(api_key: String) -> Self {
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         Self {
             base: BaseProcessor::new(Some("DeepgramSTTService".to_string()), false),
             api_key,
@@ -333,7 +335,7 @@ impl DeepgramSTTService {
         );
 
         if let Some(ref lang) = self.language {
-            url.push_str(&format!("&language={}", lang));
+            let _ = write!(url, "&language={}", lang);
         }
         if self.interim_results {
             url.push_str("&interim_results=true");
@@ -345,7 +347,7 @@ impl DeepgramSTTService {
             url.push_str("&vad_events=true");
         }
         if let Some(ms) = self.utterance_end_ms {
-            url.push_str(&format!("&utterance_end_ms={}", ms));
+            let _ = write!(url, "&utterance_end_ms={}", ms);
         }
         if self.smart_format {
             url.push_str("&smart_format=true");
@@ -400,7 +402,7 @@ impl DeepgramSTTService {
     /// converts them into pipeline frames sent via `frame_tx`.
     async fn ws_reader_loop(
         mut stream: WsStream,
-        frame_tx: tokio::sync::mpsc::UnboundedSender<Arc<dyn Frame>>,
+        frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
         user_id: String,
         vad_events: bool,
     ) {
@@ -443,7 +445,7 @@ impl DeepgramSTTService {
     /// Parse a text message from Deepgram and push the appropriate frame(s).
     fn handle_ws_text_message(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::UnboundedSender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
         user_id: &str,
         vad_events: bool,
     ) {
@@ -470,14 +472,18 @@ impl DeepgramSTTService {
                 if vad_events {
                     tracing::debug!("DeepgramSTTService: speech started event");
                     let frame = Arc::new(UserStartedSpeakingFrame::new());
-                    let _ = frame_tx.send(frame);
+                    if let Err(e) = frame_tx.try_send(frame) {
+                        tracing::warn!("DeepgramSTTService: failed to send SpeechStarted frame: {}", e);
+                    }
                 }
             }
             "UtteranceEnd" => {
                 if vad_events {
                     tracing::debug!("DeepgramSTTService: utterance end event");
                     let frame = Arc::new(UserStoppedSpeakingFrame::new());
-                    let _ = frame_tx.send(frame);
+                    if let Err(e) = frame_tx.try_send(frame) {
+                        tracing::warn!("DeepgramSTTService: failed to send UtteranceEnd frame: {}", e);
+                    }
                 }
             }
             "Metadata" => {
@@ -496,7 +502,9 @@ impl DeepgramSTTService {
                             format!("Deepgram error: {}", description),
                             false,
                         ));
-                        let _ = frame_tx.send(error_frame);
+                        if let Err(e) = frame_tx.try_send(error_frame) {
+                            tracing::warn!("DeepgramSTTService: failed to send error frame: {}", e);
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
@@ -516,7 +524,7 @@ impl DeepgramSTTService {
     /// Parse and handle a `Results` transcription message.
     fn handle_transcription_result(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::UnboundedSender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
         user_id: &str,
     ) {
         let result: DgResult = match serde_json::from_str(text) {
@@ -564,7 +572,9 @@ impl DeepgramSTTService {
             );
             frame.language = language;
             frame.result = raw_result;
-            let _ = frame_tx.send(Arc::new(frame));
+            if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+                tracing::warn!("DeepgramSTTService: failed to send transcription frame: {}", e);
+            }
         } else {
             let mut frame = InterimTranscriptionFrame::new(
                 transcript.clone(),
@@ -573,7 +583,9 @@ impl DeepgramSTTService {
             );
             frame.language = language;
             frame.result = raw_result;
-            let _ = frame_tx.send(Arc::new(frame));
+            if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+                tracing::warn!("DeepgramSTTService: failed to send interim transcription frame: {}", e);
+            }
         }
     }
 
@@ -595,6 +607,7 @@ impl DeepgramSTTService {
         // Wait for the reader task to finish.
         if let Some(handle) = self.ws_reader_task.take() {
             // Give the reader a short window to finish, then abort.
+            let abort_handle = handle.abort_handle();
             let timeout_result =
                 tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             match timeout_result {
@@ -606,6 +619,7 @@ impl DeepgramSTTService {
                 }
                 Err(_) => {
                     tracing::warn!("DeepgramSTTService: reader task timed out, aborting");
+                    abort_handle.abort();
                 }
             }
         }
@@ -634,13 +648,7 @@ impl DeepgramSTTService {
 
 /// Return the current time as an ISO 8601 string.
 fn now_iso8601() -> String {
-    use std::time::SystemTime;
-    let duration = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    let millis = duration.subsec_millis();
-    format!("{}.{:03}Z", secs, millis)
+    crate::utils::helpers::now_iso8601()
 }
 
 // ---------------------------------------------------------------------------
@@ -660,11 +668,7 @@ impl fmt::Debug for DeepgramSTTService {
     }
 }
 
-impl fmt::Display for DeepgramSTTService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(DeepgramSTTService);
 
 #[async_trait]
 impl FrameProcessor for DeepgramSTTService {
@@ -994,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_final_transcription() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{
             "type": "Results",
             "channel": {
@@ -1026,7 +1030,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_interim_transcription() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{
             "type": "Results",
             "channel": {
@@ -1056,7 +1060,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_speech_started_vad_enabled() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{"type": "SpeechStarted", "channel": [0], "timestamp": 1.0}"#;
 
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user", true);
@@ -1073,7 +1077,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_speech_started_vad_disabled() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{"type": "SpeechStarted", "channel": [0], "timestamp": 1.0}"#;
 
         // When VAD events are disabled, SpeechStarted should not produce a frame.
@@ -1084,7 +1088,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_empty_transcript_ignored() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{
             "type": "Results",
             "channel": {
@@ -1108,7 +1112,7 @@ mod tests {
 
     #[test]
     fn test_handle_ws_text_message_error() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
         let json = r#"{
             "type": "Error",
             "description": "Rate limit exceeded",

@@ -17,13 +17,13 @@
 //!
 //! This processor should be placed downstream of the VAD analyzer.
 
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::frames::{Frame, UserStoppedSpeakingFrame};
+use crate::impl_base_debug_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 
 /// VAD-based user turn stop strategy.
@@ -55,20 +55,7 @@ impl Default for VADUserTurnStopStrategy {
     }
 }
 
-impl fmt::Debug for VADUserTurnStopStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VADUserTurnStopStrategy")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
-            .finish()
-    }
-}
-
-impl fmt::Display for VADUserTurnStopStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(VADUserTurnStopStrategy);
 
 #[async_trait]
 impl FrameProcessor for VADUserTurnStopStrategy {

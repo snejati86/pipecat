@@ -6,12 +6,12 @@
 //! Provides `run_test()` to send frames through a pipeline and assert expected
 //! output frames in each direction.
 
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::impl_base_debug_display;
 use crate::frames::{EndFrame, Frame, SleepFrame, StartFrame};
 use crate::observers::Observer;
 use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
@@ -47,17 +47,7 @@ impl QueuedFrameProcessor {
     }
 }
 
-impl fmt::Debug for QueuedFrameProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "QueuedFrameProcessor({})", self.base.name())
-    }
-}
-
-impl fmt::Display for QueuedFrameProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(QueuedFrameProcessor);
 
 #[async_trait]
 impl FrameProcessor for QueuedFrameProcessor {

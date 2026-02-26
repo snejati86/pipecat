@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use crate::frames::{
     Frame, InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame,
 };
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 /// Characters that mark the end of a sentence.
@@ -105,11 +106,7 @@ impl fmt::Debug for SentenceAggregator {
     }
 }
 
-impl fmt::Display for SentenceAggregator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(SentenceAggregator);
 
 #[async_trait]
 impl FrameProcessor for SentenceAggregator {

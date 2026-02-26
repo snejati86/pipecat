@@ -24,8 +24,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
+use crate::utils::helpers::{decode_base64, encode_base64};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -170,7 +169,7 @@ fn serialize_frame_to_json(frame: &dyn Frame) -> Option<String> {
         let wire = WireFrame {
             frame_type: "audio_input".to_string(),
             payload: serde_json::to_value(WireAudio {
-                audio: BASE64.encode(&f.audio.audio),
+                audio: encode_base64(&f.audio.audio),
                 sample_rate: f.audio.sample_rate,
                 num_channels: f.audio.num_channels,
             })
@@ -184,7 +183,7 @@ fn serialize_frame_to_json(frame: &dyn Frame) -> Option<String> {
         let wire = WireFrame {
             frame_type: "audio_output".to_string(),
             payload: serde_json::to_value(WireAudio {
-                audio: BASE64.encode(&f.audio.audio),
+                audio: encode_base64(&f.audio.audio),
                 sample_rate: f.audio.sample_rate,
                 num_channels: f.audio.num_channels,
             })
@@ -292,7 +291,7 @@ fn deserialize_frame_from_json(text: &str) -> Option<Arc<dyn Frame>> {
         }
         "audio_input" => {
             let w: WireAudio = serde_json::from_value(wire.payload).ok()?;
-            let audio = BASE64.decode(&w.audio).ok()?;
+            let audio = decode_base64(&w.audio)?;
             Some(Arc::new(InputAudioRawFrame::new(
                 audio,
                 w.sample_rate,
@@ -301,7 +300,7 @@ fn deserialize_frame_from_json(text: &str) -> Option<Arc<dyn Frame>> {
         }
         "audio_output" => {
             let w: WireAudio = serde_json::from_value(wire.payload).ok()?;
-            let audio = BASE64.decode(&w.audio).ok()?;
+            let audio = decode_base64(&w.audio)?;
             Some(Arc::new(OutputAudioRawFrame::new(
                 audio,
                 w.sample_rate,

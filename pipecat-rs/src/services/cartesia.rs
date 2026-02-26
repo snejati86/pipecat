@@ -46,7 +46,6 @@
 //! ```
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -62,22 +61,13 @@ use crate::frames::{
     ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, TTSAudioRawFrame,
     TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 use crate::services::{AIService, TTSService};
 
-// ---------------------------------------------------------------------------
-// Simple context ID generator (no uuid crate dependency)
-// ---------------------------------------------------------------------------
-
-/// Generate a unique context ID using a monotonic counter.
+/// Generate a unique context ID using the shared utility.
 fn generate_context_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("cartesia-ctx-{}-{}", ts, count)
+    crate::utils::helpers::generate_unique_id("cartesia-ctx")
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +375,12 @@ impl CartesiaTTSService {
         let mut ws_guard = self.ws.lock().await;
         if let Some(ref mut ws) = *ws_guard {
             tracing::debug!(service = %self.base.name(), "Disconnecting from Cartesia WebSocket");
-            let _ = ws.close(None).await;
+            if let Err(e) = ws.close(None).await {
+                tracing::warn!(
+                    service = %self.base.name(),
+                    "Failed to close Cartesia WebSocket: {e}"
+                );
+            }
         }
         *ws_guard = None;
     }
@@ -399,7 +394,12 @@ impl CartesiaTTSService {
                 cancel: true,
             };
             if let Ok(json) = serde_json::to_string(&cancel) {
-                let _ = ws.send(WsMessage::Text(json.into())).await;
+                if let Err(e) = ws.send(WsMessage::Text(json.into())).await {
+                    tracing::warn!(
+                        service = "CartesiaTTSService",
+                        "Failed to send cancel request over WebSocket: {e}"
+                    );
+                }
             }
         }
     }
@@ -647,11 +647,7 @@ impl fmt::Debug for CartesiaTTSService {
     }
 }
 
-impl fmt::Display for CartesiaTTSService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(CartesiaTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaTTSService {
@@ -986,11 +982,7 @@ impl fmt::Debug for CartesiaHttpTTSService {
     }
 }
 
-impl fmt::Display for CartesiaHttpTTSService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(CartesiaHttpTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaHttpTTSService {
@@ -1150,7 +1142,9 @@ mod tests {
         let config = service.build_voice_config();
         assert_eq!(config.mode, "id");
         assert_eq!(config.id, "voice-123");
-        let controls = config.__experimental_controls.unwrap();
+        let controls = config
+            .__experimental_controls
+            .expect("expected experimental controls to be set");
         assert_eq!(controls.emotion, vec!["excited", "happy"]);
     }
 

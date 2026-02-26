@@ -37,6 +37,7 @@ use crate::frames::{
     LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMSetToolsFrame,
     LLMTextFrame, MetricsFrame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
+use crate::impl_base_display;
 use crate::metrics::{LLMTokenUsage, LLMUsageMetricsData, MetricsData};
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 use crate::services::{AIService, LLMService, TTSService};
@@ -412,7 +413,7 @@ impl OpenAILLMService {
             // Process all complete lines in the buffer.
             while let Some(newline_pos) = line_buffer.find('\n') {
                 let line: String = line_buffer[..newline_pos].to_string();
-                line_buffer = line_buffer[newline_pos + 1..].to_string();
+                line_buffer.drain(..=newline_pos);
 
                 let line = line.trim();
                 if line.is_empty() {
@@ -477,14 +478,11 @@ impl OpenAILLMService {
                 }
 
                 // Skip chunks with no choices.
-                if chunk.choices.is_empty() {
+                let Some(choice) = chunk.choices.first() else {
                     continue;
-                }
-
-                let choice = &chunk.choices[0];
-                let delta = match &choice.delta {
-                    Some(d) => d,
-                    None => continue,
+                };
+                let Some(delta) = choice.delta.as_ref() else {
+                    continue;
                 };
 
                 // --- Handle tool calls -------------------------------------------
@@ -579,11 +577,7 @@ impl fmt::Debug for OpenAILLMService {
     }
 }
 
-impl fmt::Display for OpenAILLMService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(OpenAILLMService);
 
 // ---------------------------------------------------------------------------
 // FrameProcessor implementation
@@ -958,11 +952,7 @@ impl fmt::Debug for OpenAITTSService {
     }
 }
 
-impl fmt::Display for OpenAITTSService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(OpenAITTSService);
 
 // ---------------------------------------------------------------------------
 // FrameProcessor implementation for TTS
@@ -1213,7 +1203,8 @@ mod tests {
         let raw = r#"{"id":"chatcmpl-abc","model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
         let chunk: ChatCompletionChunk = serde_json::from_str(raw).unwrap();
         assert_eq!(chunk.choices.len(), 1);
-        let delta = chunk.choices[0].delta.as_ref().unwrap();
+        let choice = chunk.choices.first().expect("expected at least one choice");
+        let delta = choice.delta.as_ref().expect("expected delta");
         assert_eq!(delta.content.as_deref(), Some("Hello"));
     }
 
@@ -1221,7 +1212,8 @@ mod tests {
     fn test_parse_sse_tool_call_chunk() {
         let raw = r#"{"id":"chatcmpl-abc","model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_123","function":{"name":"get_weather","arguments":"{\"location\":"}}]},"finish_reason":null}]}"#;
         let chunk: ChatCompletionChunk = serde_json::from_str(raw).unwrap();
-        let delta = chunk.choices[0].delta.as_ref().unwrap();
+        let choice = chunk.choices.first().expect("expected at least one choice");
+        let delta = choice.delta.as_ref().expect("expected delta");
         let tool_calls = delta.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(
@@ -1244,11 +1236,8 @@ mod tests {
     fn test_parse_non_streaming_response() {
         let raw = r#"{"choices":[{"message":{"content":"Hello, world!"},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#;
         let resp: ChatCompletionResponse = serde_json::from_str(raw).unwrap();
-        let content = resp.choices[0]
-            .message
-            .as_ref()
-            .unwrap()
-            .content
+        let choice = resp.choices.first().expect("expected at least one choice");
+        let content = choice.message.as_ref().unwrap().content
             .as_deref();
         assert_eq!(content, Some("Hello, world!"));
     }

@@ -76,7 +76,12 @@ impl AudioRawData {
     /// Create new audio data, computing `num_frames` automatically.
     pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
         let num_frames = if num_channels > 0 {
-            audio.len() as u32 / (num_channels * 2)
+            let bytes_per_frame = (num_channels as usize).saturating_mul(2);
+            if bytes_per_frame > 0 {
+                (audio.len() / bytes_per_frame) as u32
+            } else {
+                0
+            }
         } else {
             0
         };

@@ -21,6 +21,54 @@ pub mod audio;
 pub mod filters;
 pub mod metrics;
 
+/// Implement `Debug` and `Display` for a type that contains a `base: BaseProcessor` field.
+///
+/// The `Debug` impl prints `TypeName(name)` and the `Display` impl prints just the
+/// processor name obtained from `self.base.name()`.
+///
+/// # Examples
+///
+/// ```ignore
+/// impl_base_debug_display!(MyProcessor);
+/// ```
+#[macro_export]
+macro_rules! impl_base_debug_display {
+    ($struct_name:ident) => {
+        impl std::fmt::Debug for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}({})", stringify!($struct_name), self.base.name())
+            }
+        }
+
+        impl std::fmt::Display for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.base.name())
+            }
+        }
+    };
+}
+
+/// Implement only `Display` for a type that contains a `base: BaseProcessor` field.
+///
+/// Use this when the type needs a custom `Debug` implementation (e.g. to show
+/// extra fields) but the standard `Display` that prints `self.base.name()`.
+///
+/// # Examples
+///
+/// ```ignore
+/// impl_base_display!(CartesiaTTSService);
+/// ```
+#[macro_export]
+macro_rules! impl_base_display {
+    ($struct_name:ident) => {
+        impl std::fmt::Display for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.base.name())
+            }
+        }
+    };
+}
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -232,11 +280,7 @@ impl fmt::Debug for BaseProcessor {
     }
 }
 
-impl fmt::Display for BaseProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(BaseProcessor);
 
 /// A simple passthrough processor that forwards all frames unchanged.
 pub struct PassthroughProcessor {
@@ -257,17 +301,7 @@ impl PassthroughProcessor {
     }
 }
 
-impl fmt::Debug for PassthroughProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PassthroughProcessor({})", self.base.name())
-    }
-}
-
-impl fmt::Display for PassthroughProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(PassthroughProcessor);
 
 #[async_trait]
 impl FrameProcessor for PassthroughProcessor {

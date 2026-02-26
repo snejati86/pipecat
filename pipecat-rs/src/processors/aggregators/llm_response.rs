@@ -34,6 +34,7 @@ use crate::frames::{
     LLMMessagesUpdateFrame, LLMSetToolsFrame, TextFrame, TranscriptionFrame,
     UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 use super::llm_context::LLMContext;
@@ -102,11 +103,7 @@ impl fmt::Debug for LLMResponseAggregator {
     }
 }
 
-impl fmt::Display for LLMResponseAggregator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(LLMResponseAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMResponseAggregator {
@@ -287,11 +284,7 @@ impl fmt::Debug for LLMUserContextAggregator {
     }
 }
 
-impl fmt::Display for LLMUserContextAggregator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(LLMUserContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMUserContextAggregator {
@@ -504,11 +497,7 @@ impl fmt::Debug for LLMAssistantContextAggregator {
     }
 }
 
-impl fmt::Display for LLMAssistantContextAggregator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(LLMAssistantContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMAssistantContextAggregator {

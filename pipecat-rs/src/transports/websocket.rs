@@ -58,6 +58,7 @@ use crate::frames::{
     CancelFrame, EndFrame, Frame, InputAudioRawFrame,
     InterruptionFrame, OutputAudioRawFrame, OutputTransportMessageFrame,
 };
+use crate::impl_base_debug_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 use crate::serializers::{FrameSerializer, SerializedFrame};
 use crate::transports::{Transport, TransportParams};
@@ -329,7 +330,9 @@ impl WebSocketTransport {
         tracing::info!("WebSocketTransport: shutting down");
 
         // Signal the server accept loop to stop.
-        let _ = self.server_shutdown_tx.send(true);
+        if let Err(e) = self.server_shutdown_tx.send(true) {
+            tracing::warn!("WebSocketTransport: failed to send server shutdown signal: {}", e);
+        }
 
         // Signal the receive loop to stop.
         self.shutdown.notify_waiters();
@@ -339,12 +342,30 @@ impl WebSocketTransport {
 
         // Wait for the receive task to finish.
         if let Some(handle) = self.recv_task.lock().await.take() {
-            let _ = handle.await;
+            handle.abort();
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => tracing::debug!("recv_task shut down cleanly"),
+                Ok(Err(e)) => {
+                    if !e.is_cancelled() {
+                        tracing::warn!("recv_task panicked: {}", e);
+                    }
+                }
+                Err(_) => tracing::warn!("recv_task did not shut down within timeout"),
+            }
         }
 
         // Wait for the server task to finish.
         if let Some(handle) = self.server_task.lock().await.take() {
-            let _ = handle.await;
+            handle.abort();
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => tracing::debug!("server_task shut down cleanly"),
+                Ok(Err(e)) => {
+                    if !e.is_cancelled() {
+                        tracing::warn!("server_task panicked: {}", e);
+                    }
+                }
+                Err(_) => tracing::warn!("server_task did not shut down within timeout"),
+            }
         }
     }
 
@@ -514,20 +535,7 @@ impl WebSocketInputProcessor {
     }
 }
 
-impl fmt::Debug for WebSocketInputProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WebSocketInputProcessor")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
-            .finish()
-    }
-}
-
-impl fmt::Display for WebSocketInputProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(WebSocketInputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketInputProcessor {
@@ -657,15 +665,32 @@ impl WebSocketOutputProcessor {
             SerializedFrame::Binary(b) => Message::Binary(b),
         };
 
+        // Take the sink out of the connection state so we can release the
+        // lock before performing the potentially slow network send.
+        let mut sink = {
+            let mut conn = self.connection.lock().await;
+            if !conn.connected {
+                return;
+            }
+            match conn.sink.take() {
+                Some(s) => s,
+                None => return,
+            }
+        };
+        // Lock is released here.
+
+        let send_result = sink.send(msg).await;
+
+        // Re-acquire the lock to put the sink back (or mark disconnected).
         let mut conn = self.connection.lock().await;
-        if !conn.connected {
-            return;
-        }
-        if let Some(ref mut sink) = conn.sink {
-            if let Err(e) = sink.send(msg).await {
+        match send_result {
+            Ok(()) => {
+                conn.sink = Some(sink);
+            }
+            Err(e) => {
                 tracing::error!("WebSocketOutputProcessor: send error: {}", e);
                 conn.connected = false;
-                conn.sink = None;
+                // sink is dropped here, no need to put it back.
             }
         }
     }
@@ -685,20 +710,7 @@ impl WebSocketOutputProcessor {
     }
 }
 
-impl fmt::Debug for WebSocketOutputProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WebSocketOutputProcessor")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
-            .finish()
-    }
-}
-
-impl fmt::Display for WebSocketOutputProcessor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(WebSocketOutputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketOutputProcessor {
@@ -840,7 +852,9 @@ mod tests {
                 while let Some(Ok(msg)) = read.next().await {
                     match msg {
                         Message::Text(_) | Message::Binary(_) => {
-                            let _ = write.send(msg).await;
+                            if let Err(e) = write.send(msg).await {
+                                tracing::warn!("echo server: failed to send: {}", e);
+                            }
                         }
                         Message::Close(_) => break,
                         _ => {}

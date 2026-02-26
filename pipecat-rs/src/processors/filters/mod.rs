@@ -3,7 +3,6 @@
 
 //! Filter processors for controlling frame flow through the pipeline.
 
-use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+use crate::impl_base_debug_display;
 use crate::frames::Frame;
 use crate::processors::{
     BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup,
@@ -35,17 +35,7 @@ impl Default for IdentityFilter {
     }
 }
 
-impl fmt::Debug for IdentityFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "IdentityFilter({})", self.base.name())
-    }
-}
-
-impl fmt::Display for IdentityFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(IdentityFilter);
 
 #[async_trait]
 impl FrameProcessor for IdentityFilter {
@@ -89,17 +79,7 @@ impl FrameFilter {
     }
 }
 
-impl fmt::Debug for FrameFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FrameFilter({})", self.base.name())
-    }
-}
-
-impl fmt::Display for FrameFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(FrameFilter);
 
 #[async_trait]
 impl FrameProcessor for FrameFilter {
@@ -160,17 +140,7 @@ impl FunctionFilter {
     }
 }
 
-impl fmt::Debug for FunctionFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FunctionFilter({})", self.base.name())
-    }
-}
-
-impl fmt::Display for FunctionFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(FunctionFilter);
 
 #[async_trait]
 impl FrameProcessor for FunctionFilter {
@@ -231,17 +201,7 @@ impl WakeCheckFilter {
     }
 }
 
-impl fmt::Debug for WakeCheckFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WakeCheckFilter({})", self.base.name())
-    }
-}
-
-impl fmt::Display for WakeCheckFilter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(WakeCheckFilter);
 
 #[async_trait]
 impl FrameProcessor for WakeCheckFilter {

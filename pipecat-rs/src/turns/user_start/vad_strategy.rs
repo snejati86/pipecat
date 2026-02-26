@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::frames::{Frame, InterruptionFrame, StartFrame, UserStartedSpeakingFrame};
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 
 /// VAD-based user turn start strategy.
@@ -86,11 +87,7 @@ impl fmt::Debug for VADUserTurnStartStrategy {
     }
 }
 
-impl fmt::Display for VADUserTurnStartStrategy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(VADUserTurnStartStrategy);
 
 #[async_trait]
 impl FrameProcessor for VADUserTurnStartStrategy {

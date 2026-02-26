@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::frames::{CancelFrame, EndFrame, Frame, StartFrame};
+use crate::impl_base_debug_display;
+use crate::frames::{CancelFrame, EndFrame, ErrorFrame, Frame, StartFrame, StopFrame};
 use crate::observers::Observer;
 use crate::processors::{
     BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup, drive_processor,
@@ -32,17 +33,7 @@ impl PipelineSource {
     }
 }
 
-impl fmt::Debug for PipelineSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PipelineSource({})", self.base.name())
-    }
-}
-
-impl fmt::Display for PipelineSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(PipelineSource);
 
 #[async_trait]
 impl FrameProcessor for PipelineSource {
@@ -81,17 +72,7 @@ impl PipelineSink {
     }
 }
 
-impl fmt::Debug for PipelineSink {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PipelineSink({})", self.base.name())
-    }
-}
-
-impl fmt::Display for PipelineSink {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(PipelineSink);
 
 #[async_trait]
 impl FrameProcessor for PipelineSink {
@@ -185,17 +166,7 @@ impl Pipeline {
     }
 }
 
-impl fmt::Debug for Pipeline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Pipeline({})", self.base.name())
-    }
-}
-
-impl fmt::Display for Pipeline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_debug_display!(Pipeline);
 
 #[async_trait]
 impl FrameProcessor for Pipeline {
@@ -272,6 +243,8 @@ pub struct PipelineParams {
     pub enable_metrics: bool,
     pub enable_usage_metrics: bool,
     pub heartbeat_interval_secs: f64,
+    pub audio_in_sample_rate: u32,
+    pub audio_out_sample_rate: u32,
 }
 
 impl Default for PipelineParams {
@@ -281,6 +254,8 @@ impl Default for PipelineParams {
             enable_metrics: false,
             enable_usage_metrics: false,
             heartbeat_interval_secs: 5.0,
+            audio_in_sample_rate: 16000,
+            audio_out_sample_rate: 24000,
         }
     }
 }
@@ -354,8 +329,8 @@ impl PipelineTask {
 
         // Send StartFrame via drive_processor (no lock held during chain processing)
         let start_frame = Arc::new(StartFrame::new(
-            16000,
-            24000,
+            self.params.audio_in_sample_rate,
+            self.params.audio_out_sample_rate,
             self.params.allow_interruptions,
             self.params.enable_metrics,
         ));
@@ -378,11 +353,21 @@ impl PipelineTask {
                     let frame_ref: &dyn Frame = frame.as_ref();
                     let is_end = frame_ref.as_any().downcast_ref::<EndFrame>().is_some();
                     let is_cancel = frame_ref.as_any().downcast_ref::<CancelFrame>().is_some();
+                    let is_stop = frame_ref.as_any().downcast_ref::<StopFrame>().is_some();
+                    let is_fatal_error = frame_ref
+                        .as_any()
+                        .downcast_ref::<ErrorFrame>()
+                        .is_some_and(|e| e.fatal);
 
                     let pipeline_dyn = pipeline.clone() as Arc<Mutex<dyn FrameProcessor>>;
                     drive_processor(pipeline_dyn, frame, FrameDirection::Downstream).await;
 
-                    if is_end || is_cancel {
+                    if is_fatal_error {
+                        tracing::error!("Fatal error received, stopping pipeline");
+                        break;
+                    }
+
+                    if is_end || is_cancel || is_stop {
                         break;
                     }
                 }

@@ -27,6 +27,7 @@ use crate::frames::{
     Frame, InputAudioRawFrame, StartFrame, UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame, VADParamsUpdateFrame,
 };
+use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 
 /// Trait for providing voice confidence from an audio buffer.
@@ -370,11 +371,7 @@ impl fmt::Debug for VADAnalyzer {
     }
 }
 
-impl fmt::Display for VADAnalyzer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.base.name())
-    }
-}
+impl_base_display!(VADAnalyzer);
 
 #[async_trait]
 impl FrameProcessor for VADAnalyzer {
