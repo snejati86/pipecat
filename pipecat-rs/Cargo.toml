@@ -1,0 +1,18 @@
+[package]
+name = "pipecat"
+version = "0.1.0"
+edition = "2021"
+description = "Pipecat - Real-time voice and multimodal conversational AI framework (Rust port)"
+license = "BSD-2-Clause"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+downcast-rs = "2"
+tracing = "0.1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
