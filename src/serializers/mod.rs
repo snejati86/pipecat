@@ -3,6 +3,8 @@
 
 //! Frame serialization for WebSocket transport protocols.
 
+pub mod exotel;
+pub mod genesys;
 pub mod json;
 pub mod plivo;
 pub mod protobuf;
