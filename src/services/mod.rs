@@ -6,17 +6,22 @@
 pub mod anthropic;
 pub mod assemblyai;
 pub mod cartesia;
+pub mod cerebras;
 pub mod deepgram;
 pub mod deepseek;
 pub mod elevenlabs;
 pub mod google;
+pub mod google_stt;
 pub mod google_tts;
+pub mod grok;
 pub mod groq;
+pub mod hume;
 pub mod lmnt;
 pub mod mistral;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
+pub mod perplexity;
 pub mod together;
 pub mod whisper;
 
