@@ -4,35 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Pipecat is an open-source Python framework for building real-time voice and multimodal conversational AI agents. It orchestrates audio/video, AI services, transports, and conversation pipelines using a frame-based architecture.
+Pipecat is a Rust framework for building real-time voice and multimodal conversational AI agents. It orchestrates audio/video, AI services, transports, and conversation pipelines using a frame-based architecture.
 
 ## Common Commands
 
 ```bash
-# Setup development environment
-uv sync --group dev --all-extras --no-extra gstreamer --no-extra krisp
-
-# Install pre-commit hooks
-uv run pre-commit install
+# Build
+cargo build
 
 # Run all tests
-uv run pytest
+cargo test
 
 # Run a single test file
-uv run pytest tests/test_name.py
+cargo test --test test_pipeline
 
 # Run a specific test
-uv run pytest tests/test_name.py::test_function_name
+cargo test test_wake_check_with_wake_word
 
-# Preview changelog
-uv run towncrier build --draft --version Unreleased
+# Check compilation without building
+cargo check
 
-# Lint and format check
-uv run ruff check
-uv run ruff format --check
-
-# Update dependencies (after editing pyproject.toml)
-uv lock && uv sync
+# Lint
+cargo clippy
 ```
 
 ## Architecture
@@ -47,111 +40,108 @@ All data flows as **Frame** objects through a pipeline of **FrameProcessors**:
 
 **Key components:**
 
-- **Frames** (`src/pipecat/frames/frames.py`): Data units (audio, text, video) and control signals. Flow DOWNSTREAM (input→output) or UPSTREAM (acknowledgments/errors).
+- **Frames** (`src/frames/mod.rs`): Data units (audio, text, video) and control signals. 70+ types organized as System, Data, and Control frames. Flow DOWNSTREAM (input→output) or UPSTREAM (acknowledgments/errors).
 
-- **FrameProcessor** (`src/pipecat/processors/frame_processor.py`): Base processing unit. Each processor receives frames, processes them, and pushes results downstream.
+- **FrameProcessor** (`src/processors/mod.rs`): Base processing unit. Each processor receives frames, processes them, and pushes results downstream. Implement `base()`, `base_mut()`, and `process_frame()`.
 
-- **Pipeline** (`src/pipecat/pipeline/pipeline.py`): Chains processors together.
+- **Pipeline** (`src/pipeline/mod.rs`): Chains processors together. Use `Pipeline::builder()` or the `pipeline!` macro.
 
-- **ParallelPipeline** (`src/pipecat/pipeline/parallel_pipeline.py`): Runs multiple pipelines in parallel.
+- **PipelineTask** (`src/pipeline/mod.rs`): Manages lifecycle (start, run, stop) of a pipeline. Use `PipelineTask::builder(pipeline)`.
 
-- **Transports** (`src/pipecat/transports/`): Transports are frame processors used for external I/O layer (Daily WebRTC, LiveKit WebRTC, WebSocket, Local). Abstract interface via `BaseTransport`, `BaseInputTransport` and `BaseOutputTransport`.
+- **PipelineRunner** (`src/pipeline/mod.rs`): Top-level entry point: `PipelineRunner::new().run(&task).await`.
 
-- **Pipeline Task (`src/pipecat/pipeline/task.py`)**: Runs and manages a pipeline. Pipeline tasks send the first frame, `StartFrame`, to the pipeline in order for processors to know they can start processing and pushing frames. Pipeline tasks internally create a pipeline with two additional processors, a source processor before the user-defined pipeline and a sink processor at the end. Those are used for multiple things: error handling, pipeline task level events, heartbeat monitoring, etc.
+- **Services** (`src/services/`): AI provider integrations (OpenAI LLM/TTS, Deepgram STT, Cartesia TTS). All use builder pattern: `.with_model()`, `.with_language()`, etc.
 
-- **Pipeline Runner (`src/pipecat/pipeline/runner.py`)**: High-level entry point for executing pipeline tasks. Handles signal management (SIGINT/SIGTERM) for graceful shutdown and optional garbage collection. Run a single pipeline task with `await runner.run(task)` or multiple concurrently with `await asyncio.gather(runner.run(task1), runner.run(task2))`.
+- **Transports** (`src/transports/`): WebSocket transport for external I/O. `WebSocketTransport::new(params, serializer)`.
 
-- **Services** (`src/pipecat/services/`): 60+ AI provider integrations (STT, TTS, LLM, etc.). Extend base classes: `AIService`, `LLMService`, `STTService`, `TTSService`, `VisionService`.
+- **Serializers** (`src/serializers/`): Convert frames to/from wire formats. `JsonFrameSerializer` for JSON-over-WebSocket.
 
-- **Serializers** (`src/pipecat/serializers/`): Convert frames to/from wire formats for WebSocket transports. `FrameSerializer` base class defines `serialize()` and `deserialize()`. Telephony serializers (Twilio, Plivo, Vonage, Telnyx, Exotel, Genesys) handle provider-specific protocols and audio encoding (e.g., μ-law).
-
-- **RTVI** (`src/pipecat/processors/frameworks/rtvi.py`): Real-Time Voice Interface protocol bridging clients and the pipeline. `RTVIProcessor` handles incoming client messages (text input, audio, function call results). `RTVIObserver` converts pipeline frames to outgoing messages: user/bot speaking events, transcriptions, LLM/TTS lifecycle, function calls, metrics, and audio levels.
-
-- **Observers** (`src/pipecat/observers/`): Monitor frame flow without modifying the pipeline. Passed to `PipelineTask` via the `observers` parameter. Implement `on_process_frame()` and `on_push_frame()` callbacks.
+- **Observers** (`src/observers/`): Monitor frame flow without modifying the pipeline. Implement `Observer` trait with `on_process_frame()` / `on_push_frame()`.
 
 ### Important Patterns
 
-- **Context Aggregation**: `LLMContext` accumulates messages for LLM calls; `UserResponse` aggregates user input
-
-- **Turn Management**: Turn management is done through `LLMUserAggregator` and
-  `LLMAssistantAggregator`, created with `LLMContextAggregatorPair`
-
-- **User turn strategies**: Detection of when the user starts and stops speaking is done via user turn start/stop strategies. They push `UserStartedSpeakingFrame` and `UserStoppedSpeakingFrame` respectively.
-
-- **Interruptions**: Interruptions are usually triggered by a user turn start strategy (e.g. `VADUserTurnStartStrategy`) but they can be triggered by other processors as well, in which case the user turn start strategies don't need to. An `InterruptionFrame` carries an optional `asyncio.Event` that is set when the frame reaches the pipeline sink. If a processor stops an `InterruptionFrame` from propagating downstream (i.e., doesn't push it), it **must** call `frame.complete()` to avoid stalling `push_interruption_task_frame_and_wait()` callers.
-
-- **Uninterruptible Frames**: These are frames that will not be removed from internal queues even if there's an interruption. For example, `EndFrame` and `StopFrame`.
-
-- **Events**: Most classes in Pipecat have `BaseObject` as the very base class. `BaseObject` has support for events. Events can run in the background in an async task (default) or synchronously (`sync=True`) if we want immediate action. Synchronous event handlers need to execute fast.
-
-- **Async Task Management**: Always use `self.create_task(coroutine, name)` instead of raw `asyncio.create_task()`. The `TaskManager` automatically tracks tasks and cleans them up on processor shutdown. Use `await self.cancel_task(task, timeout)` for cancellation.
-
-- **Error Handling**: Use `await self.push_error(msg, exception, fatal)` to push errors upstream. Services should use `fatal=False` (the default) so application code can handle errors and take action (e.g. switch to another service).
+- **Frame downcasting**: Use `frame.downcast_ref::<TextFrame>()` to check frame types
+- **Prelude**: `use pipecat::prelude::*` for common re-exports
+- **Helper functions**: `frame(TextFrame::new("hi"))` wraps in Arc, `processor(p)` wraps in Arc<Mutex<>>
+- **Debug/Display macros**: `impl_base_debug_display!(MyProcessor)` generates required trait impls
+- **Builder pattern**: Services, Pipeline, PipelineTask all use builders
+- **Async task management**: Use `tokio` async runtime with `async_trait`
+- **Error handling**: Use `self.push_error(msg, fatal).await` to push errors upstream
 
 ### Key Directories
 
-| Directory                  | Purpose                                            |
-| -------------------------- | -------------------------------------------------- |
-| `src/pipecat/frames/`      | Frame definitions (100+ types)                     |
-| `src/pipecat/processors/`  | FrameProcessor base + aggregators, filters, audio  |
-| `src/pipecat/pipeline/`    | Pipeline orchestration                             |
-| `src/pipecat/services/`    | AI service integrations (60+ providers)            |
-| `src/pipecat/transports/`  | Transport layer (Daily, LiveKit, WebSocket, Local) |
-| `src/pipecat/serializers/` | Frame serialization for WebSocket protocols        |
-| `src/pipecat/observers/`   | Pipeline observers for monitoring frame flow       |
-| `src/pipecat/audio/`       | VAD, filters, mixers, turn detection, DTMF         |
-| `src/pipecat/turns/`       | User turn management                               |
+| Directory | Purpose |
+|-----------|---------|
+| `src/frames/` | Frame definitions (70+ types) |
+| `src/processors/` | FrameProcessor base + aggregators, filters |
+| `src/pipeline/` | Pipeline orchestration |
+| `src/services/` | AI service integrations (OpenAI, Deepgram, Cartesia) |
+| `src/transports/` | Transport layer (WebSocket) |
+| `src/serializers/` | Frame serialization (JSON) |
+| `src/observers/` | Pipeline observers |
+| `src/audio/` | VAD, filters, mixers, turn detection |
+| `src/turns/` | User turn management |
+| `src/metrics/` | Telemetry data models |
+| `src/utils/` | BaseObject, shared helpers |
 
 ## Code Style
 
-- **Docstrings**: Google-style. Classes describe purpose; `__init__` has `Args:` section; dataclasses use `Parameters:` section.
-- **Linting**: Ruff (line length 100). Pre-commit hooks enforce formatting.
-- **Type hints**: Required for complex async code.
-- **Dataclass vs Pydantic**: Use `@dataclass` for frames and internal pipeline data (high-frequency, no validation needed). Use Pydantic `BaseModel` for configuration, parameters, metrics, and external API data (benefits from validation and serialization). Specifically:
-  - `@dataclass`: Frame types, context aggregator pairs, internal data containers
-  - `BaseModel`: Service `InputParams`, transport/VAD/turn params, metrics data, API request/response models, serializer params
+- **Formatting**: Use `cargo fmt`
+- **Linting**: Use `cargo clippy`
+- **Type hints**: Required for public APIs
+- **Docstrings**: Use `///` doc comments with examples where helpful
+- **Error handling**: Use `thiserror` for error types. Push `ErrorFrame` on service failures.
 
-### Docstring Example
+### Writing a Custom Processor
 
-```python
-class MyService(LLMService):
-    """Description of what the service does.
+```rust
+use pipecat::prelude::*;
+use pipecat::impl_base_debug_display;
 
-    More detailed description.
+struct MyProcessor {
+    base: BaseProcessor,
+}
 
-    Event handlers available:
+impl MyProcessor {
+    fn new() -> Self {
+        Self { base: BaseProcessor::new(Some("MyProcessor".into()), false) }
+    }
+}
 
-    - on_connected: Called when we are connected
+impl_base_debug_display!(MyProcessor);
 
-    Example::
+#[async_trait::async_trait]
+impl FrameProcessor for MyProcessor {
+    fn base(&self) -> &BaseProcessor { &self.base }
+    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
 
-        @service.event_handler("on_connected")
-        async def on_connected(service, frame):
-            ...
-    """
-
-    def __init__(self, param1: str, **kwargs):
-        """Initialize the service.
-
-        Args:
-            param1: Description of param1.
-            **kwargs: Additional arguments passed to parent.
-        """
-        super().__init__(**kwargs)
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
+        // Process specific frame types
+        if let Some(text) = frame.downcast_ref::<TextFrame>() {
+            // Transform and push
+            self.push_frame(Arc::new(TextFrame::new(text.text.to_uppercase())), direction).await;
+        } else {
+            // Pass all other frames through
+            self.push_frame(frame, direction).await;
+        }
+    }
+}
 ```
-
-## Service Implementation
-
-When adding a new service:
-
-1. Extend the appropriate base class (`STTService`, `TTSService`, `LLMService`, etc.)
-2. Implement required abstract methods
-3. Handle necessary frames
-4. By default, all frames should be pushed in the direction they came
-5. Push `ErrorFrame` on failures
-6. Add metrics tracking via `MetricsData` if relevant
-7. Follow the pattern of existing services in `src/pipecat/services/`
 
 ## Testing
 
-Test utilities live in `src/pipecat/tests/utils.py`. Use `run_test()` to send frames through a pipeline and assert expected output frames in each direction. Use `SleepFrame(sleep=N)` to add delays between frames.
+Test utilities live in `src/tests/mod.rs`. Use `run_test()` to send frames through a pipeline and assert expected output frames in each direction.
+
+```rust
+use pipecat::tests::run_test;
+
+run_test(
+    processor,
+    frames_to_send,
+    Some(vec!["TextFrame"]),  // expected downstream
+    None,                     // expected upstream
+    true,                     // send EndFrame after
+    vec![],                   // observers
+    None,                     // pipeline params
+).await;
+```
