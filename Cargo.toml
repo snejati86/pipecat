@@ -27,3 +27,10 @@ prost-build = "0.13"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+axum = { version = "0.8", features = ["ws"] }
+
+[[example]]
+name = "twilio_outbound"
+path = "examples/twilio_outbound.rs"
