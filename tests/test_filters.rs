@@ -28,10 +28,7 @@ async fn test_identity_filter() {
         Arc::new(UserStoppedSpeakingFrame::new()),
     ];
 
-    let expected_down = vec![
-        "UserStartedSpeakingFrame",
-        "UserStoppedSpeakingFrame",
-    ];
+    let expected_down = vec!["UserStartedSpeakingFrame", "UserStoppedSpeakingFrame"];
 
     run_test(
         filter,
@@ -51,15 +48,12 @@ async fn test_identity_filter() {
 
 #[tokio::test]
 async fn test_frame_filter_text_frame() {
-    let filter = Arc::new(Mutex::new(FrameFilter::new(
-        Box::new(|frame: &dyn Frame| {
-            frame.as_any().downcast_ref::<TextFrame>().is_some()
-        }),
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(FrameFilter::new(Box::new(
+        |frame: &dyn Frame| frame.as_any().downcast_ref::<TextFrame>().is_some(),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TextFrame::new("Hello Pipecat!".to_string())),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> =
+        vec![Arc::new(TextFrame::new("Hello Pipecat!".to_string()))];
 
     let expected_down = vec!["TextFrame"];
 
@@ -77,15 +71,11 @@ async fn test_frame_filter_text_frame() {
 
 #[tokio::test]
 async fn test_frame_filter_end_frame() {
-    let filter = Arc::new(Mutex::new(FrameFilter::new(
-        Box::new(|frame: &dyn Frame| {
-            frame.as_any().downcast_ref::<EndFrame>().is_some()
-        }),
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(FrameFilter::new(Box::new(
+        |frame: &dyn Frame| frame.as_any().downcast_ref::<EndFrame>().is_some(),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(EndFrame::new()),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(EndFrame::new())];
 
     let expected_down = vec!["EndFrame"];
 
@@ -108,9 +98,7 @@ async fn test_frame_filter_system_frame_passes() {
         Box::new(|_frame: &dyn Frame| false), // Nothing matches
     ))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(UserStartedSpeakingFrame::new()),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(UserStartedSpeakingFrame::new())];
 
     let expected_down = vec!["UserStartedSpeakingFrame"];
 
@@ -132,13 +120,12 @@ async fn test_frame_filter_system_frame_passes() {
 
 #[tokio::test]
 async fn test_function_filter_passthrough() {
-    let filter = Arc::new(Mutex::new(FunctionFilter::downstream(
-        Box::new(|_frame: Arc<dyn Frame>| Box::pin(async move { true })),
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(FunctionFilter::downstream(Box::new(
+        |_frame: Arc<dyn Frame>| Box::pin(async move { true }),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TextFrame::new("Hello Pipecat!".to_string())),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> =
+        vec![Arc::new(TextFrame::new("Hello Pipecat!".to_string()))];
 
     let expected_down = vec!["TextFrame"];
 
@@ -156,13 +143,12 @@ async fn test_function_filter_passthrough() {
 
 #[tokio::test]
 async fn test_function_filter_no_passthrough() {
-    let filter = Arc::new(Mutex::new(FunctionFilter::downstream(
-        Box::new(|_frame: Arc<dyn Frame>| Box::pin(async move { false })),
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(FunctionFilter::downstream(Box::new(
+        |_frame: Arc<dyn Frame>| Box::pin(async move { false }),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TextFrame::new("Hello Pipecat!".to_string())),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> =
+        vec![Arc::new(TextFrame::new("Hello Pipecat!".to_string()))];
 
     let expected_down: Vec<&str> = vec![];
 
@@ -206,12 +192,20 @@ impl std::fmt::Display for UpstreamPusher {
 
 #[async_trait::async_trait]
 impl FrameProcessor for UpstreamPusher {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame.clone(), direction).await;
-        if frame.as_any().downcast_ref::<UserStartedSpeakingFrame>().is_some() {
+        if frame
+            .as_any()
+            .downcast_ref::<UserStartedSpeakingFrame>()
+            .is_some()
+        {
             let text = Arc::new(TextFrame::new("upstream".to_string()));
             self.push_frame(text, FrameDirection::Upstream).await;
         }
@@ -224,17 +218,14 @@ async fn test_function_filter_no_direction_filters_both() {
 
     // Filter that blocks TextFrames in both directions (direction=None)
     let filter_fn: AsyncFilterFn = Box::new(|frame: Arc<dyn Frame>| {
-        Box::pin(async move {
-            frame.as_any().downcast_ref::<TextFrame>().is_none()
-        })
+        Box::pin(async move { frame.as_any().downcast_ref::<TextFrame>().is_none() })
     });
     let filter = Arc::new(Mutex::new(FunctionFilter::new(filter_fn, None)))
         as Arc<Mutex<dyn FrameProcessor>>;
-    let pusher = Arc::new(Mutex::new(UpstreamPusher::new()))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pusher = Arc::new(Mutex::new(UpstreamPusher::new())) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher])))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pipeline =
+        Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher]))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TextFrame::new("Hello!".to_string())),
@@ -263,21 +254,16 @@ async fn test_function_filter_downstream_passes_upstream() {
 
     // direction=DOWNSTREAM: blocks text only downstream
     let filter_fn: AsyncFilterFn = Box::new(|frame: Arc<dyn Frame>| {
-        Box::pin(async move {
-            frame.as_any().downcast_ref::<TextFrame>().is_none()
-        })
+        Box::pin(async move { frame.as_any().downcast_ref::<TextFrame>().is_none() })
     });
     let filter = Arc::new(Mutex::new(FunctionFilter::downstream(filter_fn)))
         as Arc<Mutex<dyn FrameProcessor>>;
-    let pusher = Arc::new(Mutex::new(UpstreamPusher::new()))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pusher = Arc::new(Mutex::new(UpstreamPusher::new())) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher])))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pipeline =
+        Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher]))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(UserStartedSpeakingFrame::new()),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(UserStartedSpeakingFrame::new())];
 
     // Upstream TextFrame passes through (filter only applies downstream)
     let expected_down = vec!["UserStartedSpeakingFrame"];
@@ -301,19 +287,16 @@ async fn test_function_filter_upstream_passes_downstream() {
 
     // direction=UPSTREAM: blocks text only upstream, downstream passes through
     let filter_fn: AsyncFilterFn = Box::new(|frame: Arc<dyn Frame>| {
-        Box::pin(async move {
-            frame.as_any().downcast_ref::<TextFrame>().is_none()
-        })
+        Box::pin(async move { frame.as_any().downcast_ref::<TextFrame>().is_none() })
     });
     let filter = Arc::new(Mutex::new(FunctionFilter::new(
         filter_fn,
         Some(FrameDirection::Upstream),
     ))) as Arc<Mutex<dyn FrameProcessor>>;
-    let pusher = Arc::new(Mutex::new(UpstreamPusher::new()))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pusher = Arc::new(Mutex::new(UpstreamPusher::new())) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher])))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pipeline =
+        Arc::new(Mutex::new(Pipeline::new(vec![filter, pusher]))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TextFrame::new("Hello!".to_string())),
@@ -343,17 +326,15 @@ async fn test_function_filter_upstream_passes_downstream() {
 
 #[tokio::test]
 async fn test_wake_check_no_wake_word() {
-    let filter = Arc::new(Mutex::new(WakeCheckFilter::new(
-        vec!["Hey, Pipecat".to_string()],
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(WakeCheckFilter::new(vec![
+        "Hey, Pipecat".to_string()
+    ]))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TranscriptionFrame::new(
-            "Phrase 1".to_string(),
-            "test".to_string(),
-            "".to_string(),
-        )),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(TranscriptionFrame::new(
+        "Phrase 1".to_string(),
+        "test".to_string(),
+        "".to_string(),
+    ))];
 
     let expected_down: Vec<&str> = vec![];
 
@@ -371,9 +352,9 @@ async fn test_wake_check_no_wake_word() {
 
 #[tokio::test]
 async fn test_wake_check_with_wake_word() {
-    let filter = Arc::new(Mutex::new(WakeCheckFilter::new(
-        vec!["Hey, Pipecat".to_string()],
-    ))) as Arc<Mutex<dyn FrameProcessor>>;
+    let filter = Arc::new(Mutex::new(WakeCheckFilter::new(vec![
+        "Hey, Pipecat".to_string()
+    ]))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TranscriptionFrame::new(

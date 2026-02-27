@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::impl_base_debug_display;
 use crate::frames::{EndFrame, Frame, SleepFrame, StartFrame};
+use crate::impl_base_debug_display;
 use crate::observers::Observer;
 use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -51,10 +51,16 @@ impl_base_debug_display!(QueuedFrameProcessor);
 
 #[async_trait]
 impl FrameProcessor for QueuedFrameProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    fn is_direct_mode(&self) -> bool { true }
+    fn is_direct_mode(&self) -> bool {
+        true
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         if direction == self.queue_direction {
@@ -78,7 +84,7 @@ pub struct TestResult {
 
 /// Run a test pipeline with the specified processor and validate frame flow.
 ///
-/// Creates a pipeline: [source] -> [processor] -> [sink]
+/// Creates a pipeline: `[source] -> [processor] -> [sink]`
 /// Source captures upstream frames, sink captures downstream frames.
 pub async fn run_test(
     processor: Arc<Mutex<dyn FrameProcessor>>,
@@ -140,7 +146,8 @@ pub async fn run_test(
 
     // Filter out EndFrame from downstream if we sent one
     let down_frames: Vec<Arc<dyn Frame>> = if send_end_frame {
-        down_frames.iter()
+        down_frames
+            .iter()
             .filter(|f| f.as_any().downcast_ref::<EndFrame>().is_none())
             .cloned()
             .collect()

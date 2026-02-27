@@ -21,9 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::frames::{
-    Frame, InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame,
-};
+use crate::frames::{Frame, InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame};
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
@@ -109,8 +107,12 @@ impl_base_display!(SentenceAggregator);
 
 #[async_trait]
 impl FrameProcessor for SentenceAggregator {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Ignore interim transcription frames
@@ -163,9 +165,7 @@ impl FrameProcessor for SentenceAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{
-        InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame,
-    };
+    use crate::frames::{InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame};
 
     #[test]
     fn sentence_end_detection() {
