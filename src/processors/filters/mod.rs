@@ -9,11 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::impl_base_debug_display;
 use crate::frames::Frame;
-use crate::processors::{
-    BaseProcessor, FrameDirection, FrameProcessor,
-};
+use crate::impl_base_debug_display;
+use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
 
 /// Identity filter that passes all frames through unchanged.
 pub struct IdentityFilter {
@@ -38,8 +36,12 @@ impl_base_debug_display!(IdentityFilter);
 
 #[async_trait]
 impl FrameProcessor for IdentityFilter {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Pass everything through
@@ -47,17 +49,20 @@ impl FrameProcessor for IdentityFilter {
     }
 }
 
+/// Predicate that checks whether a given frame should pass through.
+type FrameChecker = Box<dyn Fn(&dyn Frame) -> bool + Send + Sync>;
+
 /// Frame filter that only passes through specified frame types.
 /// System frames always pass through.
 pub struct FrameFilter {
     base: BaseProcessor,
     /// Function that checks if a frame type should pass through
-    type_checker: Box<dyn Fn(&dyn Frame) -> bool + Send + Sync>,
+    type_checker: FrameChecker,
 }
 
 impl FrameFilter {
     /// Create a new FrameFilter that passes through frames matching the given predicate.
-    pub fn new(type_checker: Box<dyn Fn(&dyn Frame) -> bool + Send + Sync>) -> Self {
+    pub fn new(type_checker: FrameChecker) -> Self {
         Self {
             base: BaseProcessor::new(Some("FrameFilter".to_string()), false),
             type_checker,
@@ -69,8 +74,12 @@ impl_base_debug_display!(FrameFilter);
 
 #[async_trait]
 impl FrameProcessor for FrameFilter {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
@@ -81,11 +90,8 @@ impl FrameProcessor for FrameFilter {
 }
 
 /// Type alias for async filter functions.
-pub type AsyncFilterFn = Box<
-    dyn Fn(Arc<dyn Frame>) -> Pin<Box<dyn Future<Output = bool> + Send>>
-        + Send
-        + Sync,
->;
+pub type AsyncFilterFn =
+    Box<dyn Fn(Arc<dyn Frame>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 /// Function filter that uses an async predicate to filter frames.
 pub struct FunctionFilter {
@@ -117,8 +123,12 @@ impl_base_debug_display!(FunctionFilter);
 
 #[async_trait]
 impl FrameProcessor for FunctionFilter {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
@@ -129,7 +139,7 @@ impl FrameProcessor for FunctionFilter {
 
         // Check if filter applies to this direction
         let should_filter = match self.direction {
-            None => true, // Filter both directions
+            None => true,              // Filter both directions
             Some(d) => d == direction, // Only filter the specified direction
         };
 
@@ -165,8 +175,12 @@ impl_base_debug_display!(WakeCheckFilter);
 
 #[async_trait]
 impl FrameProcessor for WakeCheckFilter {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
@@ -176,7 +190,11 @@ impl FrameProcessor for WakeCheckFilter {
         }
 
         // Check if this is a transcription frame
-        if let Some(transcription) = frame.as_ref().as_any().downcast_ref::<crate::frames::TranscriptionFrame>() {
+        if let Some(transcription) = frame
+            .as_ref()
+            .as_any()
+            .downcast_ref::<crate::frames::TranscriptionFrame>()
+        {
             if self.awake {
                 self.push_frame(frame, direction).await;
             } else {

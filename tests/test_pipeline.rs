@@ -13,16 +13,14 @@ use tokio::sync::Mutex;
 use pipecat::frames::*;
 use pipecat::pipeline::Pipeline;
 use pipecat::processors::filters::IdentityFilter;
-use pipecat::processors::{
-    BaseProcessor, FrameDirection, FrameProcessor, PassthroughProcessor,
-};
+use pipecat::processors::{BaseProcessor, FrameDirection, FrameProcessor, PassthroughProcessor};
 use pipecat::tests::run_test;
 
 #[tokio::test]
 async fn test_single_processor_pipeline() {
     // A single passthrough processor should forward all frames.
-    let processor = Arc::new(Mutex::new(PassthroughProcessor::new(None)))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let processor =
+        Arc::new(Mutex::new(PassthroughProcessor::new(None))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TextFrame::new("Hello".to_string())),
@@ -46,17 +44,17 @@ async fn test_single_processor_pipeline() {
 #[tokio::test]
 async fn test_multi_processor_pipeline() {
     // Multiple passthrough processors should forward all frames.
-    let p1 = Arc::new(Mutex::new(PassthroughProcessor::new(Some("P1".to_string()))))
-        as Arc<Mutex<dyn FrameProcessor>>;
-    let p2 = Arc::new(Mutex::new(PassthroughProcessor::new(Some("P2".to_string()))))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let p1 = Arc::new(Mutex::new(PassthroughProcessor::new(Some(
+        "P1".to_string(),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
+    let p2 = Arc::new(Mutex::new(PassthroughProcessor::new(Some(
+        "P2".to_string(),
+    )))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![p1, p2])))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pipeline =
+        Arc::new(Mutex::new(Pipeline::new(vec![p1, p2]))) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TextFrame::new("Hello".to_string())),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(TextFrame::new("Hello".to_string()))];
 
     let expected_down = vec!["TextFrame"];
 
@@ -75,18 +73,14 @@ async fn test_multi_processor_pipeline() {
 #[tokio::test]
 async fn test_pipeline_system_frames_pass_through() {
     // System frames should always pass through any processor.
-    let processor = Arc::new(Mutex::new(IdentityFilter::new()))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let processor = Arc::new(Mutex::new(IdentityFilter::new())) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(UserStartedSpeakingFrame::new()),
         Arc::new(UserStoppedSpeakingFrame::new()),
     ];
 
-    let expected_down = vec![
-        "UserStartedSpeakingFrame",
-        "UserStoppedSpeakingFrame",
-    ];
+    let expected_down = vec!["UserStartedSpeakingFrame", "UserStoppedSpeakingFrame"];
 
     run_test(
         processor,
@@ -103,8 +97,8 @@ async fn test_pipeline_system_frames_pass_through() {
 #[tokio::test]
 async fn test_pipeline_mixed_frames() {
     // Mix of system and data frames should all flow through.
-    let processor = Arc::new(Mutex::new(PassthroughProcessor::new(None)))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let processor =
+        Arc::new(Mutex::new(PassthroughProcessor::new(None))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(UserStartedSpeakingFrame::new()),
@@ -160,8 +154,12 @@ async fn test_pipeline_with_upstream_pusher() {
 
     #[async_trait::async_trait]
     impl FrameProcessor for UpstreamPusher {
-        fn base(&self) -> &BaseProcessor { &self.base }
-        fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+        fn base(&self) -> &BaseProcessor {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut BaseProcessor {
+            &mut self.base
+        }
 
         async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
             // Push downstream
@@ -174,12 +172,9 @@ async fn test_pipeline_with_upstream_pusher() {
         }
     }
 
-    let processor = Arc::new(Mutex::new(UpstreamPusher::new()))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let processor = Arc::new(Mutex::new(UpstreamPusher::new())) as Arc<Mutex<dyn FrameProcessor>>;
 
-    let frames_to_send: Vec<Arc<dyn Frame>> = vec![
-        Arc::new(TextFrame::new("hello".to_string())),
-    ];
+    let frames_to_send: Vec<Arc<dyn Frame>> = vec![Arc::new(TextFrame::new("hello".to_string()))];
 
     let expected_down = vec!["TextFrame"];
     let expected_up = vec!["ErrorFrame"];
@@ -199,8 +194,7 @@ async fn test_pipeline_with_upstream_pusher() {
 #[tokio::test]
 async fn test_empty_pipeline() {
     // An empty pipeline (no user processors) should still forward EndFrame.
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![])))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(vec![]))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![];
     let expected_down: Vec<&str> = vec![];
@@ -219,8 +213,8 @@ async fn test_empty_pipeline() {
 
 #[tokio::test]
 async fn test_pipeline_multiple_text_frames() {
-    let processor = Arc::new(Mutex::new(PassthroughProcessor::new(None)))
-        as Arc<Mutex<dyn FrameProcessor>>;
+    let processor =
+        Arc::new(Mutex::new(PassthroughProcessor::new(None))) as Arc<Mutex<dyn FrameProcessor>>;
 
     let frames_to_send: Vec<Arc<dyn Frame>> = vec![
         Arc::new(TextFrame::new("one".to_string())),

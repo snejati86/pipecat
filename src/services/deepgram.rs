@@ -35,8 +35,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing;
 
 use crate::frames::{
-    EndFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame,
-    TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+    EndFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame, TranscriptionFrame,
+    UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -159,7 +159,6 @@ pub struct DeepgramSTTService {
     base: BaseProcessor,
 
     // -- Configuration -------------------------------------------------------
-
     /// Deepgram API key.
     api_key: String,
     /// Deepgram model identifier (e.g. `"nova-2"`).
@@ -191,7 +190,6 @@ pub struct DeepgramSTTService {
     base_url: Option<String>,
 
     // -- WebSocket state -----------------------------------------------------
-
     /// Write half of the WebSocket connection (if connected).
     ws_sender: Option<Arc<Mutex<WsSink>>>,
     /// Handle for the background task that reads WebSocket messages.
@@ -321,10 +319,7 @@ impl DeepgramSTTService {
 
     /// Build the Deepgram WebSocket URL with query parameters.
     fn build_ws_url(&self) -> String {
-        let host = self
-            .base_url
-            .as_deref()
-            .unwrap_or("wss://api.deepgram.com");
+        let host = self.base_url.as_deref().unwrap_or("wss://api.deepgram.com");
 
         // Strip trailing slash from host.
         let host = host.trim_end_matches('/');
@@ -375,11 +370,8 @@ impl DeepgramSTTService {
                 .map_err(|e| format!("Invalid API key header value: {}", e))?,
         );
 
-        let ws_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            connect_async(request),
-        )
-        .await;
+        let ws_result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(request)).await;
         let (ws_stream, _response) = match ws_result {
             Ok(Ok((stream, resp))) => (stream, resp),
             Ok(Err(e)) => {
@@ -428,12 +420,7 @@ impl DeepgramSTTService {
 
             match msg {
                 Message::Text(text) => {
-                    Self::handle_ws_text_message(
-                        &text,
-                        &frame_tx,
-                        &user_id,
-                        vad_events,
-                    );
+                    Self::handle_ws_text_message(&text, &frame_tx, &user_id, vad_events);
                 }
                 Message::Close(close_frame) => {
                     tracing::debug!(
@@ -484,7 +471,10 @@ impl DeepgramSTTService {
                     tracing::debug!("DeepgramSTTService: speech started event");
                     let frame = Arc::new(UserStartedSpeakingFrame::new());
                     if let Err(e) = frame_tx.try_send(frame) {
-                        tracing::warn!("DeepgramSTTService: failed to send SpeechStarted frame: {}", e);
+                        tracing::warn!(
+                            "DeepgramSTTService: failed to send SpeechStarted frame: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -493,7 +483,10 @@ impl DeepgramSTTService {
                     tracing::debug!("DeepgramSTTService: utterance end event");
                     let frame = Arc::new(UserStoppedSpeakingFrame::new());
                     if let Err(e) = frame_tx.try_send(frame) {
-                        tracing::warn!("DeepgramSTTService: failed to send UtteranceEnd frame: {}", e);
+                        tracing::warn!(
+                            "DeepgramSTTService: failed to send UtteranceEnd frame: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -576,26 +569,26 @@ impl DeepgramSTTService {
         let raw_result: Option<serde_json::Value> = serde_json::from_str(text).ok();
 
         if is_final {
-            let mut frame = TranscriptionFrame::new(
-                transcript.clone(),
-                user_id.to_string(),
-                timestamp,
-            );
+            let mut frame =
+                TranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
             frame.result = raw_result;
             if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
-                tracing::warn!("DeepgramSTTService: failed to send transcription frame: {}", e);
+                tracing::warn!(
+                    "DeepgramSTTService: failed to send transcription frame: {}",
+                    e
+                );
             }
         } else {
-            let mut frame = InterimTranscriptionFrame::new(
-                transcript.clone(),
-                user_id.to_string(),
-                timestamp,
-            );
+            let mut frame =
+                InterimTranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
             frame.result = raw_result;
             if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
-                tracing::warn!("DeepgramSTTService: failed to send interim transcription frame: {}", e);
+                tracing::warn!(
+                    "DeepgramSTTService: failed to send interim transcription frame: {}",
+                    e
+                );
             }
         }
     }
@@ -605,9 +598,10 @@ impl DeepgramSTTService {
         // Signal the WebSocket to close gracefully.
         if let Some(sender) = self.ws_sender.take() {
             let mut sink = sender.lock().await;
-            if let Err(e) = sink.send(Message::Text(
-                r#"{"type": "CloseStream"}"#.to_string(),
-            )).await {
+            if let Err(e) = sink
+                .send(Message::Text(r#"{"type": "CloseStream"}"#.to_string()))
+                .await
+            {
                 tracing::debug!("DeepgramSTTService: error sending CloseStream: {}", e);
             }
             if let Err(e) = sink.close().await {
@@ -644,10 +638,19 @@ impl DeepgramSTTService {
     async fn drain_reader_frames(&mut self) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             // ErrorFrames go upstream, everything else downstream.
-            if frame.as_ref().as_any().downcast_ref::<crate::frames::ErrorFrame>().is_some() {
-                self.base.pending_frames.push((frame, FrameDirection::Upstream));
+            if frame
+                .as_ref()
+                .as_any()
+                .downcast_ref::<crate::frames::ErrorFrame>()
+                .is_some()
+            {
+                self.base
+                    .pending_frames
+                    .push((frame, FrameDirection::Upstream));
             } else {
-                self.base.pending_frames.push((frame, FrameDirection::Downstream));
+                self.base
+                    .pending_frames
+                    .push((frame, FrameDirection::Downstream));
             }
         }
     }
@@ -683,8 +686,12 @@ impl_base_display!(DeepgramSTTService);
 
 #[async_trait]
 impl FrameProcessor for DeepgramSTTService {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn cleanup(&mut self) {
         self.disconnect().await;
@@ -696,7 +703,12 @@ impl FrameProcessor for DeepgramSTTService {
         self.drain_reader_frames().await;
 
         // -- StartFrame: establish WebSocket connection -----------------------
-        if frame.as_ref().as_any().downcast_ref::<StartFrame>().is_some() {
+        if frame
+            .as_ref()
+            .as_any()
+            .downcast_ref::<StartFrame>()
+            .is_some()
+        {
             // Extract sample_rate from StartFrame if present.
             if let Some(start_frame) = frame.as_ref().as_any().downcast_ref::<StartFrame>() {
                 if start_frame.audio_in_sample_rate > 0 {
@@ -721,27 +733,21 @@ impl FrameProcessor for DeepgramSTTService {
         }
 
         // -- InputAudioRawFrame: forward audio to Deepgram -------------------
-        if let Some(audio_frame) = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<InputAudioRawFrame>()
-        {
+        if let Some(audio_frame) = frame.as_ref().as_any().downcast_ref::<InputAudioRawFrame>() {
             if let Some(ref sender) = self.ws_sender {
                 let mut sink = sender.lock().await;
-                if let Err(e) = sink.send(Message::Binary(audio_frame.audio.audio.clone())).await {
+                if let Err(e) = sink
+                    .send(Message::Binary(audio_frame.audio.audio.clone()))
+                    .await
+                {
                     tracing::error!("DeepgramSTTService: failed to send audio: {}", e);
                     // Drop the connection reference; we'll try to reconnect.
                     drop(sink);
-                    self.push_error(
-                        &format!("Failed to send audio to Deepgram: {}", e),
-                        false,
-                    )
-                    .await;
+                    self.push_error(&format!("Failed to send audio to Deepgram: {}", e), false)
+                        .await;
                 }
             } else {
-                tracing::warn!(
-                    "DeepgramSTTService: received audio but WebSocket is not connected"
-                );
+                tracing::warn!("DeepgramSTTService: received audio but WebSocket is not connected");
             }
             // Audio frames are consumed by the STT service; do NOT push downstream.
             return;
@@ -941,10 +947,7 @@ mod tests {
 
         let result: DgResult = serde_json::from_str(json).unwrap();
         assert!(!result.is_final.unwrap());
-        assert_eq!(
-            result.channel.unwrap().alternatives[0].transcript,
-            "hel"
-        );
+        assert_eq!(result.channel.unwrap().alternatives[0].transcript, "hel");
     }
 
     #[test]
@@ -1044,13 +1047,11 @@ mod tests {
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user", true);
 
         let frame = rx.try_recv().unwrap();
-        assert!(
-            frame
-                .as_ref()
-                .as_any()
-                .downcast_ref::<UserStartedSpeakingFrame>()
-                .is_some()
-        );
+        assert!(frame
+            .as_ref()
+            .as_any()
+            .downcast_ref::<UserStartedSpeakingFrame>()
+            .is_some());
     }
 
     #[test]

@@ -899,7 +899,11 @@ impl InputImageRawFrame {
     pub fn new(image: Vec<u8>, size: (u32, u32), format: Option<String>) -> Self {
         Self {
             fields: FrameFields::new("InputImageRawFrame"),
-            image: ImageRawData { image, size, format },
+            image: ImageRawData {
+                image,
+                size,
+                format,
+            },
         }
     }
 }
@@ -1501,7 +1505,11 @@ impl OutputImageRawFrame {
     pub fn new(image: Vec<u8>, size: (u32, u32), format: Option<String>) -> Self {
         Self {
             fields: FrameFields::new("OutputImageRawFrame"),
-            image: ImageRawData { image, size, format },
+            image: ImageRawData {
+                image,
+                size,
+                format,
+            },
         }
     }
 }
@@ -1541,7 +1549,11 @@ pub struct TranscriptionFrame {
 }
 
 impl TranscriptionFrame {
-    pub fn new(text: impl Into<String>, user_id: impl Into<String>, timestamp: impl Into<String>) -> Self {
+    pub fn new(
+        text: impl Into<String>,
+        user_id: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
         Self {
             fields: FrameFields::new("TranscriptionFrame"),
             text: text.into(),
@@ -1583,7 +1595,11 @@ pub struct InterimTranscriptionFrame {
 }
 
 impl InterimTranscriptionFrame {
-    pub fn new(text: impl Into<String>, user_id: impl Into<String>, timestamp: impl Into<String>) -> Self {
+    pub fn new(
+        text: impl Into<String>,
+        user_id: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
         Self {
             fields: FrameFields::new("InterimTranscriptionFrame"),
             text: text.into(),
@@ -2235,11 +2251,7 @@ pub struct LLMContextSummaryResultFrame {
 }
 
 impl LLMContextSummaryResultFrame {
-    pub fn new(
-        request_id: String,
-        summary: String,
-        last_summarized_index: usize,
-    ) -> Self {
+    pub fn new(request_id: String, summary: String, last_summarized_index: usize) -> Self {
         Self {
             fields: FrameFields::new("LLMContextSummaryResultFrame"),
             request_id,
@@ -2268,11 +2280,7 @@ pub struct FunctionCallInProgressFrame {
 }
 
 impl FunctionCallInProgressFrame {
-    pub fn new(
-        function_name: String,
-        tool_call_id: String,
-        arguments: serde_json::Value,
-    ) -> Self {
+    pub fn new(function_name: String, tool_call_id: String, arguments: serde_json::Value) -> Self {
         Self {
             fields: FrameFields::new("FunctionCallInProgressFrame"),
             function_name,
@@ -2476,11 +2484,8 @@ mod tests {
 
     #[test]
     fn test_llm_context_summary_result_uninterruptible() {
-        let frame = LLMContextSummaryResultFrame::new(
-            "req-1".to_string(),
-            "Summary text".to_string(),
-            5,
-        );
+        let frame =
+            LLMContextSummaryResultFrame::new("req-1".to_string(), "Summary text".to_string(), 5);
         assert!(frame.is_control_frame());
         assert!(frame.is_uninterruptible());
     }

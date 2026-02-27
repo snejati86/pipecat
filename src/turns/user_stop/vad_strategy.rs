@@ -58,21 +58,19 @@ impl_base_debug_display!(VADUserTurnStopStrategy);
 
 #[async_trait]
 impl FrameProcessor for VADUserTurnStopStrategy {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // When user stops speaking, log and pass through.
         // The frame itself serves as the signal for downstream processors
         // (e.g. LLM context aggregators) to finalize the user's turn.
         if frame.downcast_ref::<UserStoppedSpeakingFrame>().is_some() {
-            tracing::debug!(
-                "VADUserTurnStopStrategy: user stopped speaking, propagating frame"
-            );
+            tracing::debug!("VADUserTurnStopStrategy: user stopped speaking, propagating frame");
             self.push_frame(frame, direction).await;
             return;
         }

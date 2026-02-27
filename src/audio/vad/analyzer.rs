@@ -18,15 +18,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use crate::audio::utils::{calculate_rms, exp_smoothing};
 use crate::audio::vad::{VADParams, VADState};
 use crate::frames::{
-    Frame, InputAudioRawFrame, StartFrame, UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame, VADParamsUpdateFrame,
+    Frame, InputAudioRawFrame, StartFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+    VADParamsUpdateFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
+use async_trait::async_trait;
 
 /// Trait for providing voice confidence from an audio buffer.
 ///
@@ -288,8 +288,7 @@ impl VADAnalyzer {
 
             let volume = self.get_smoothed_volume(&audio_frames);
 
-            let speaking =
-                confidence >= self.params.confidence && volume >= self.params.min_volume;
+            let speaking = confidence >= self.params.confidence && volume >= self.params.min_volume;
 
             if speaking {
                 match self.state {
@@ -329,17 +328,13 @@ impl VADAnalyzer {
         }
 
         // Check if we have accumulated enough consecutive frames to transition.
-        if self.state == VADState::Starting
-            && self.vad_starting_count >= self.vad_start_frames
-        {
+        if self.state == VADState::Starting && self.vad_starting_count >= self.vad_start_frames {
             self.state = VADState::Speaking;
             self.vad_starting_count = 0;
             became_speaking = true;
         }
 
-        if self.state == VADState::Stopping
-            && self.vad_stopping_count >= self.vad_stop_frames
-        {
+        if self.state == VADState::Stopping && self.vad_stopping_count >= self.vad_stop_frames {
             self.state = VADState::Quiet;
             self.vad_stopping_count = 0;
             became_quiet = true;
@@ -373,14 +368,14 @@ impl_base_display!(VADAnalyzer);
 
 #[async_trait]
 impl FrameProcessor for VADAnalyzer {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Handle StartFrame: initialize sample rate from pipeline configuration.
         if let Some(start_frame) = frame.downcast_ref::<StartFrame>() {
             if !self.initialized {

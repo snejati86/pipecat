@@ -12,11 +12,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, Notify};
 
-use crate::impl_base_debug_display;
 use crate::frames::{CancelFrame, EndFrame, ErrorFrame, Frame, StartFrame, StopFrame};
+use crate::impl_base_debug_display;
 use crate::observers::Observer;
 use crate::processors::{
-    BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup, drive_processor,
+    drive_processor, BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup,
 };
 
 /// Source processor at the beginning of a pipeline chain.
@@ -37,8 +37,12 @@ impl_base_debug_display!(PipelineSource);
 
 #[async_trait]
 impl FrameProcessor for PipelineSource {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
@@ -63,8 +67,12 @@ impl_base_debug_display!(PipelineSink);
 
 #[async_trait]
 impl FrameProcessor for PipelineSink {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
@@ -144,10 +152,16 @@ impl_base_debug_display!(Pipeline);
 
 #[async_trait]
 impl FrameProcessor for Pipeline {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    fn is_direct_mode(&self) -> bool { true }
+    fn is_direct_mode(&self) -> bool {
+        true
+    }
 
     fn processors(&self) -> Vec<Arc<Mutex<dyn FrameProcessor>>> {
         self.processors.clone()

@@ -241,10 +241,7 @@ impl OpenAILLMService {
         };
 
         Self {
-            base: BaseProcessor::new(
-                Some(format!("OpenAILLMService({})", model)),
-                false,
-            ),
+            base: BaseProcessor::new(Some(format!("OpenAILLMService({})", model)), false),
             api_key,
             model,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
@@ -540,9 +537,7 @@ impl OpenAILLMService {
 
         if !functions.is_empty() {
             let mut function_calls = Vec::with_capacity(functions.len());
-            for ((name, args_str), tool_id) in
-                functions.into_iter().zip(arguments).zip(tool_ids)
-            {
+            for ((name, args_str), tool_id) in functions.into_iter().zip(arguments).zip(tool_ids) {
                 let parsed_args: serde_json::Value = serde_json::from_str(&args_str)
                     .unwrap_or_else(|e| {
                         warn!(error = %e, raw = %args_str, "Failed to parse tool call arguments");
@@ -557,7 +552,10 @@ impl OpenAILLMService {
                 });
             }
 
-            debug!(count = function_calls.len(), "Emitting FunctionCallsStartedFrame");
+            debug!(
+                count = function_calls.len(),
+                "Emitting FunctionCallsStartedFrame"
+            );
             self.base.pending_frames.push((
                 Arc::new(FunctionCallsStartedFrame::new(function_calls)),
                 FrameDirection::Downstream,
@@ -596,8 +594,12 @@ impl_base_display!(OpenAILLMService);
 
 #[async_trait]
 impl FrameProcessor for OpenAILLMService {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // --- LLMMessagesAppendFrame: accumulate messages and trigger inference ---
@@ -792,10 +794,7 @@ impl OpenAITTSService {
         };
 
         Self {
-            base: BaseProcessor::new(
-                Some(format!("OpenAITTSService({})", model)),
-                false,
-            ),
+            base: BaseProcessor::new(Some(format!("OpenAITTSService({})", model)), false),
             api_key,
             model,
             voice,
@@ -961,8 +960,12 @@ impl_base_display!(OpenAITTSService);
 
 #[async_trait]
 impl FrameProcessor for OpenAITTSService {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // TextFrame triggers TTS synthesis.
@@ -1116,8 +1119,7 @@ mod tests {
 
     #[test]
     fn test_tts_service_creation() {
-        let svc =
-            OpenAITTSService::new("sk-test-key".to_string(), String::new(), String::new());
+        let svc = OpenAITTSService::new("sk-test-key".to_string(), String::new(), String::new());
         assert_eq!(svc.model, OpenAITTSService::DEFAULT_MODEL);
         assert_eq!(svc.voice, OpenAITTSService::DEFAULT_VOICE);
         assert_eq!(svc.sample_rate, OpenAITTSService::OPENAI_SAMPLE_RATE);
@@ -1205,8 +1207,7 @@ mod tests {
         let raw = r#"{"choices":[{"message":{"content":"Hello, world!"},"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#;
         let resp: ChatCompletionResponse = serde_json::from_str(raw).unwrap();
         let choice = resp.choices.first().expect("expected at least one choice");
-        let content = choice.message.as_ref().unwrap().content
-            .as_deref();
+        let content = choice.message.as_ref().unwrap().content.as_deref();
         assert_eq!(content, Some("Hello, world!"));
     }
 
