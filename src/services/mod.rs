@@ -5,6 +5,8 @@
 
 pub mod anthropic;
 pub mod assemblyai;
+pub mod aws_polly;
+pub mod azure;
 pub mod cartesia;
 pub mod cerebras;
 pub mod deepgram;
@@ -21,12 +23,15 @@ pub mod hume;
 pub mod kokoro;
 pub mod lmnt;
 pub mod mistral;
+pub mod neuphonic;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 pub mod perplexity;
+pub mod piper;
 pub mod qwen;
 pub mod rime;
+pub mod sambanova;
 pub mod together;
 pub mod whisper;
 
