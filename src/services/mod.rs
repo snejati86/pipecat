@@ -9,8 +9,13 @@ pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google;
+pub mod google_tts;
+pub mod groq;
 pub mod lmnt;
+pub mod mistral;
+pub mod ollama;
 pub mod openai;
+pub mod whisper;
 
 use std::sync::Arc;
 
