@@ -7,6 +7,7 @@ pub mod anthropic;
 pub mod assemblyai;
 pub mod cartesia;
 pub mod deepgram;
+pub mod deepseek;
 pub mod elevenlabs;
 pub mod google;
 pub mod google_tts;
@@ -15,6 +16,8 @@ pub mod lmnt;
 pub mod mistral;
 pub mod ollama;
 pub mod openai;
+pub mod openrouter;
+pub mod together;
 pub mod whisper;
 
 use std::sync::Arc;
