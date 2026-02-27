@@ -107,8 +107,12 @@ impl_base_display!(LLMResponseAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMResponseAggregator {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Check for LLMFullResponseStartFrame
@@ -259,8 +263,12 @@ impl_base_display!(LLMUserContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMUserContextAggregator {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // UserStartedSpeakingFrame
@@ -443,8 +451,12 @@ impl_base_display!(LLMAssistantContextAggregator);
 
 #[async_trait]
 impl FrameProcessor for LLMAssistantContextAggregator {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // LLMFullResponseStartFrame
@@ -477,14 +489,10 @@ impl FrameProcessor for LLMAssistantContextAggregator {
         // TextFrame -- accumulate when inside a response
         if let Some(text_frame) = frame.as_any().downcast_ref::<TextFrame>() {
             if self.response_depth > 0 && text_frame.append_to_context {
-                if self.aggregation.is_empty() {
-                    self.aggregation.push_str(&text_frame.text);
-                } else if text_frame.includes_inter_frame_spaces {
-                    self.aggregation.push_str(&text_frame.text);
-                } else {
+                if !self.aggregation.is_empty() && !text_frame.includes_inter_frame_spaces {
                     self.aggregation.push(' ');
-                    self.aggregation.push_str(&text_frame.text);
                 }
+                self.aggregation.push_str(&text_frame.text);
             }
             // Pass TextFrame through so downstream processors (e.g. TTS) see it
             self.push_frame(frame, direction).await;

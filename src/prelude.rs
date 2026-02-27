@@ -13,16 +13,13 @@ pub use crate::frames::{
     AudioRawData, CancelFrame, EndFrame, ErrorFrame, Frame, InputAudioRawFrame,
     InterimTranscriptionFrame, InterruptionFrame, LLMFullResponseEndFrame,
     LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMTextFrame, MetricsFrame,
-    OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame,
-    TTSStoppedFrame, TextFrame, TranscriptionFrame, UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
+    OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
+    TextFrame, TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
 
 pub use crate::observers::Observer;
 pub use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
-pub use crate::processors::{
-    BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup,
-};
+pub use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 pub use crate::serializers::FrameSerializer;
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
 

@@ -380,10 +380,7 @@ mod tests {
     use super::*;
 
     /// Helper to serialize and then deserialize a frame through the serializer.
-    fn roundtrip(
-        serializer: &JsonFrameSerializer,
-        frame: Arc<dyn Frame>,
-    ) -> Arc<dyn Frame> {
+    fn roundtrip(serializer: &JsonFrameSerializer, frame: Arc<dyn Frame>) -> Arc<dyn Frame> {
         let serialized = serializer.serialize(frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Text(t) => t.as_bytes(),
@@ -439,13 +436,10 @@ mod tests {
     fn test_roundtrip_input_audio_frame() {
         let serializer = JsonFrameSerializer::new();
         let audio_data = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
-        let frame: Arc<dyn Frame> =
-            Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
+        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
 
         let deserialized = roundtrip(&serializer, frame);
-        let af = deserialized
-            .downcast_ref::<InputAudioRawFrame>()
-            .unwrap();
+        let af = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
         assert_eq!(af.audio.audio, audio_data);
         assert_eq!(af.audio.sample_rate, 16000);
         assert_eq!(af.audio.num_channels, 1);
@@ -459,9 +453,7 @@ mod tests {
             Arc::new(OutputAudioRawFrame::new(audio_data.clone(), 24000, 2));
 
         let deserialized = roundtrip(&serializer, frame);
-        let af = deserialized
-            .downcast_ref::<OutputAudioRawFrame>()
-            .unwrap();
+        let af = deserialized.downcast_ref::<OutputAudioRawFrame>().unwrap();
         assert_eq!(af.audio.audio, audio_data);
         assert_eq!(af.audio.sample_rate, 24000);
         assert_eq!(af.audio.num_channels, 2);
@@ -473,8 +465,7 @@ mod tests {
 
         // Output message
         let msg = serde_json::json!({"key": "value", "count": 42});
-        let frame: Arc<dyn Frame> =
-            Arc::new(OutputTransportMessageFrame::new(msg.clone()));
+        let frame: Arc<dyn Frame> = Arc::new(OutputTransportMessageFrame::new(msg.clone()));
         let deserialized = roundtrip(&serializer, frame);
         let mf = deserialized
             .downcast_ref::<OutputTransportMessageFrame>()
@@ -482,8 +473,7 @@ mod tests {
         assert_eq!(mf.message, msg);
 
         // Input message
-        let frame2: Arc<dyn Frame> =
-            Arc::new(InputTransportMessageFrame::new(msg.clone()));
+        let frame2: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(msg.clone()));
         let deserialized2 = roundtrip(&serializer, frame2);
         let mf2 = deserialized2
             .downcast_ref::<InputTransportMessageFrame>()
@@ -516,8 +506,7 @@ mod tests {
     #[test]
     fn test_roundtrip_cancel_frame() {
         let serializer = JsonFrameSerializer::new();
-        let frame: Arc<dyn Frame> =
-            Arc::new(CancelFrame::new(Some("test reason".to_string())));
+        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(Some("test reason".to_string())));
 
         let deserialized = roundtrip(&serializer, frame);
         let cf = deserialized.downcast_ref::<CancelFrame>().unwrap();
@@ -549,8 +538,7 @@ mod tests {
     #[test]
     fn test_roundtrip_error_frame_fatal() {
         let serializer = JsonFrameSerializer::new();
-        let frame: Arc<dyn Frame> =
-            Arc::new(ErrorFrame::new("fatal error".to_string(), true));
+        let frame: Arc<dyn Frame> = Arc::new(ErrorFrame::new("fatal error".to_string(), true));
 
         let deserialized = roundtrip(&serializer, frame);
         let ef = deserialized.downcast_ref::<ErrorFrame>().unwrap();
