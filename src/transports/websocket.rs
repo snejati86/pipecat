@@ -50,13 +50,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{
-    accept_async, connect_async, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::frames::{
-    CancelFrame, EndFrame, Frame, InputAudioRawFrame,
-    InterruptionFrame, OutputAudioRawFrame, OutputTransportMessageFrame,
+    CancelFrame, EndFrame, Frame, InputAudioRawFrame, InterruptionFrame, OutputAudioRawFrame,
+    OutputTransportMessageFrame,
 };
 use crate::impl_base_debug_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -105,9 +103,7 @@ enum WsStream {
 }
 
 impl WsStream {
-    async fn next(
-        &mut self,
-    ) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
+    async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
         match self {
             WsStream::Client(stream) => stream.next().await,
             WsStream::Server(stream) => stream.next().await,
@@ -236,11 +232,7 @@ impl WebSocketTransport {
     pub async fn connect(self: &Arc<Self>, url: &str) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("WebSocketTransport: connecting to {}", url);
 
-        let ws_result = tokio::time::timeout(
-            Duration::from_secs(10),
-            connect_async(url),
-        )
-        .await;
+        let ws_result = tokio::time::timeout(Duration::from_secs(10), connect_async(url)).await;
         let (ws_stream, _response) = match ws_result {
             Ok(Ok((stream, resp))) => (stream, resp),
             Ok(Err(e)) => {
@@ -344,7 +336,10 @@ impl WebSocketTransport {
 
         // Signal the server accept loop to stop.
         if let Err(e) = self.server_shutdown_tx.send(true) {
-            tracing::warn!("WebSocketTransport: failed to send server shutdown signal: {}", e);
+            tracing::warn!(
+                "WebSocketTransport: failed to send server shutdown signal: {}",
+                e
+            );
         }
 
         // Signal the receive loop to stop.
@@ -487,7 +482,10 @@ impl WebSocketTransport {
 
         // If the frame is an InputAudioRawFrame, check whether audio input
         // is enabled.
-        if frame.as_any().downcast_ref::<InputAudioRawFrame>().is_some()
+        if frame
+            .as_any()
+            .downcast_ref::<InputAudioRawFrame>()
+            .is_some()
             && !params.audio_in_enabled
         {
             return;
@@ -538,10 +536,7 @@ impl WebSocketInputProcessor {
     /// Create a new input processor.
     fn new(serializer: Arc<dyn FrameSerializer>, params: TransportParams) -> Self {
         Self {
-            base: BaseProcessor::new(
-                Some("WebSocketInputProcessor".to_string()),
-                false,
-            ),
+            base: BaseProcessor::new(Some("WebSocketInputProcessor".to_string()), false),
             serializer,
             params,
         }
@@ -552,8 +547,12 @@ impl_base_debug_display!(WebSocketInputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketInputProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     /// Process an incoming frame from the WebSocket.
     ///
@@ -561,11 +560,7 @@ impl FrameProcessor for WebSocketInputProcessor {
     /// gating (checking `params.audio_in_enabled`) is handled in
     /// `WebSocketTransport::handle_incoming_message` before this method is
     /// called.
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        _direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, _direction: FrameDirection) {
         // For input, we always push downstream.
         self.push_frame(frame, FrameDirection::Downstream).await;
     }
@@ -617,10 +612,7 @@ impl WebSocketOutputProcessor {
         let send_interval = Duration::from_secs_f64(chunk_duration_secs / 2.0);
 
         Self {
-            base: BaseProcessor::new(
-                Some("WebSocketOutputProcessor".to_string()),
-                false,
-            ),
+            base: BaseProcessor::new(Some("WebSocketOutputProcessor".to_string()), false),
             connection,
             serializer,
             params,
@@ -694,8 +686,12 @@ impl_base_debug_display!(WebSocketOutputProcessor);
 
 #[async_trait]
 impl FrameProcessor for WebSocketOutputProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     /// Process a frame from the pipeline for output over the WebSocket.
     ///
@@ -707,13 +703,13 @@ impl FrameProcessor for WebSocketOutputProcessor {
     ///   connection state is updated.
     /// - `InterruptionFrame`: resets the audio send timer.
     /// - All other frames: forwarded downstream unchanged.
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Handle OutputAudioRawFrame with throttling.
-        if frame.as_any().downcast_ref::<OutputAudioRawFrame>().is_some() {
+        if frame
+            .as_any()
+            .downcast_ref::<OutputAudioRawFrame>()
+            .is_some()
+        {
             if !self.params.audio_out_enabled {
                 return;
             }
@@ -749,11 +745,7 @@ impl FrameProcessor for WebSocketOutputProcessor {
         }
 
         // Handle InterruptionFrame -- reset audio timing.
-        if frame
-            .as_any()
-            .downcast_ref::<InterruptionFrame>()
-            .is_some()
-        {
+        if frame.as_any().downcast_ref::<InterruptionFrame>().is_some() {
             self.next_send_time = None;
             self.write_frame(Arc::clone(&frame)).await;
             return;

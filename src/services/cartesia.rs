@@ -226,9 +226,8 @@ struct CartesiaHttpRequest {
 // Type alias for the WebSocket stream
 // ---------------------------------------------------------------------------
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 // ---------------------------------------------------------------------------
 // CartesiaTTSService (WebSocket streaming)
@@ -410,7 +409,7 @@ impl CartesiaTTSService {
                 cancel: true,
             };
             if let Ok(json) = serde_json::to_string(&cancel) {
-                if let Err(e) = ws.send(WsMessage::Text(json.into())).await {
+                if let Err(e) = ws.send(WsMessage::Text(json)).await {
                     tracing::warn!(
                         service = "CartesiaTTSService",
                         "Failed to send cancel request over WebSocket: {e}"
@@ -497,7 +496,7 @@ impl CartesiaTTSService {
             }
         };
 
-        if let Err(e) = ws.send(WsMessage::Text(request_json.into())).await {
+        if let Err(e) = ws.send(WsMessage::Text(request_json)).await {
             frames.push(Arc::new(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
@@ -578,11 +577,8 @@ impl CartesiaTTSService {
                                         "Time to first byte"
                                     );
                                 }
-                                let mut audio_frame = TTSAudioRawFrame::new(
-                                    audio_bytes,
-                                    self.sample_rate,
-                                    1,
-                                );
+                                let mut audio_frame =
+                                    TTSAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
                                 audio_frame.context_id = Some(context_id.clone());
                                 frames.push(Arc::new(audio_frame));
                             }
@@ -667,8 +663,12 @@ impl_base_display!(CartesiaTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaTTSService {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     /// Process incoming frames.
     ///
@@ -917,8 +917,7 @@ impl CartesiaHttpTTSService {
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let error_text = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
-                    let error_msg =
-                        format!("Cartesia API returned status {status}: {error_text}");
+                    let error_msg = format!("Cartesia API returned status {status}: {error_text}");
                     tracing::error!(service = %self.base.name(), "{}", error_msg);
                     frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
                 } else {
@@ -935,11 +934,8 @@ impl CartesiaHttpTTSService {
                                 "Received TTS audio"
                             );
 
-                            let mut audio_frame = TTSAudioRawFrame::new(
-                                audio_data.to_vec(),
-                                self.sample_rate,
-                                1,
-                            );
+                            let mut audio_frame =
+                                TTSAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
                             audio_frame.context_id = Some(context_id.clone());
                             frames.push(Arc::new(audio_frame));
                         }
@@ -983,8 +979,12 @@ impl_base_display!(CartesiaHttpTTSService);
 
 #[async_trait]
 impl FrameProcessor for CartesiaHttpTTSService {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
     /// Process incoming frames.
     ///
@@ -1105,8 +1105,7 @@ mod tests {
             emotion: Some(vec!["excited".into(), "happy".into()]),
             ..Default::default()
         };
-        let service = CartesiaHttpTTSService::new("key", "voice-123")
-            .with_params(params);
+        let service = CartesiaHttpTTSService::new("key", "voice-123").with_params(params);
         let config = service.build_voice_config();
         assert_eq!(config.mode, "id");
         assert_eq!(config.id, "voice-123");
@@ -1190,8 +1189,7 @@ mod tests {
             generation_config: Some(gen_config),
             ..Default::default()
         };
-        let service = CartesiaHttpTTSService::new("key", "voice")
-            .with_params(params);
+        let service = CartesiaHttpTTSService::new("key", "voice").with_params(params);
         assert!(service.params.generation_config.is_some());
         let gc = service.params.generation_config.unwrap();
         assert_eq!(gc.volume, Some(1.0));
@@ -1235,8 +1233,8 @@ mod tests {
     async fn test_http_tts_run_returns_started_and_stopped() {
         // Without a real API key, the HTTP request will fail, but we should
         // still get TTSStartedFrame, ErrorFrame, and TTSStoppedFrame.
-        let mut service = CartesiaHttpTTSService::new("invalid-key", "voice")
-            .with_base_url("http://localhost:1"); // unreachable port
+        let mut service =
+            CartesiaHttpTTSService::new("invalid-key", "voice").with_base_url("http://localhost:1"); // unreachable port
 
         let frames = service.run_tts("test").await;
 

@@ -21,6 +21,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+/// Background event tasks that are still running.
+type EventTasks = Vec<(String, JoinHandle<()>)>;
+
 // ---------------------------------------------------------------------------
 // Global counters
 // ---------------------------------------------------------------------------
@@ -67,9 +70,8 @@ pub fn obj_count(type_name: &str) -> u64 {
 /// Handlers are trait objects that, when called, return a pinned future.
 /// They receive no arguments; the caller is expected to capture any required
 /// context via `Arc` / `Clone` before registering the handler.
-pub type EventHandler = Arc<
-    dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type EventHandler =
+    Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// A named event with its registered handlers and execution mode.
 pub struct EventHandlerEntry {
@@ -106,7 +108,7 @@ pub struct BaseObject {
     /// Background (non-sync) event tasks that are still running.  Each entry
     /// stores the event name together with its `JoinHandle` so that
     /// [`cleanup`](BaseObject::cleanup) can report which events it is waiting on.
-    event_tasks: Arc<Mutex<Vec<(String, JoinHandle<()>)>>>,
+    event_tasks: Arc<Mutex<EventTasks>>,
 }
 
 impl BaseObject {
@@ -163,7 +165,11 @@ impl BaseObject {
     /// Registering the same event name twice logs a warning and is a no-op.
     pub fn register_event_handler(&mut self, event_name: &str, is_sync: bool) {
         if self.event_handlers.contains_key(event_name) {
-            tracing::warn!("{}: event handler {} already registered", self.name, event_name);
+            tracing::warn!(
+                "{}: event handler {} already registered",
+                self.name,
+                event_name
+            );
             return;
         }
         self.event_handlers.insert(

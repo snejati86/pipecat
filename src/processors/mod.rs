@@ -89,14 +89,9 @@ pub enum FrameDirection {
 }
 
 /// Configuration parameters for frame processor initialization.
+#[derive(Default)]
 pub struct FrameProcessorSetup {
     pub observer: Option<Arc<dyn Observer>>,
-}
-
-impl Default for FrameProcessorSetup {
-    fn default() -> Self {
-        Self { observer: None }
-    }
 }
 
 /// Core trait for all frame processors in the pipeline.
@@ -159,18 +154,10 @@ pub trait FrameProcessor: Send + Sync + fmt::Debug + fmt::Display {
     /// Process a frame in the given direction.
     /// Implementations should call `self.push_frame(frame, direction)` to
     /// buffer output frames for forwarding.
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    );
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection);
 
     /// Queue a frame for processing (may bypass queue in direct mode).
-    async fn queue_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn queue_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.process_frame(frame, direction).await;
     }
 
@@ -203,20 +190,12 @@ pub trait FrameProcessor: Send + Sync + fmt::Debug + fmt::Display {
     /// Buffer a frame for later forwarding by `drive_processor`.
     /// This is the primary mechanism for processors to send frames to
     /// neighboring processors without causing recursive lock deadlocks.
-    async fn push_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn push_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.pending_frames_mut().push((frame, direction));
     }
 
     /// Push an error frame upstream.
-    async fn push_error(
-        &mut self,
-        error_msg: &str,
-        fatal: bool,
-    ) {
+    async fn push_error(&mut self, error_msg: &str, fatal: bool) {
         let frame = Arc::new(ErrorFrame::new(error_msg.to_string(), fatal));
         self.push_frame(frame, FrameDirection::Upstream).await;
     }
@@ -241,9 +220,12 @@ pub async fn drive_processor(
 ) {
     // Use an iterative work stack to avoid async recursion (which requires Box::pin).
     // DFS order: push pending frames in reverse so the first frame is processed first.
-    let mut work_stack: Vec<(Arc<Mutex<dyn FrameProcessor>>, Arc<dyn Frame>, FrameDirection)> =
-        Vec::new();
-    work_stack.push((processor, frame, direction));
+    type WorkItem = (
+        Arc<Mutex<dyn FrameProcessor>>,
+        Arc<dyn Frame>,
+        FrameDirection,
+    );
+    let mut work_stack: Vec<WorkItem> = vec![(processor, frame, direction)];
 
     while let Some((proc, f, d)) = work_stack.pop() {
         // Phase 1: Lock, process, drain buffer, capture routing info, unlock
@@ -338,14 +320,14 @@ impl_base_debug_display!(PassthroughProcessor);
 
 #[async_trait]
 impl FrameProcessor for PassthroughProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
     }
 }

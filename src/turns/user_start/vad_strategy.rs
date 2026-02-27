@@ -90,14 +90,14 @@ impl_base_display!(VADUserTurnStartStrategy);
 
 #[async_trait]
 impl FrameProcessor for VADUserTurnStartStrategy {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+    fn base(&self) -> &BaseProcessor {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut BaseProcessor {
+        &mut self.base
+    }
 
-    async fn process_frame(
-        &mut self,
-        frame: Arc<dyn Frame>,
-        direction: FrameDirection,
-    ) {
+    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Extract allow_interruptions from the StartFrame.
         if let Some(start_frame) = frame.downcast_ref::<StartFrame>() {
             self.allow_interruptions = start_frame.allow_interruptions;

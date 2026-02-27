@@ -1,0 +1,117 @@
+// Copyright (c) 2024-2026, Daily
+// SPDX-License-Identifier: BSD-2-Clause
+
+// Protocol buffer definitions for Pipecat frame serialization.
+//
+// These messages define the wire format for frames exchanged between
+// Pipecat pipeline components over transports (e.g. WebSocket).
+// The top-level `Frame` message uses a `oneof` to wrap the individual
+// frame types, enabling efficient binary serialization with type
+// discrimination.
+
+syntax = "proto3";
+
+package pipecat.frames;
+
+// ---------------------------------------------------------------------------
+// Data frames
+// ---------------------------------------------------------------------------
+
+// A text data frame carrying a string payload.
+message TextFrame {
+  uint64 id = 1;
+  string name = 2;
+  string text = 3;
+}
+
+// Raw audio data in PCM format (16-bit signed little-endian).
+// Used for both input and output audio; the wrapping Frame oneof
+// field determines the direction.
+message AudioRawFrame {
+  uint64 id = 1;
+  string name = 2;
+  bytes audio = 3;
+  uint32 sample_rate = 4;
+  uint32 num_channels = 5;
+  optional uint64 pts = 6;
+}
+
+// Final transcription result from a speech-to-text service.
+message TranscriptionFrame {
+  uint64 id = 1;
+  string name = 2;
+  string text = 3;
+  string user_id = 4;
+  string timestamp = 5;
+  optional string language = 6;
+}
+
+// Interim (partial) transcription from a speech-to-text service.
+message InterimTranscriptionFrame {
+  uint64 id = 1;
+  string name = 2;
+  string text = 3;
+  string user_id = 4;
+  string timestamp = 5;
+  optional string language = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Transport message frames
+// ---------------------------------------------------------------------------
+
+// A transport message frame carrying an opaque JSON payload as a string.
+// Used for both input and output transport messages; the wrapping Frame
+// oneof field determines the direction.
+message TransportMessageFrame {
+  string data = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Control / system frames
+// ---------------------------------------------------------------------------
+
+// Initial frame to start pipeline processing with configuration.
+message StartFrame {
+  uint32 audio_in_sample_rate = 1;
+  uint32 audio_out_sample_rate = 2;
+  bool allow_interruptions = 3;
+  bool enable_metrics = 4;
+}
+
+// Signals the end of a pipeline.
+message EndFrame {
+}
+
+// Requests cancellation of the current pipeline operation.
+message CancelFrame {
+  optional string reason = 1;
+}
+
+// Carries an error notification.
+message ErrorFrame {
+  string error = 1;
+  bool fatal = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level wrapper
+// ---------------------------------------------------------------------------
+
+// Wrapper message that contains exactly one frame type. The `oneof`
+// discriminator allows the receiver to determine which frame was sent.
+message Frame {
+  oneof frame {
+    TextFrame text = 1;
+    AudioRawFrame audio_input = 2;
+    AudioRawFrame audio_output = 3;
+    TranscriptionFrame transcription = 4;
+    InterimTranscriptionFrame interim_transcription = 5;
+    TransportMessageFrame message_input = 6;
+    TransportMessageFrame message_output = 7;
+    StartFrame start = 8;
+    EndFrame end = 9;
+    CancelFrame cancel = 10;
+    ErrorFrame error = 11;
+  }
+}
