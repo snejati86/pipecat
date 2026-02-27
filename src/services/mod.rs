@@ -4,9 +4,12 @@
 //! AI service integrations (LLM, STT, TTS, Vision, Image Generation).
 
 pub mod anthropic;
+pub mod assemblyai;
 pub mod cartesia;
 pub mod deepgram;
 pub mod elevenlabs;
+pub mod google;
+pub mod lmnt;
 pub mod openai;
 
 use std::sync::Arc;

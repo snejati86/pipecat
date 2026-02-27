@@ -4,9 +4,11 @@
 //! Frame serialization for WebSocket transport protocols.
 
 pub mod json;
+pub mod plivo;
 pub mod protobuf;
 pub mod telnyx;
 pub mod twilio;
+pub mod vonage;
 
 use std::sync::Arc;
 
