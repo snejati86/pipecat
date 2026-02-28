@@ -497,7 +497,8 @@ impl FrameSerializer for TwilioFrameSerializer {
                         .map(SerializedFrame::Text);
                     }
                 }
-                let (_, ref mut resampler, ref mut residual) = guard.as_mut().unwrap();
+                let (_, ref mut resampler, ref mut residual) =
+                    guard.as_mut().expect("resampler state must be initialized after lazy init block");
                 resampled = resample_rubato(resampler, residual, &audio_frame.audio.audio);
                 &resampled
             } else {

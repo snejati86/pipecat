@@ -156,7 +156,19 @@ impl Processor for SentenceAggregator {
                     let sentence = std::mem::take(&mut self.aggregation);
                     tracing::debug!(sentence = %sentence, "Sentence: emitting");
                     ctx.send_downstream(FrameEnum::Text(TextFrame::new(sentence)));
+                }
+            }
 
+            // LLMTextFrame -- same as TextFrame but emitted by LLM streaming
+            FrameEnum::LLMText(t) => {
+                self.aggregation.push_str(&t.text);
+                tracing::trace!(text = %t.text, buffer_len = self.aggregation.len(), "Sentence: buffering LLMText");
+
+                if is_sentence_end(&self.aggregation) {
+                    let sentence = std::mem::take(&mut self.aggregation);
+                    tracing::debug!(sentence = %sentence, "Sentence: emitting");
+                    // Emit as TextFrame for downstream TTS compatibility
+                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(sentence)));
                 }
             }
 
@@ -186,7 +198,9 @@ impl Processor for SentenceAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame};
+    use crate::frames::{
+        InterimTranscriptionFrame, LLMFullResponseEndFrame, LLMTextFrame, TextFrame,
+    };
     use tokio::sync::mpsc;
 
     fn make_ctx() -> (
@@ -347,5 +361,43 @@ mod tests {
 
         let out = drx.try_recv().unwrap();
         assert!(matches!(out, FrameEnum::End(_)));
+    }
+
+    #[tokio::test]
+    async fn buffers_llm_text_frames() {
+        let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
+
+        // LLMTextFrame tokens -- should be buffered until sentence end
+        agg.process(
+            FrameEnum::LLMText(LLMTextFrame::new("Hello".to_string())),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+        assert_eq!(agg.aggregation(), "Hello");
+        assert!(drx.try_recv().is_err());
+
+        agg.process(
+            FrameEnum::LLMText(LLMTextFrame::new(", world".to_string())),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+        assert!(drx.try_recv().is_err());
+
+        // Sentence end via LLMTextFrame
+        agg.process(
+            FrameEnum::LLMText(LLMTextFrame::new(".".to_string())),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+        assert!(agg.aggregation().is_empty());
+        let out = drx.try_recv().unwrap();
+        match out {
+            FrameEnum::Text(t) => assert_eq!(t.text, "Hello, world."),
+            _ => panic!("Expected TextFrame from LLMText aggregation"),
+        }
     }
 }

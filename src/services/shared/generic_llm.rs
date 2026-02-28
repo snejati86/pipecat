@@ -292,6 +292,16 @@ impl<P: LlmProtocol> GenericLlmService<P> {
         }
 
         if !functions.is_empty() {
+            debug_assert_eq!(
+                functions.len(),
+                arguments.len(),
+                "tool call functions/arguments length mismatch"
+            );
+            debug_assert_eq!(
+                functions.len(),
+                tool_ids.len(),
+                "tool call functions/tool_ids length mismatch"
+            );
             let mut function_calls = Vec::with_capacity(functions.len());
             for ((name, args_str), tool_id) in
                 functions.into_iter().zip(arguments).zip(tool_ids)

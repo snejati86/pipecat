@@ -69,13 +69,6 @@ impl LLMResponseAggregator {
         }
     }
 
-    /// Reset the aggregation state.
-    #[allow(dead_code)]
-    fn reset(&mut self) {
-        self.aggregation.clear();
-        self.in_response = false;
-    }
-
     /// Get the current accumulated text.
     pub fn aggregation(&self) -> &str {
         &self.aggregation
@@ -162,7 +155,7 @@ impl Processor for LLMResponseAggregator {
                 ctx.send_downstream(frame);
             }
 
-            // TextFrame -- accumulate text when inside a response
+            // TextFrame / LLMTextFrame -- accumulate text when inside a response
             FrameEnum::Text(ref text_frame) => {
                 if self.in_response {
                     if !self.aggregation.is_empty() && !text_frame.includes_inter_frame_spaces {
@@ -170,11 +163,16 @@ impl Processor for LLMResponseAggregator {
                     }
                     self.aggregation.push_str(&text_frame.text);
                 }
-                // Pass TextFrame through regardless
-                match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame),
-                    FrameDirection::Upstream => ctx.send_upstream(frame),
+                ctx.send(frame, direction);
+            }
+            FrameEnum::LLMText(ref llm_text) => {
+                if self.in_response {
+                    if !self.aggregation.is_empty() && !llm_text.includes_inter_frame_spaces {
+                        self.aggregation.push(' ');
+                    }
+                    self.aggregation.push_str(&llm_text.text);
                 }
+                ctx.send(frame, direction);
             }
 
             // All other frames pass through
@@ -230,12 +228,6 @@ impl LLMUserContextAggregator {
     /// Get a reference to the shared context.
     pub fn context(&self) -> &Arc<Mutex<LLMContext>> {
         &self.context
-    }
-
-    /// Reset the aggregation state.
-    #[allow(dead_code)]
-    fn reset(&mut self) {
-        self.aggregation.clear();
     }
 
     /// Process the current aggregation: add user message to context and push
@@ -531,7 +523,7 @@ impl Processor for LLMAssistantContextAggregator {
                 }
             }
 
-            // TextFrame -- accumulate when inside a response; always pass through
+            // TextFrame / LLMTextFrame -- accumulate when inside a response; always pass through
             FrameEnum::Text(ref text_frame) => {
                 if self.response_depth > 0 && text_frame.append_to_context {
                     if !self.aggregation.is_empty() && !text_frame.includes_inter_frame_spaces {
@@ -539,11 +531,16 @@ impl Processor for LLMAssistantContextAggregator {
                     }
                     self.aggregation.push_str(&text_frame.text);
                 }
-                // Pass TextFrame through so downstream processors (e.g. TTS) see it
-                match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame),
-                    FrameDirection::Upstream => ctx.send_upstream(frame),
+                ctx.send(frame, direction);
+            }
+            FrameEnum::LLMText(ref llm_text) => {
+                if self.response_depth > 0 && llm_text.append_to_context {
+                    if !self.aggregation.is_empty() && !llm_text.includes_inter_frame_spaces {
+                        self.aggregation.push(' ');
+                    }
+                    self.aggregation.push_str(&llm_text.text);
                 }
+                ctx.send(frame, direction);
             }
 
             // InterruptionFrame -- flush aggregation, reset state, pass through
