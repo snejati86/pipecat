@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
+use crate::audio::codec::strip_wav_header;
 use crate::frames::{
     ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
     OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
@@ -77,20 +78,6 @@ pub struct SpeechRequest {
     pub noise_scale: f64,
     /// Phoneme width variation (default 0.8).
     pub noise_w: f64,
-}
-
-/// Standard WAV header size in bytes.
-pub const WAV_HEADER_SIZE: usize = 44;
-
-/// Strip the 44-byte WAV header from audio data.
-///
-/// If the data is shorter than `WAV_HEADER_SIZE`, returns an empty slice.
-pub fn strip_wav_header(data: &[u8]) -> &[u8] {
-    if data.len() > WAV_HEADER_SIZE {
-        &data[WAV_HEADER_SIZE..]
-    } else {
-        &[]
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -888,29 +875,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WAV header stripping tests
+    // WAV header stripping tests (delegates to crate::audio::codec)
     // -----------------------------------------------------------------------
+
+    /// Build a minimal valid 44-byte WAV header followed by `pcm` data.
+    fn make_wav(pcm: &[u8]) -> Vec<u8> {
+        let data_size = pcm.len() as u32;
+        let mut wav = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&22050u32.to_le_bytes());
+        wav.extend_from_slice(&44100u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        wav.extend_from_slice(pcm);
+        wav
+    }
 
     #[test]
     fn test_strip_wav_header_normal() {
-        let mut data = vec![0u8; WAV_HEADER_SIZE]; // 44-byte header
-        data.extend_from_slice(&[1, 2, 3, 4]); // PCM audio data
+        let data = make_wav(&[1, 2, 3, 4]);
         let stripped = strip_wav_header(&data);
         assert_eq!(stripped, &[1, 2, 3, 4]);
     }
 
     #[test]
     fn test_strip_wav_header_exact_header_size() {
-        let data = vec![0u8; WAV_HEADER_SIZE];
+        let data = make_wav(&[]);
         let stripped = strip_wav_header(&data);
-        assert!(stripped.is_empty());
+        // Exactly 44 bytes with valid RIFF/WAVE but no data beyond header,
+        // shared implementation returns empty slice (no PCM data).
+        assert_eq!(stripped.len(), 0);
     }
 
     #[test]
     fn test_strip_wav_header_shorter_than_header() {
         let data = vec![0u8; 20];
         let stripped = strip_wav_header(&data);
-        assert!(stripped.is_empty());
+        // Not a valid WAV, returned unchanged.
+        assert_eq!(stripped.len(), 20);
     }
 
     #[test]
@@ -923,9 +933,8 @@ mod tests {
     #[test]
     fn test_strip_wav_header_large_audio() {
         // Simulate ~0.5s of 22050Hz 16-bit mono (22050 bytes) with WAV header.
-        let mut data = vec![0u8; WAV_HEADER_SIZE];
         let pcm_data = vec![0xABu8; 22050];
-        data.extend_from_slice(&pcm_data);
+        let data = make_wav(&pcm_data);
         let stripped = strip_wav_header(&data);
         assert_eq!(stripped.len(), 22050);
         assert!(stripped.iter().all(|&b| b == 0xAB));
@@ -938,8 +947,7 @@ mod tests {
     #[test]
     fn test_extract_audio_strips_wav_header() {
         let service = PiperTTSService::new();
-        let mut data = vec![0u8; WAV_HEADER_SIZE];
-        data.extend_from_slice(&[10, 20, 30]);
+        let data = make_wav(&[10, 20, 30]);
         let result = service.extract_audio(data);
         assert_eq!(result, vec![10, 20, 30]);
     }
@@ -949,7 +957,8 @@ mod tests {
         let service = PiperTTSService::new();
         let data = vec![0u8; 10];
         let result = service.extract_audio(data);
-        assert!(result.is_empty());
+        // Not a valid WAV, returned unchanged.
+        assert_eq!(result.len(), 10);
     }
 
     #[test]
@@ -963,9 +972,10 @@ mod tests {
     #[test]
     fn test_extract_audio_exactly_header_size() {
         let service = PiperTTSService::new();
-        let data = vec![0u8; WAV_HEADER_SIZE];
+        let data = make_wav(&[]);
         let result = service.extract_audio(data);
-        assert!(result.is_empty());
+        // Exactly 44 bytes, shared implementation strips header → empty.
+        assert_eq!(result.len(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1378,15 +1388,6 @@ mod tests {
             service.base.pending_frames.is_empty(),
             "Empty LLMTextFrame should not trigger TTS"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // WAV_HEADER_SIZE constant test
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_wav_header_size_constant() {
-        assert_eq!(WAV_HEADER_SIZE, 44);
     }
 
     // -----------------------------------------------------------------------

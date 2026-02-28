@@ -10,31 +10,27 @@
 pub use std::sync::Arc;
 
 pub use crate::frames::{
-    AudioRawData, CancelFrame, EndFrame, ErrorFrame, Frame, InputAudioRawFrame,
-    InterimTranscriptionFrame, InterruptionFrame, LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMTextFrame, MetricsFrame,
-    OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-    TextFrame, TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+    AudioRawData, CancelFrame, EndFrame, ErrorFrame, ExtensionFrame, Frame, FrameEnum, FrameKind,
+    FrameRef, InputAudioRawFrame, InterimTranscriptionFrame, InterruptionFrame,
+    LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMTextFrame,
+    MetricsFrame, OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame,
+    TTSStoppedFrame, TextFrame, TranscriptionFrame, UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 };
 
 pub use crate::observers::Observer;
-pub use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
-pub use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
+pub use crate::pipeline::ChannelPipeline;
+pub use crate::processors::audio::input_mute::UserInputMuteProcessor;
+pub use crate::processors::{FrameDirection, Processor, ProcessorContext, ProcessorWeight};
 pub use crate::serializers::FrameSerializer;
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
 
-/// Type alias for a reference-counted frame.
-pub type FrameRef = Arc<dyn Frame>;
-
-/// Type alias for a reference-counted, mutex-protected processor.
-pub type ProcessorRef = Arc<tokio::sync::Mutex<dyn FrameProcessor>>;
+#[cfg(feature = "silero-vad")]
+pub use crate::processors::audio::silero_vad::SileroVADProcessor;
+#[cfg(feature = "smart-turn")]
+pub use crate::processors::audio::smart_turn_processor::SmartTurnProcessor;
 
 /// Wrap a frame in an Arc for pipeline use.
 pub fn frame<F: Frame + 'static>(f: F) -> FrameRef {
     Arc::new(f)
-}
-
-/// Wrap a processor in Arc<Mutex<>> for pipeline use.
-pub fn processor<P: FrameProcessor + 'static>(p: P) -> ProcessorRef {
-    Arc::new(tokio::sync::Mutex::new(p))
 }

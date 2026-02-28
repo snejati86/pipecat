@@ -477,7 +477,10 @@ impl WebSocketTransport {
     ) {
         let frame = match serializer.deserialize(data) {
             Some(f) => f,
-            None => return,
+            None => {
+                tracing::debug!("WebSocketTransport: deserialization returned None, dropping message");
+                return;
+            }
         };
 
         // If the frame is an InputAudioRawFrame, check whether audio input

@@ -33,6 +33,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::audio::codec::{mulaw_to_pcm, pcm_to_mulaw, resample_linear};
 use crate::frames::*;
 use crate::serializers::{FrameSerializer, SerializedFrame};
 use crate::utils::helpers::{decode_base64, encode_base64};
@@ -43,137 +44,6 @@ use crate::utils::helpers::{decode_base64, encode_base64};
 
 /// Exotel's native audio sample rate (8kHz G.711 mu-law telephony).
 const EXOTEL_SAMPLE_RATE: u32 = 8000;
-
-// ---------------------------------------------------------------------------
-// Mu-law codec (ITU-T G.711)
-// ---------------------------------------------------------------------------
-
-/// Bias added before mu-law compression (ITU-T G.711).
-const MULAW_BIAS: i32 = 0x84; // 132
-/// Maximum linear magnitude before clipping.
-const MULAW_CLIP: i32 = 32635;
-
-/// Encode a single 16-bit linear PCM sample to mu-law (ITU-T G.711).
-///
-/// Implements the standard CCITT G.711 mu-law companding algorithm.
-fn linear_to_mulaw(sample: i16) -> u8 {
-    // Determine sign and get magnitude
-    let sign: i32 = if sample < 0 { 0x80 } else { 0x00 };
-    let mut magnitude = if sample < 0 {
-        -(sample as i32)
-    } else {
-        sample as i32
-    };
-
-    // Clip to valid range
-    if magnitude > MULAW_CLIP {
-        magnitude = MULAW_CLIP;
-    }
-    magnitude += MULAW_BIAS;
-
-    // Find the segment (exponent) by searching from the top bit down
-    let mut exponent: i32 = 7;
-    let mut mask = 0x4000;
-    while exponent > 0 && (magnitude & mask) == 0 {
-        exponent -= 1;
-        mask >>= 1;
-    }
-
-    // Extract the 4 mantissa bits
-    let mantissa = (magnitude >> (exponent + 3)) & 0x0F;
-
-    // Combine sign, exponent, mantissa and complement
-    let mulaw_byte = sign | (exponent << 4) | mantissa;
-    !(mulaw_byte as u8)
-}
-
-/// Decode a single mu-law byte to a 16-bit linear PCM sample (ITU-T G.711).
-fn mulaw_to_linear(mulaw_byte: u8) -> i16 {
-    let complement = !mulaw_byte as i32;
-    let sign = complement & 0x80;
-    let exponent = (complement >> 4) & 0x07;
-    let mantissa = complement & 0x0F;
-
-    // Reconstruct magnitude
-    let mut magnitude = ((mantissa << 1) | 0x21) << (exponent + 2);
-    magnitude -= MULAW_BIAS;
-
-    if sign == 0x80 {
-        -magnitude as i16
-    } else {
-        magnitude as i16
-    }
-}
-
-/// Decode a buffer of mu-law bytes to 16-bit linear PCM bytes (little-endian).
-fn mulaw_to_pcm(mulaw_data: &[u8]) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(mulaw_data.len() * 2);
-    for &byte in mulaw_data {
-        let sample = mulaw_to_linear(byte);
-        pcm.extend_from_slice(&sample.to_le_bytes());
-    }
-    pcm
-}
-
-/// Encode 16-bit linear PCM bytes (little-endian) to mu-law bytes.
-fn pcm_to_mulaw(pcm_data: &[u8]) -> Vec<u8> {
-    let mut mulaw = Vec::with_capacity(pcm_data.len() / 2);
-    for chunk in pcm_data.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        mulaw.push(linear_to_mulaw(sample));
-    }
-    mulaw
-}
-
-// ---------------------------------------------------------------------------
-// Sample rate conversion (linear interpolation)
-// ---------------------------------------------------------------------------
-
-/// Resample 16-bit PCM audio (as bytes) from one sample rate to another
-/// using linear interpolation.
-///
-/// Input and output are little-endian i16 PCM byte buffers.
-fn resample_linear(pcm_data: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
-    if from_rate == to_rate || pcm_data.len() < 2 {
-        return pcm_data.to_vec();
-    }
-
-    // Parse input samples
-    let input_samples: Vec<i16> = pcm_data
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
-
-    let input_len = input_samples.len();
-    if input_len == 0 {
-        return Vec::new();
-    }
-    if input_len == 1 {
-        return pcm_data.to_vec();
-    }
-
-    let ratio = from_rate as f64 / to_rate as f64;
-    let output_len = ((input_len as f64) / ratio).ceil() as usize;
-
-    let mut output = Vec::with_capacity(output_len * 2);
-    for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let src_idx = src_pos.floor() as usize;
-        let frac = src_pos - src_idx as f64;
-
-        let sample = if src_idx + 1 < input_len {
-            let s0 = input_samples[src_idx] as f64;
-            let s1 = input_samples[src_idx + 1] as f64;
-            (s0 + frac * (s1 - s0)) as i16
-        } else {
-            input_samples[input_len - 1]
-        };
-
-        output.extend_from_slice(&sample.to_le_bytes());
-    }
-
-    output
-}
 
 // ---------------------------------------------------------------------------
 // Exotel wire-format types (deserialization)
@@ -407,7 +277,13 @@ impl FrameSerializer for ExotelFrameSerializer {
                 if media.payload.is_empty() {
                     return None;
                 }
-                let mulaw_data = decode_base64(&media.payload)?;
+                let mulaw_data = match decode_base64(&media.payload) {
+                    Some(data) => data,
+                    None => {
+                        tracing::warn!("Exotel: failed to decode base64 audio payload");
+                        return None;
+                    }
+                };
                 if mulaw_data.is_empty() {
                     return None;
                 }
@@ -463,6 +339,7 @@ impl FrameSerializer for ExotelFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::codec::{linear_to_mulaw, mulaw_to_linear};
 
     // -----------------------------------------------------------------------
     // Mu-law codec unit tests

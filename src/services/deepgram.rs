@@ -34,13 +34,14 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing;
 
+use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
-    EndFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame, TranscriptionFrame,
+    ErrorFrame, Frame, InterimTranscriptionFrame, TranscriptionFrame,
     UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
-use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
-use crate::services::{AIService, STTService};
+use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
+use crate::processors::FrameDirection;
+use crate::services::AIService;
 
 // ---------------------------------------------------------------------------
 // Deepgram WebSocket JSON response types
@@ -155,8 +156,10 @@ type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 /// let stt = DeepgramSTTService::new("dg-api-key".to_string());
 /// ```
 pub struct DeepgramSTTService {
-    /// Common processor state (ID, name, links, pending frames).
-    base: BaseProcessor,
+    /// Unique processor instance ID.
+    id: u64,
+    /// Human-readable processor name.
+    name: String,
 
     // -- Configuration -------------------------------------------------------
     /// Deepgram API key.
@@ -196,7 +199,7 @@ pub struct DeepgramSTTService {
     ws_reader_task: Option<JoinHandle<()>>,
     /// Channel used by the reader task to push frames back into the processor.
     frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
-    /// Receiving end -- drained in `process_frame` to push frames downstream.
+    /// Receiving end -- drained in `process` to push frames downstream.
     frame_rx: tokio::sync::mpsc::Receiver<Arc<dyn Frame>>,
 }
 
@@ -213,7 +216,8 @@ impl DeepgramSTTService {
     pub fn new(api_key: impl Into<String>) -> Self {
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         Self {
-            base: BaseProcessor::new(Some("DeepgramSTTService".to_string()), false),
+            id: crate::utils::base_object::obj_id(),
+            name: "DeepgramSTTService".to_string(),
             api_key: api_key.into(),
             model: "nova-2".to_string(),
             language: Some("en".to_string()),
@@ -556,6 +560,7 @@ impl DeepgramSTTService {
         let transcript = &alternative.transcript;
 
         if transcript.is_empty() {
+            tracing::trace!("Deepgram: empty transcript, skipping");
             return;
         }
 
@@ -569,6 +574,7 @@ impl DeepgramSTTService {
         let raw_result: Option<serde_json::Value> = serde_json::from_str(text).ok();
 
         if is_final {
+            tracing::debug!(text = %transcript, "Deepgram: final transcription");
             let mut frame =
                 TranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
@@ -580,6 +586,7 @@ impl DeepgramSTTService {
                 );
             }
         } else {
+            tracing::trace!(text = %transcript, "Deepgram: interim transcription");
             let mut frame =
                 InterimTranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
@@ -632,25 +639,16 @@ impl DeepgramSTTService {
         tracing::debug!("DeepgramSTTService: disconnected");
     }
 
-    /// Drain any frames that the background reader has produced and push them
-    /// downstream. This is called from `process_frame` so that frames are
-    /// integrated into the normal pipeline flow.
-    async fn drain_reader_frames(&mut self) {
+    /// Drain any frames that the background reader has produced and send them
+    /// via the processor context. This is called from `process` so that frames
+    /// are integrated into the normal pipeline flow.
+    async fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
         while let Ok(frame) = self.frame_rx.try_recv() {
-            // ErrorFrames go upstream, everything else downstream.
-            if frame
-                .as_ref()
-                .as_any()
-                .downcast_ref::<crate::frames::ErrorFrame>()
-                .is_some()
-            {
-                self.base
-                    .pending_frames
-                    .push((frame, FrameDirection::Upstream));
-            } else {
-                self.base
-                    .pending_frames
-                    .push((frame, FrameDirection::Downstream));
+            if let Some(fe) = FrameEnum::try_from_arc(frame) {
+                match &fe {
+                    FrameEnum::Error(_) => ctx.send_upstream(fe).await,
+                    _ => ctx.send_downstream(fe).await,
+                }
             }
         }
     }
@@ -672,8 +670,8 @@ fn now_iso8601() -> String {
 impl fmt::Debug for DeepgramSTTService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeepgramSTTService")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("model", &self.model)
             .field("sample_rate", &self.sample_rate)
             .field("encoding", &self.encoding)
@@ -682,101 +680,117 @@ impl fmt::Debug for DeepgramSTTService {
     }
 }
 
-impl_base_display!(DeepgramSTTService);
+impl fmt::Display for DeepgramSTTService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
 
 #[async_trait]
-impl FrameProcessor for DeepgramSTTService {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
+impl Processor for DeepgramSTTService {
+    fn name(&self) -> &str {
+        &self.name
     }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
+
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn weight(&self) -> ProcessorWeight {
+        ProcessorWeight::Heavy
+    }
+
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        match frame {
+            // -- StartFrame: establish WebSocket connection -------------------
+            FrameEnum::Start(ref sf) => {
+                // Extract sample_rate from StartFrame if present.
+                if sf.audio_in_sample_rate > 0 {
+                    self.sample_rate = sf.audio_in_sample_rate;
+                }
+
+                match self.connect().await {
+                    Ok(()) => {
+                        tracing::info!("DeepgramSTTService: connected successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!("DeepgramSTTService: connection failed: {}", e);
+                        let error_frame = FrameEnum::Error(ErrorFrame::new(
+                            format!("Deepgram connection failed: {}", e),
+                            false,
+                        ));
+                        ctx.send_upstream(error_frame).await;
+                    }
+                }
+
+                // Pass the StartFrame downstream so other processors see it.
+                ctx.send_downstream(frame).await;
+            }
+
+            // -- InputAudioRawFrame: forward audio to Deepgram ---------------
+            FrameEnum::InputAudioRaw(ref audio_frame) => {
+                // Drain any frames produced by the WebSocket reader task.
+                self.drain_reader_frames(ctx).await;
+
+                if let Some(ref sender) = self.ws_sender {
+                    let mut sink = sender.lock().await;
+                    if let Err(e) = sink
+                        .send(Message::Binary(audio_frame.audio.audio.clone()))
+                        .await
+                    {
+                        tracing::error!("DeepgramSTTService: failed to send audio: {}", e);
+                        // Drop the sink lock and clear ws_sender so next frame triggers reconnect.
+                        drop(sink);
+                        self.ws_sender = None;
+                        let error_frame = FrameEnum::Error(ErrorFrame::new(
+                            format!("Failed to send audio to Deepgram: {}", e),
+                            false,
+                        ));
+                        ctx.send_upstream(error_frame).await;
+                    }
+                } else {
+                    tracing::warn!(
+                        "DeepgramSTTService: received audio but WebSocket is not connected"
+                    );
+                }
+                // Audio frames are consumed by the STT service; do NOT push downstream.
+            }
+
+            // -- EndFrame: graceful shutdown ----------------------------------
+            FrameEnum::End(_) => {
+                self.disconnect().await;
+                // Drain any final frames that arrived during disconnect.
+                self.drain_reader_frames(ctx).await;
+                // Pass EndFrame downstream.
+                ctx.send_downstream(frame).await;
+            }
+
+            // -- CancelFrame: immediate shutdown -----------------------------
+            FrameEnum::Cancel(_) => {
+                self.disconnect().await;
+                // Drain any final frames that arrived during disconnect.
+                self.drain_reader_frames(ctx).await;
+                ctx.send_downstream(frame).await;
+            }
+
+            // -- All other frames: drain reader and pass through -------------
+            other => {
+                self.drain_reader_frames(ctx).await;
+                match direction {
+                    FrameDirection::Downstream => ctx.send_downstream(other).await,
+                    FrameDirection::Upstream => ctx.send_upstream(other).await,
+                }
+            }
+        }
     }
 
     async fn cleanup(&mut self) {
         self.disconnect().await;
-    }
-
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        // First, drain any frames produced by the WebSocket reader task so they
-        // are pushed into the pipeline in order.
-        self.drain_reader_frames().await;
-
-        // -- StartFrame: establish WebSocket connection -----------------------
-        if frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<StartFrame>()
-            .is_some()
-        {
-            // Extract sample_rate from StartFrame if present.
-            if let Some(start_frame) = frame.as_ref().as_any().downcast_ref::<StartFrame>() {
-                if start_frame.audio_in_sample_rate > 0 {
-                    self.sample_rate = start_frame.audio_in_sample_rate;
-                }
-            }
-
-            match self.connect().await {
-                Ok(()) => {
-                    tracing::info!("DeepgramSTTService: connected successfully");
-                }
-                Err(e) => {
-                    tracing::error!("DeepgramSTTService: connection failed: {}", e);
-                    self.push_error(&format!("Deepgram connection failed: {}", e), false)
-                        .await;
-                }
-            }
-
-            // Pass the StartFrame downstream so other processors see it.
-            self.push_frame(frame, direction).await;
-            return;
-        }
-
-        // -- InputAudioRawFrame: forward audio to Deepgram -------------------
-        if let Some(audio_frame) = frame.as_ref().as_any().downcast_ref::<InputAudioRawFrame>() {
-            if let Some(ref sender) = self.ws_sender {
-                let mut sink = sender.lock().await;
-                if let Err(e) = sink
-                    .send(Message::Binary(audio_frame.audio.audio.clone()))
-                    .await
-                {
-                    tracing::error!("DeepgramSTTService: failed to send audio: {}", e);
-                    // Drop the connection reference; we'll try to reconnect.
-                    drop(sink);
-                    self.push_error(&format!("Failed to send audio to Deepgram: {}", e), false)
-                        .await;
-                }
-            } else {
-                tracing::warn!("DeepgramSTTService: received audio but WebSocket is not connected");
-            }
-            // Audio frames are consumed by the STT service; do NOT push downstream.
-            return;
-        }
-
-        // -- EndFrame: graceful shutdown -------------------------------------
-        if frame.as_ref().as_any().downcast_ref::<EndFrame>().is_some() {
-            self.disconnect().await;
-            // Drain any final frames that arrived during disconnect.
-            self.drain_reader_frames().await;
-            // Pass EndFrame downstream.
-            self.push_frame(frame, direction).await;
-            return;
-        }
-
-        // -- CancelFrame: immediate shutdown ---------------------------------
-        if frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::CancelFrame>()
-            .is_some()
-        {
-            self.disconnect().await;
-            self.push_frame(frame, direction).await;
-            return;
-        }
-
-        // -- All other frames: pass through ----------------------------------
-        self.push_frame(frame, direction).await;
     }
 }
 
@@ -786,52 +800,12 @@ impl AIService for DeepgramSTTService {
         Some(&self.model)
     }
 
-    async fn start(&mut self) {
-        // Connection is established upon receiving StartFrame in process_frame.
-    }
-
     async fn stop(&mut self) {
         self.disconnect().await;
     }
 
     async fn cancel(&mut self) {
         self.disconnect().await;
-    }
-}
-
-#[async_trait]
-impl STTService for DeepgramSTTService {
-    /// Process audio data and return transcription frames.
-    ///
-    /// In the streaming WebSocket model, audio is sent via `process_frame`
-    /// when an `InputAudioRawFrame` arrives. This method provides a
-    /// request-response interface: it sends the audio and then collects any
-    /// frames that the reader task has produced.
-    async fn run_stt(&mut self, audio: &[u8]) -> Vec<Arc<dyn Frame>> {
-        if let Some(ref sender) = self.ws_sender {
-            let mut sink = sender.lock().await;
-            if let Err(e) = sink.send(Message::Binary(audio.to_vec())).await {
-                tracing::error!("DeepgramSTTService::run_stt: failed to send audio: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
-                    format!("Failed to send audio to Deepgram: {}", e),
-                    false,
-                ))];
-            }
-        } else {
-            return vec![Arc::new(crate::frames::ErrorFrame::new(
-                "DeepgramSTTService: WebSocket not connected".to_string(),
-                false,
-            ))];
-        }
-
-        // Give the server a brief moment to respond, then drain available frames.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            frames.push(frame);
-        }
-        frames
     }
 }
 

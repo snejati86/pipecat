@@ -46,7 +46,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -356,6 +356,7 @@ impl LmntTTSService {
 
         let ttfb_start = Instant::now();
         let mut got_first_audio = false;
+        let mut actual_ttfb = Duration::ZERO;
 
         // Send the request and receive responses under the lock.
         let mut ws_guard = self.ws.lock().await;
@@ -372,6 +373,7 @@ impl LmntTTSService {
 
         // Send text message.
         if let Err(e) = ws.send(WsMessage::Text(text_json)).await {
+            *ws_guard = None; // Invalidate broken connection for reconnection
             frames.push(Arc::new(ErrorFrame::new(
                 format!("Failed to send TTS text request over WebSocket: {e}"),
                 false,
@@ -381,6 +383,7 @@ impl LmntTTSService {
 
         // Send EOF message to flush synthesis.
         if let Err(e) = ws.send(WsMessage::Text(eof_json)).await {
+            *ws_guard = None; // Invalidate broken connection for reconnection
             frames.push(Arc::new(ErrorFrame::new(
                 format!("Failed to send TTS EOF request over WebSocket: {e}"),
                 false,
@@ -399,10 +402,12 @@ impl LmntTTSService {
         );
 
         // Read messages until we get a done signal or connection closes.
+        let mut ws_broken = false;
         loop {
             let msg = match ws.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
+                    ws_broken = true;
                     frames.push(Arc::new(ErrorFrame::new(
                         format!("WebSocket receive error: {e}"),
                         false,
@@ -410,11 +415,12 @@ impl LmntTTSService {
                     break;
                 }
                 None => {
-                    // Connection closed.
-                    tracing::debug!(
-                        service = %self.base.name(),
-                        "WebSocket connection closed"
-                    );
+                    // Connection closed unexpectedly.
+                    ws_broken = true;
+                    frames.push(Arc::new(ErrorFrame::new(
+                        "WebSocket connection closed unexpectedly".to_string(),
+                        false,
+                    )));
                     break;
                 }
             };
@@ -425,10 +431,10 @@ impl LmntTTSService {
                     if !data.is_empty() {
                         if !got_first_audio {
                             got_first_audio = true;
-                            let ttfb = ttfb_start.elapsed();
+                            actual_ttfb = ttfb_start.elapsed();
                             tracing::debug!(
                                 service = %self.base.name(),
-                                ttfb_ms = %ttfb.as_millis(),
+                                ttfb_ms = %actual_ttfb.as_millis(),
                                 "Time to first byte"
                             );
                         }
@@ -521,6 +527,7 @@ impl LmntTTSService {
                     }
                 }
                 WsMessage::Close(_) => {
+                    ws_broken = true;
                     tracing::debug!(
                         service = %self.base.name(),
                         "WebSocket closed by server"
@@ -531,10 +538,14 @@ impl LmntTTSService {
             }
         }
 
-        // Record metrics.
-        let ttfb = ttfb_start.elapsed();
+        // Invalidate broken connection so connect() can reconnect.
+        if ws_broken {
+            *ws_guard = None;
+        }
+
+        // Record metrics using the actual time-to-first-byte, not total time.
         self.last_metrics = Some(LmntTTSMetrics {
-            ttfb_ms: ttfb.as_secs_f64() * 1000.0,
+            ttfb_ms: actual_ttfb.as_secs_f64() * 1000.0,
             character_count: text.len(),
         });
 
@@ -608,6 +619,10 @@ impl FrameProcessor for LmntTTSService {
             // Pass all other frames through in their original direction.
             self.push_frame(frame, direction).await;
         }
+    }
+
+    async fn cleanup(&mut self) {
+        self.disconnect().await;
     }
 }
 

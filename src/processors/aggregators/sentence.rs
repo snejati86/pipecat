@@ -17,13 +17,15 @@
 //! ```
 
 use std::fmt;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::frames::{Frame, InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame};
-use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
+use crate::frames::frame_enum::FrameEnum;
+use crate::frames::{LLMFullResponseEndFrame, TextFrame};
+use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
+use crate::processors::FrameDirection;
+use crate::utils::base_object::obj_id;
+use tracing;
 
 /// Characters that mark the end of a sentence.
 const SENTENCE_ENDINGS: &[char] = &['.', '!', '?', '\n'];
@@ -63,12 +65,13 @@ fn is_sentence_end(text: &str) -> bool {
 /// (such as TTS) receive complete sentences rather than individual tokens.
 ///
 /// Special frame handling:
-/// - [`InterimTranscriptionFrame`]: ignored (consumed without output).
+/// - [`InterimTranscriptionFrame`](crate::frames::InterimTranscriptionFrame): ignored (consumed without output).
 /// - [`LLMFullResponseEndFrame`]: flushes any remaining buffered text before
 ///   passing the frame through.
 /// - All other frames: passed through unchanged.
 pub struct SentenceAggregator {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     /// Accumulated text waiting for a sentence boundary.
     aggregation: String,
 }
@@ -77,7 +80,8 @@ impl SentenceAggregator {
     /// Create a new sentence aggregator.
     pub fn new() -> Self {
         Self {
-            base: BaseProcessor::new(Some("SentenceAggregator".to_string()), false),
+            id: obj_id(),
+            name: "SentenceAggregator".to_string(),
             aggregation: String::with_capacity(256),
         }
     }
@@ -97,68 +101,85 @@ impl Default for SentenceAggregator {
 impl fmt::Debug for SentenceAggregator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SentenceAggregator")
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("aggregation_len", &self.aggregation.len())
             .finish()
     }
 }
 
-impl_base_display!(SentenceAggregator);
+impl fmt::Display for SentenceAggregator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
 
 #[async_trait]
-impl FrameProcessor for SentenceAggregator {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
+impl Processor for SentenceAggregator {
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        // Ignore interim transcription frames
-        if frame
-            .as_any()
-            .downcast_ref::<InterimTranscriptionFrame>()
-            .is_some()
-        {
-            return;
-        }
+    fn id(&self) -> u64 {
+        self.id
+    }
 
-        // TextFrame -- accumulate and check for sentence boundary
-        if let Some(text_frame) = frame.as_any().downcast_ref::<TextFrame>() {
-            self.aggregation.push_str(&text_frame.text);
+    fn weight(&self) -> ProcessorWeight {
+        ProcessorWeight::Light
+    }
 
-            if is_sentence_end(&self.aggregation) {
-                let sentence = std::mem::take(&mut self.aggregation);
-                self.push_frame(
-                    Arc::new(TextFrame::new(sentence)),
-                    FrameDirection::Downstream,
-                )
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        match frame {
+            // Ignore interim transcription frames (consumed)
+            FrameEnum::InterimTranscription(_) => {
+                return;
+            }
+
+            // InterruptionFrame -- clear accumulated text and pass through
+            FrameEnum::Interruption(_) => {
+                self.aggregation.clear();
+                tracing::debug!("Sentence: cleared on interruption");
+                ctx.send_downstream(frame).await;
+            }
+
+            // TextFrame -- accumulate and check for sentence boundary
+            FrameEnum::Text(t) => {
+                self.aggregation.push_str(&t.text);
+                tracing::trace!(text = %t.text, buffer_len = self.aggregation.len(), "Sentence: buffering");
+
+                if is_sentence_end(&self.aggregation) {
+                    let sentence = std::mem::take(&mut self.aggregation);
+                    tracing::debug!(sentence = %sentence, "Sentence: emitting");
+                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(sentence)))
+                        .await;
+                }
+            }
+
+            // LLMFullResponseEndFrame -- flush remaining text before passing through
+            FrameEnum::LLMFullResponseEnd(_) => {
+                if !self.aggregation.is_empty() {
+                    let remaining = std::mem::take(&mut self.aggregation);
+                    tracing::debug!(text = %remaining, "Sentence: flushing on response end");
+                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(remaining)))
+                        .await;
+                }
+                ctx.send_downstream(FrameEnum::LLMFullResponseEnd(
+                    LLMFullResponseEndFrame::new(),
+                ))
                 .await;
             }
-            return;
-        }
 
-        // LLMFullResponseEndFrame -- flush remaining text before passing through
-        if frame
-            .as_any()
-            .downcast_ref::<LLMFullResponseEndFrame>()
-            .is_some()
-        {
-            if !self.aggregation.is_empty() {
-                let remaining = std::mem::take(&mut self.aggregation);
-                self.push_frame(
-                    Arc::new(TextFrame::new(remaining)),
-                    FrameDirection::Downstream,
-                )
-                .await;
-            }
-            self.push_frame(frame, direction).await;
-            return;
+            // All other frames pass through
+            other => match direction {
+                FrameDirection::Downstream => ctx.send_downstream(other).await,
+                FrameDirection::Upstream => ctx.send_upstream(other).await,
+            },
         }
-
-        // All other frames pass through
-        self.push_frame(frame, direction).await;
     }
 }
 
@@ -166,6 +187,18 @@ impl FrameProcessor for SentenceAggregator {
 mod tests {
     use super::*;
     use crate::frames::{InterimTranscriptionFrame, LLMFullResponseEndFrame, TextFrame};
+    use tokio::sync::mpsc;
+
+    fn make_ctx() -> (
+        ProcessorContext,
+        mpsc::UnboundedReceiver<FrameEnum>,
+        mpsc::UnboundedReceiver<FrameEnum>,
+    ) {
+        let (dtx, drx) = mpsc::unbounded_channel();
+        let (utx, urx) = mpsc::unbounded_channel();
+        let ctx = ProcessorContext::new(dtx, utx, tokio_util::sync::CancellationToken::new(), 1);
+        (ctx, drx, urx)
+    }
 
     #[test]
     fn sentence_end_detection() {
@@ -183,88 +216,136 @@ mod tests {
     #[tokio::test]
     async fn buffers_until_sentence_end() {
         let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
 
-        // Partial text -- should be buffered
-        agg.process_frame(
-            Arc::new(TextFrame::new("Hello".to_string())),
+        // Partial text -- should be buffered, nothing sent
+        agg.process(
+            FrameEnum::Text(TextFrame::new("Hello")),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
         assert_eq!(agg.aggregation(), "Hello");
-        assert!(agg.pending_frames_mut().is_empty());
+        assert!(drx.try_recv().is_err());
 
         // More partial text
-        agg.process_frame(
-            Arc::new(TextFrame::new(", world".to_string())),
+        agg.process(
+            FrameEnum::Text(TextFrame::new(", world")),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
         assert_eq!(agg.aggregation(), "Hello, world");
-        assert!(agg.pending_frames_mut().is_empty());
+        assert!(drx.try_recv().is_err());
 
         // Sentence end -- should flush
-        agg.process_frame(
-            Arc::new(TextFrame::new(".".to_string())),
+        agg.process(
+            FrameEnum::Text(TextFrame::new(".")),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
         assert!(agg.aggregation().is_empty());
-        assert_eq!(agg.pending_frames_mut().len(), 1);
-
-        // Verify the pushed frame content
-        let (pushed_frame, dir) = &agg.pending_frames_mut()[0];
-        assert_eq!(*dir, FrameDirection::Downstream);
-        let text_frame = pushed_frame.as_any().downcast_ref::<TextFrame>().unwrap();
-        assert_eq!(text_frame.text, "Hello, world.");
+        let out = drx.try_recv().unwrap();
+        match out {
+            FrameEnum::Text(t) => assert_eq!(t.text, "Hello, world."),
+            _ => panic!("Expected Text"),
+        }
     }
 
     #[tokio::test]
     async fn flushes_on_response_end() {
         let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
 
-        agg.process_frame(
-            Arc::new(TextFrame::new("incomplete".to_string())),
+        agg.process(
+            FrameEnum::Text(TextFrame::new("incomplete")),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
-        assert!(agg.pending_frames_mut().is_empty());
+        assert!(drx.try_recv().is_err());
 
         // Response end should flush remaining text
-        agg.process_frame(
-            Arc::new(LLMFullResponseEndFrame::new()),
+        agg.process(
+            FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
 
-        // Should have two pending frames: the flushed TextFrame + the EndFrame
-        assert_eq!(agg.pending_frames_mut().len(), 2);
+        // Should have two frames: the flushed TextFrame + the EndFrame
+        let first = drx.try_recv().unwrap();
+        match first {
+            FrameEnum::Text(t) => assert_eq!(t.text, "incomplete"),
+            _ => panic!("Expected TextFrame"),
+        }
 
-        let (first, _) = &agg.pending_frames_mut()[0];
-        let text = first.as_any().downcast_ref::<TextFrame>().unwrap();
-        assert_eq!(text.text, "incomplete");
-
-        let (second, _) = &agg.pending_frames_mut()[1];
-        assert!(second
-            .as_any()
-            .downcast_ref::<LLMFullResponseEndFrame>()
-            .is_some());
+        let second = drx.try_recv().unwrap();
+        assert!(matches!(second, FrameEnum::LLMFullResponseEnd(_)));
     }
 
     #[tokio::test]
     async fn ignores_interim_transcription() {
         let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
 
-        agg.process_frame(
-            Arc::new(InterimTranscriptionFrame::new(
+        agg.process(
+            FrameEnum::InterimTranscription(InterimTranscriptionFrame::new(
                 "partial".to_string(),
                 "user1".to_string(),
                 "ts".to_string(),
             )),
             FrameDirection::Downstream,
+            &ctx,
         )
         .await;
 
         assert!(agg.aggregation().is_empty());
-        assert!(agg.pending_frames_mut().is_empty());
+        assert!(drx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn interruption_clears_aggregation() {
+        let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
+
+        // Accumulate some text
+        agg.process(
+            FrameEnum::Text(TextFrame::new("Hello")),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+        assert_eq!(agg.aggregation(), "Hello");
+
+        // Interruption should clear
+        agg.process(
+            FrameEnum::Interruption(crate::frames::InterruptionFrame::new()),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+        assert!(agg.aggregation().is_empty());
+
+        // The interruption frame should have been passed through
+        let out = drx.try_recv().unwrap();
+        assert!(matches!(out, FrameEnum::Interruption(_)));
+    }
+
+    #[tokio::test]
+    async fn passthrough_other_frames() {
+        let mut agg = SentenceAggregator::new();
+        let (ctx, mut drx, _urx) = make_ctx();
+
+        agg.process(
+            FrameEnum::End(crate::frames::EndFrame::new()),
+            FrameDirection::Downstream,
+            &ctx,
+        )
+        .await;
+
+        let out = drx.try_recv().unwrap();
+        assert!(matches!(out, FrameEnum::End(_)));
     }
 }

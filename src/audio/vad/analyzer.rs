@@ -22,7 +22,7 @@ use crate::audio::utils::{calculate_rms, exp_smoothing};
 use crate::audio::vad::{VADParams, VADState};
 use crate::frames::{
     Frame, InputAudioRawFrame, StartFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
-    VADParamsUpdateFrame,
+    VADParamsUpdateFrame, VADUserStartedSpeakingFrame, VADUserStoppedSpeakingFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -85,7 +85,9 @@ impl VADConfidenceProvider for RmsConfidenceProvider {
 /// # Frames Emitted
 ///
 /// - [`UserStartedSpeakingFrame`]: Pushed downstream on `Starting -> Speaking` transition.
+/// - [`VADUserStartedSpeakingFrame`]: Pushed downstream with wall-clock timing after the above.
 /// - [`UserStoppedSpeakingFrame`]: Pushed downstream on `Stopping -> Quiet` transition.
+/// - [`VADUserStoppedSpeakingFrame`]: Pushed downstream with wall-clock timing after the above.
 pub struct VADAnalyzer {
     base: BaseProcessor,
 
@@ -209,7 +211,9 @@ impl VADAnalyzer {
         self.params = params;
 
         self.vad_frames = self.num_frames_required();
-        self.vad_frames_num_bytes = (self.vad_frames * self.num_channels * 2) as usize;
+        self.vad_frames_num_bytes = (self.vad_frames as usize)
+            .saturating_mul(self.num_channels as usize)
+            .saturating_mul(2);
 
         if self.sample_rate > 0 && self.vad_frames > 0 {
             let vad_frames_per_sec = self.vad_frames as f64 / self.sample_rate as f64;
@@ -378,7 +382,7 @@ impl FrameProcessor for VADAnalyzer {
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // Handle StartFrame: initialize sample rate from pipeline configuration.
         if let Some(start_frame) = frame.downcast_ref::<StartFrame>() {
-            if !self.initialized {
+            if !self.initialized && start_frame.audio_in_sample_rate > 0 {
                 self.set_sample_rate(start_frame.audio_in_sample_rate);
             }
             self.push_frame(frame, direction).await;
@@ -419,6 +423,13 @@ impl FrameProcessor for VADAnalyzer {
                 self.push_frame(speaking_frame, FrameDirection::Downstream)
                     .await;
 
+                let vad_frame = Arc::new(VADUserStartedSpeakingFrame::new(
+                    self.params.start_secs,
+                    ts,
+                ));
+                self.push_frame(vad_frame, FrameDirection::Downstream)
+                    .await;
+
                 tracing::debug!("VADAnalyzer: user started speaking at {:.3}", ts);
             }
 
@@ -426,6 +437,13 @@ impl FrameProcessor for VADAnalyzer {
                 let ts = Self::current_timestamp();
                 let stopped_frame = Arc::new(UserStoppedSpeakingFrame::new());
                 self.push_frame(stopped_frame, FrameDirection::Downstream)
+                    .await;
+
+                let vad_frame = Arc::new(VADUserStoppedSpeakingFrame::new(
+                    self.params.stop_secs,
+                    ts,
+                ));
+                self.push_frame(vad_frame, FrameDirection::Downstream)
                     .await;
 
                 tracing::debug!("VADAnalyzer: user stopped speaking at {:.3}", ts);

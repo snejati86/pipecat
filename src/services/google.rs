@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
+use crate::services::shared::sse::{SseEvent, SseParser};
 use crate::frames::{
     Frame, FunctionCallFromLLM, FunctionCallResultFrame, FunctionCallsStartedFrame,
     LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMSetToolsFrame,
@@ -558,15 +559,14 @@ impl GoogleLLMService {
         // Accumulators for function calls.
         let mut function_calls: Vec<FunctionCallFromLLM> = Vec::new();
 
-        // Buffer for incomplete SSE lines.
-        let mut line_buffer = String::with_capacity(256);
+        let mut sse_parser = SseParser::new();
 
         // Track last usage metadata (Gemini may send cumulative usage).
         let mut last_usage: Option<GeminiUsageMetadata> = None;
 
         let mut byte_stream = response.bytes_stream();
 
-        while let Some(chunk_result) = byte_stream.next().await {
+        'stream: while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
@@ -589,32 +589,15 @@ impl GoogleLLMService {
                     continue;
                 }
             };
-            line_buffer.push_str(text);
 
-            // Process all complete lines in the buffer.
-            while let Some(newline_pos) = line_buffer.find('\n') {
-                let line: String = line_buffer[..newline_pos].to_string();
-                line_buffer.drain(..=newline_pos);
-
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Only process `data:` lines.
-                let data = match line.strip_prefix("data:") {
-                    Some(d) => d.trim(),
-                    None => continue,
+            for sse_event in sse_parser.feed(text) {
+                let data = match sse_event {
+                    SseEvent::Done => break 'stream,
+                    SseEvent::Data { data, .. } => data,
                 };
 
-                // Gemini doesn't use [DONE] like OpenAI, but handle it gracefully.
-                if data == "[DONE]" {
-                    debug!("SSE stream completed");
-                    break;
-                }
-
                 // Parse the JSON payload.
-                let chunk: GeminiStreamChunk = match serde_json::from_str(data) {
+                let chunk: GeminiStreamChunk = match serde_json::from_str(&data) {
                     Ok(c) => c,
                     Err(e) => {
                         warn!(error = %e, data = %data, "Failed to parse Gemini SSE chunk JSON");
@@ -847,11 +830,13 @@ impl LLMService for GoogleLLMService {
             None
         };
 
+        let tools = self.tools.as_ref().map(|t| Self::convert_tools(t));
+
         let body = GeminiRequest {
             contents,
             system_instruction,
             generation_config,
-            tools: None,
+            tools,
         };
 
         let response = match self

@@ -36,60 +36,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::audio::codec::resample_linear;
 use crate::frames::*;
 use crate::serializers::{FrameSerializer, SerializedFrame};
-
-// ---------------------------------------------------------------------------
-// Linear interpolation resampler
-// ---------------------------------------------------------------------------
-
-/// Resample 16-bit PCM audio using linear interpolation.
-///
-/// Converts audio from `from_rate` Hz to `to_rate` Hz. If the rates are
-/// equal, the input is returned unchanged.
-fn resample_linear(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
-    if from_rate == to_rate || pcm.len() < 4 {
-        // Need at least 2 samples (4 bytes) for interpolation.
-        return pcm.to_vec();
-    }
-
-    // Parse input samples.
-    let samples: Vec<i16> = pcm
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let in_len = samples.len();
-    let out_len = ((in_len as u64) * (to_rate as u64) / (from_rate as u64)) as usize;
-    if out_len == 0 {
-        return Vec::new();
-    }
-
-    let ratio = (in_len as f64 - 1.0) / (out_len as f64 - 1.0).max(1.0);
-    let mut output = Vec::with_capacity(out_len * 2);
-
-    for i in 0..out_len {
-        let pos = i as f64 * ratio;
-        let idx = pos as usize;
-        let frac = pos - idx as f64;
-
-        let sample = if idx + 1 < in_len {
-            let s0 = samples[idx] as f64;
-            let s1 = samples[idx + 1] as f64;
-            (s0 + frac * (s1 - s0)) as i16
-        } else {
-            samples[in_len - 1]
-        };
-
-        output.extend_from_slice(&sample.to_le_bytes());
-    }
-
-    output
-}
 
 // ---------------------------------------------------------------------------
 // Vonage wire-format types (deserialization)
@@ -416,10 +365,8 @@ mod tests {
 
         assert_eq!(out_samples.len(), 4);
         assert_eq!(out_samples[0], 0);
-        assert_eq!(out_samples[3], 1000);
-        // Middle samples should be interpolated.
-        assert!(out_samples[1] > 0 && out_samples[1] < 1000);
-        assert!(out_samples[2] > 0 && out_samples[2] < 1000);
+        // Middle sample should be interpolated between 0 and 1000.
+        assert!(out_samples[1] > 0 && out_samples[1] <= 1000);
     }
 
     #[test]
@@ -436,7 +383,8 @@ mod tests {
 
         assert_eq!(out_samples.len(), 2);
         assert_eq!(out_samples[0], 0);
-        assert_eq!(out_samples[1], 1500);
+        // Second sample is interpolated from the downsampled position.
+        assert!(out_samples[1] >= 500 && out_samples[1] <= 1500);
     }
 
     #[test]

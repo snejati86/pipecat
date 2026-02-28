@@ -3,48 +3,52 @@
 
 //! AI service integrations (LLM, STT, TTS, Vision, Image Generation).
 
-pub mod anthropic;
-pub mod assemblyai;
-pub mod aws_polly;
-pub mod azure;
+pub mod shared;
+
+// Active services (native Processor or clean GenericLlmService wrappers):
 pub mod cartesia;
 pub mod cerebras;
 pub mod deepgram;
-pub mod deepseek;
-pub mod elevenlabs;
 pub mod fireworks;
-pub mod gladia;
-pub mod google;
-pub mod google_stt;
-pub mod google_tts;
 pub mod grok;
 pub mod groq;
-pub mod hume;
-pub mod kokoro;
-pub mod lmnt;
 pub mod mistral;
-pub mod neuphonic;
-pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 pub mod perplexity;
-pub mod piper;
 pub mod qwen;
-pub mod rime;
 pub mod sambanova;
 pub mod together;
-pub mod whisper;
+
+// Legacy FrameProcessor services — commented out until migrated:
+// pub mod anthropic;
+// pub mod assemblyai;
+// pub mod aws_polly;
+// pub mod azure;
+// pub mod deepseek;
+// pub mod elevenlabs;
+// pub mod gladia;
+// pub mod google;
+// pub mod google_stt;
+// pub mod google_tts;
+// pub mod hume;
+// pub mod kokoro;
+// pub mod lmnt;
+// pub mod neuphonic;
+// pub mod ollama;
+// pub mod piper;
+// pub mod rime;
+// pub mod whisper;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::frames::Frame;
-use crate::processors::FrameProcessor;
 
 /// Base trait for all AI services.
 #[async_trait]
-pub trait AIService: FrameProcessor {
+pub trait AIService: Send + Sync {
     /// Get the model name used by this service.
     fn model(&self) -> Option<&str> {
         None

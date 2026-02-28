@@ -47,23 +47,29 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
 use tracing;
 
+use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, TTSAudioRawFrame,
-    TTSStartedFrame, TTSStoppedFrame, TextFrame,
+    ErrorFrame, Frame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
 };
-use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
+use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
+use crate::processors::FrameDirection;
 use crate::services::{AIService, TTSService};
+use crate::utils::base_object::obj_id;
 
 /// Generate a unique context ID using the shared utility.
 fn generate_context_id() -> String {
@@ -226,8 +232,8 @@ struct CartesiaHttpRequest {
 // Type alias for the WebSocket stream
 // ---------------------------------------------------------------------------
 
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type CartesiaWsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+type CartesiaWsReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 // ---------------------------------------------------------------------------
 // CartesiaTTSService (WebSocket streaming)
@@ -241,7 +247,8 @@ type WsStream =
 /// The service maintains a persistent WebSocket connection and supports
 /// context-based audio management for handling interruptions and cancellations.
 pub struct CartesiaTTSService {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     api_key: String,
     voice_id: String,
     model: String,
@@ -253,9 +260,17 @@ pub struct CartesiaTTSService {
     ws_url: String,
     params: CartesiaInputParams,
 
-    /// The WebSocket connection, wrapped in a Mutex for interior mutability so
-    /// that the receive task and the send path can coexist safely.
-    ws: Arc<Mutex<Option<WsStream>>>,
+    // -- Split WebSocket (Deepgram pattern) --
+    ws_sender: Option<Arc<Mutex<CartesiaWsSink>>>,
+    ws_reader_task: Option<JoinHandle<()>>,
+
+    // -- Reader → processor channel (bounded, 256) --
+    frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
+    frame_rx: tokio::sync::mpsc::Receiver<FrameEnum>,
+
+    // -- Context continuation within an LLM turn --
+    current_context_id: Option<String>,
+    sentence_count_in_turn: u32,
 
     /// Last metrics collected (available after `run_tts` completes).
     pub last_metrics: Option<TTSMetrics>,
@@ -272,8 +287,10 @@ impl CartesiaTTSService {
     /// * `api_key` - Cartesia API key for authentication.
     /// * `voice_id` - ID of the voice to use for synthesis.
     pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         Self {
-            base: BaseProcessor::new(Some("CartesiaTTSService".to_string()), false),
+            id: obj_id(),
+            name: "CartesiaTTSService".to_string(),
             api_key: api_key.into(),
             voice_id: voice_id.into(),
             model: "sonic-2".to_string(),
@@ -284,7 +301,12 @@ impl CartesiaTTSService {
             cartesia_version: "2025-04-16".to_string(),
             ws_url: "wss://api.cartesia.ai/tts/websocket".to_string(),
             params: CartesiaInputParams::default(),
-            ws: Arc::new(Mutex::new(None)),
+            ws_sender: None,
+            ws_reader_task: None,
+            frame_tx,
+            frame_rx,
+            current_context_id: None,
+            sentence_count_in_turn: 0,
             last_metrics: None,
         }
     }
@@ -344,13 +366,12 @@ impl CartesiaTTSService {
         self
     }
 
-    /// Establish the WebSocket connection to Cartesia.
+    /// Establish the WebSocket connection to Cartesia, split into sender/reader.
     ///
-    /// This must be called before `run_tts`. If the connection is already open,
-    /// this is a no-op.
-    pub async fn connect(&self) -> Result<(), String> {
-        let mut ws_guard = self.ws.lock().await;
-        if ws_guard.is_some() {
+    /// Spawns a background reader task that pushes frames via an mpsc channel.
+    /// If the connection is already open, this is a no-op.
+    pub async fn connect(&mut self) -> Result<(), String> {
+        if self.ws_sender.is_some() {
             return Ok(());
         }
 
@@ -359,59 +380,88 @@ impl CartesiaTTSService {
             self.ws_url, self.api_key, self.cartesia_version
         );
 
-        tracing::debug!(service = %self.base.name(), "Connecting to Cartesia WebSocket");
+        tracing::debug!(service = %self.name, "Connecting to Cartesia WebSocket");
 
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             tokio_tungstenite::connect_async(&url),
         )
         .await;
-        match ws_result {
+        let ws_stream = match ws_result {
             Ok(Ok((stream, _response))) => {
-                tracing::info!(service = %self.base.name(), "Connected to Cartesia WebSocket");
-                *ws_guard = Some(stream);
-                Ok(())
+                tracing::info!(service = %self.name, "Connected to Cartesia WebSocket");
+                stream
             }
             Ok(Err(e)) => {
                 let msg = format!("Failed to connect to Cartesia WebSocket: {e}");
-                tracing::error!(service = %self.base.name(), "{}", msg);
-                Err(msg)
+                tracing::error!(service = %self.name, "{}", msg);
+                return Err(msg);
             }
             Err(_) => {
                 let msg = "Cartesia WebSocket connection timed out after 10s".to_string();
-                tracing::error!(service = %self.base.name(), "{}", msg);
-                Err(msg)
+                tracing::error!(service = %self.name, "{}", msg);
+                return Err(msg);
             }
-        }
+        };
+
+        let (sink, stream) = ws_stream.split();
+        self.ws_sender = Some(Arc::new(Mutex::new(sink)));
+
+        let frame_tx = self.frame_tx.clone();
+        let name = self.name.clone();
+        let sample_rate = self.sample_rate;
+        self.ws_reader_task = Some(tokio::spawn(async move {
+            Self::ws_reader_loop(stream, frame_tx, name, sample_rate).await;
+        }));
+
+        Ok(())
     }
 
-    /// Disconnect the WebSocket connection.
-    pub async fn disconnect(&self) {
-        let mut ws_guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *ws_guard {
-            tracing::debug!(service = %self.base.name(), "Disconnecting from Cartesia WebSocket");
-            if let Err(e) = ws.close(None).await {
-                tracing::warn!(
-                    service = %self.base.name(),
-                    "Failed to close Cartesia WebSocket: {e}"
-                );
+    /// Disconnect the WebSocket connection and stop the reader task.
+    pub async fn disconnect(&mut self) {
+        if let Some(sender) = self.ws_sender.take() {
+            tracing::debug!(service = %self.name, "Disconnecting from Cartesia WebSocket");
+            let mut sink = sender.lock().await;
+            if let Err(e) = sink.close().await {
+                tracing::debug!(service = %self.name, "Error closing Cartesia WebSocket sink: {e}");
             }
         }
-        *ws_guard = None;
+
+        if let Some(handle) = self.ws_reader_task.take() {
+            let abort_handle = handle.abort_handle();
+            let timeout_result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            match timeout_result {
+                Ok(Ok(())) => {
+                    tracing::debug!(service = %self.name, "Reader task finished cleanly");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(service = %self.name, "Reader task panicked: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(service = %self.name, "Reader task timed out, aborting");
+                    abort_handle.abort();
+                }
+            }
+        }
+
+        self.current_context_id = None;
+        self.sentence_count_in_turn = 0;
+        tracing::debug!(service = %self.name, "Disconnected from Cartesia WebSocket");
     }
 
     /// Cancel an active WebSocket context (e.g., on interruption).
-    pub async fn cancel_context(&self, context_id: &str) {
-        let mut ws_guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *ws_guard {
+    async fn send_cancel(&self, context_id: &str) {
+        if let Some(ref sender) = self.ws_sender {
             let cancel = CartesiaWsCancelRequest {
                 context_id: context_id.to_string(),
                 cancel: true,
             };
             if let Ok(json) = serde_json::to_string(&cancel) {
-                if let Err(e) = ws.send(WsMessage::Text(json)).await {
+                let mut sink = sender.lock().await;
+                if let Err(e) = sink.send(WsMessage::Text(json)).await {
                     tracing::warn!(
-                        service = "CartesiaTTSService",
+                        service = %self.name,
                         "Failed to send cancel request over WebSocket: {e}"
                     );
                 }
@@ -447,17 +497,160 @@ impl CartesiaTTSService {
         }
     }
 
-    /// Send a TTS request over the WebSocket and collect response frames.
+    /// Background task that reads messages from the Cartesia WebSocket and
+    /// pushes `FrameEnum` variants via the mpsc channel.
+    async fn ws_reader_loop(
+        mut stream: CartesiaWsReadStream,
+        frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
+        name: String,
+        sample_rate: u32,
+    ) {
+        while let Some(msg_result) = stream.next().await {
+            let msg = match msg_result {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(service = %name, "WebSocket read error: {e}");
+                    let _ = frame_tx.try_send(FrameEnum::Error(ErrorFrame::new(
+                        format!("Cartesia WebSocket read error: {e}"),
+                        false,
+                    )));
+                    break;
+                }
+            };
+
+            match msg {
+                WsMessage::Text(text) => {
+                    let text_str = text.to_string();
+                    let response: CartesiaWsResponse = match serde_json::from_str(&text_str) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(service = %name, "Failed to parse WS message: {e}");
+                            continue;
+                        }
+                    };
+
+                    match response.msg_type.as_str() {
+                        "chunk" => {
+                            if let Some(ref data) = response.data {
+                                match base64::engine::general_purpose::STANDARD.decode(data) {
+                                    Ok(audio_bytes) => {
+                                        let frame = FrameEnum::OutputAudioRaw(
+                                            OutputAudioRawFrame::new(audio_bytes, sample_rate, 1),
+                                        );
+                                        if let Err(e) = frame_tx.try_send(frame) {
+                                            tracing::warn!(
+                                                service = %name,
+                                                "Failed to send audio frame: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            service = %name,
+                                            "Failed to decode base64 audio: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        "done" => {
+                            tracing::debug!(
+                                service = %name,
+                                context_id = %response.context_id,
+                                "TTS generation complete"
+                            );
+                            let frame = FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                                response.context_id.clone(),
+                            )));
+                            if let Err(e) = frame_tx.try_send(frame) {
+                                tracing::warn!(
+                                    service = %name,
+                                    "Failed to send TTSStoppedFrame: {e}"
+                                );
+                            }
+                        }
+                        "error" => {
+                            let error_detail = response
+                                .error
+                                .unwrap_or_else(|| "Unknown Cartesia error".to_string());
+                            tracing::error!(
+                                service = %name,
+                                context_id = %response.context_id,
+                                error = %error_detail,
+                                "Cartesia WebSocket error"
+                            );
+                            let frame = FrameEnum::Error(ErrorFrame::new(
+                                format!("Cartesia error: {error_detail}"),
+                                false,
+                            ));
+                            if let Err(e) = frame_tx.try_send(frame) {
+                                tracing::warn!(
+                                    service = %name,
+                                    "Failed to send error frame: {e}"
+                                );
+                            }
+                        }
+                        "timestamps" => {
+                            tracing::trace!(service = %name, "Received word timestamps");
+                        }
+                        other => {
+                            tracing::warn!(
+                                service = %name,
+                                msg_type = %other,
+                                "Unknown Cartesia message type"
+                            );
+                        }
+                    }
+                }
+                WsMessage::Close(_) => {
+                    tracing::debug!(service = %name, "WebSocket closed by server");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        tracing::debug!(service = %name, "Cartesia WebSocket reader loop ended");
+    }
+
+    /// Drain frames from the background reader task and send them through
+    /// the processor context.
+    async fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            match &frame {
+                FrameEnum::Error(_) => ctx.send_upstream(frame).await,
+                _ => ctx.send_downstream(frame).await,
+            }
+        }
+    }
+
+    /// Send a TTS request over the WebSocket (non-blocking).
     ///
-    /// This sends the request, then reads messages from the WebSocket until
-    /// a `done` or `error` message is received for the given context.
-    async fn run_tts_ws(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    /// Builds the request, sends it via the split sink, and emits
+    /// TTSStartedFrame synchronously. Audio frames will arrive via the
+    /// background reader task and be drained in subsequent `process()` calls.
+    async fn send_tts_request(&mut self, text: &str, ctx: &ProcessorContext) {
+        // Auto-connect if needed.
+        if self.ws_sender.is_none() {
+            if let Err(e) = self.connect().await {
+                ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
+                    format!("Failed to auto-connect Cartesia WebSocket: {e}"),
+                    false,
+                )))
+                .await;
+                return;
+            }
+        }
+
+        // Each sentence gets a fresh context_id. Cartesia closes contexts after
+        // the first sentence finishes generating, so continuation fails for
+        // complete-sentence workloads. Fresh IDs are safe and still non-blocking.
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        self.current_context_id = Some(context_id.clone());
+        self.sentence_count_in_turn += 1;
 
         let request = CartesiaWsRequest {
             transcript: text.to_string(),
-            continue_transcript: true,
+            continue_transcript: false,
             context_id: context_id.clone(),
             model_id: self.model.clone(),
             voice: self.build_voice_config(),
@@ -472,231 +665,151 @@ impl CartesiaTTSService {
         let request_json = match serde_json::to_string(&request) {
             Ok(json) => json,
             Err(e) => {
-                frames.push(Arc::new(ErrorFrame::new(
+                ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to serialize Cartesia request: {e}"),
                     false,
-                )));
-                return frames;
+                )))
+                .await;
+                return;
             }
         };
 
-        let ttfb_start = Instant::now();
-        let mut got_first_audio = false;
-
-        // Send the request and receive responses under the lock.
-        let mut ws_guard = self.ws.lock().await;
-        let ws = match ws_guard.as_mut() {
-            Some(ws) => ws,
-            None => {
-                frames.push(Arc::new(ErrorFrame::new(
-                    "WebSocket not connected. Call connect() first.".to_string(),
-                    false,
-                )));
-                return frames;
-            }
+        // Send via the split sink
+        let send_result = {
+            let sender = self.ws_sender.as_ref().unwrap();
+            let mut sink = sender.lock().await;
+            sink.send(WsMessage::Text(request_json)).await
         };
 
-        if let Err(e) = ws.send(WsMessage::Text(request_json)).await {
-            frames.push(Arc::new(ErrorFrame::new(
+        if let Err(e) = send_result {
+            tracing::error!(service = %self.name, "Failed to send TTS request: {e}");
+            self.ws_sender = None;
+            ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
-            )));
-            return frames;
+            )))
+            .await;
+            return;
         }
 
-        // Push TTSStartedFrame
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        // Emit TTSStartedFrame synchronously for correct ordering
+        ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))))
+        .await;
 
         tracing::debug!(
-            service = %self.base.name(),
+            service = %self.name,
             text = %text,
             context_id = %context_id,
+            sentence = self.sentence_count_in_turn,
             "Sent TTS request over WebSocket"
         );
-
-        // Read messages until we get a "done" or "error" for our context.
-        loop {
-            let msg = match ws.next().await {
-                Some(Ok(msg)) => msg,
-                Some(Err(e)) => {
-                    frames.push(Arc::new(ErrorFrame::new(
-                        format!("WebSocket receive error: {e}"),
-                        false,
-                    )));
-                    break;
-                }
-                None => {
-                    // Connection closed unexpectedly.
-                    frames.push(Arc::new(ErrorFrame::new(
-                        "WebSocket connection closed unexpectedly".to_string(),
-                        false,
-                    )));
-                    break;
-                }
-            };
-
-            let text_data = match msg {
-                WsMessage::Text(t) => t.to_string(),
-                WsMessage::Close(_) => {
-                    tracing::debug!(
-                        service = %self.base.name(),
-                        "WebSocket closed by server"
-                    );
-                    break;
-                }
-                _ => continue,
-            };
-
-            let response: CartesiaWsResponse = match serde_json::from_str(&text_data) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        service = %self.base.name(),
-                        "Failed to parse WebSocket message: {e}"
-                    );
-                    continue;
-                }
-            };
-
-            // Only process messages for our context.
-            if response.context_id != context_id {
-                continue;
-            }
-
-            match response.msg_type.as_str() {
-                "chunk" => {
-                    if let Some(ref data) = response.data {
-                        match base64::engine::general_purpose::STANDARD.decode(data) {
-                            Ok(audio_bytes) => {
-                                if !got_first_audio {
-                                    got_first_audio = true;
-                                    let ttfb = ttfb_start.elapsed();
-                                    tracing::debug!(
-                                        service = %self.base.name(),
-                                        ttfb_ms = %ttfb.as_millis(),
-                                        "Time to first byte"
-                                    );
-                                }
-                                let mut audio_frame =
-                                    TTSAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
-                                audio_frame.context_id = Some(context_id.clone());
-                                frames.push(Arc::new(audio_frame));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    service = %self.base.name(),
-                                    "Failed to decode base64 audio chunk: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-                "done" => {
-                    tracing::debug!(
-                        service = %self.base.name(),
-                        context_id = %context_id,
-                        "TTS generation complete"
-                    );
-                    break;
-                }
-                "error" => {
-                    let error_detail = response
-                        .error
-                        .unwrap_or_else(|| "Unknown Cartesia error".to_string());
-                    tracing::error!(
-                        service = %self.base.name(),
-                        context_id = %context_id,
-                        error = %error_detail,
-                        "Cartesia WebSocket error"
-                    );
-                    frames.push(Arc::new(ErrorFrame::new(
-                        format!("Cartesia error: {error_detail}"),
-                        false,
-                    )));
-                    break;
-                }
-                "timestamps" => {
-                    // Timestamps are informational; we log them but do not produce frames.
-                    tracing::trace!(
-                        service = %self.base.name(),
-                        "Received word timestamps (not forwarded)"
-                    );
-                }
-                other => {
-                    tracing::warn!(
-                        service = %self.base.name(),
-                        msg_type = %other,
-                        "Unknown Cartesia message type"
-                    );
-                }
-            }
-        }
-
-        // Record metrics.
-        let ttfb = ttfb_start.elapsed();
-        self.last_metrics = Some(TTSMetrics {
-            ttfb_ms: ttfb.as_secs_f64() * 1000.0,
-            character_count: text.len(),
-        });
-
-        // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
-
-        frames
     }
 }
 
 impl fmt::Debug for CartesiaTTSService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CartesiaTTSService")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("voice_id", &self.voice_id)
             .field("model", &self.model)
             .field("sample_rate", &self.sample_rate)
             .field("encoding", &self.encoding)
+            .field("connected", &self.ws_sender.is_some())
             .finish()
     }
 }
 
-impl_base_display!(CartesiaTTSService);
+impl fmt::Display for CartesiaTTSService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
 
 #[async_trait]
-impl FrameProcessor for CartesiaTTSService {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
+impl Processor for CartesiaTTSService {
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Process incoming frames.
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn weight(&self) -> ProcessorWeight {
+        ProcessorWeight::Heavy
+    }
+
+    /// Process incoming frames (non-blocking TTS with drain pattern).
     ///
-    /// - `TextFrame`: Accumulates text and triggers TTS generation.
-    /// - `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame`: Passed through downstream.
-    /// - All other frames: Pushed through in their original direction.
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        let any = frame.as_any();
+    /// - `FrameEnum::Text`: Sends TTS request via WebSocket (non-blocking).
+    /// - `FrameEnum::LLMFullResponseStart`: Signals new LLM turn.
+    /// - `FrameEnum::LLMFullResponseEnd`: Resets context for next turn.
+    /// - `FrameEnum::Interruption`: Cancels in-flight TTS and resets context.
+    /// - `FrameEnum::Start`: Establishes WebSocket connection.
+    /// - `FrameEnum::End` / `FrameEnum::Cancel`: Disconnects and drains.
+    /// - All other frames: Passed through in the same direction.
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        // Always drain any pending frames from the reader task
+        self.drain_reader_frames(ctx).await;
 
-        if let Some(text_frame) = any.downcast_ref::<TextFrame>() {
-            tracing::debug!(
-                service = %self.base.name(),
-                text = %text_frame.text,
-                "Processing TextFrame for TTS"
-            );
-            let result_frames = self.run_tts(&text_frame.text).await;
-            for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+        match frame {
+            FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                self.send_tts_request(&t.text, ctx).await;
+                // Forward TextFrame so downstream AssistantContextAggregator
+                // can accumulate the response into conversation history.
+                ctx.send_downstream(frame).await;
             }
-        } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
-            || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
-        {
-            // LLM response boundary frames are passed through downstream.
-            self.push_frame(frame, FrameDirection::Downstream).await;
-        } else {
-            // Pass all other frames through in their original direction.
-            self.push_frame(frame, direction).await;
+            FrameEnum::LLMFullResponseStart(_) => {
+                // New LLM turn — fresh context_id will be generated on first TextFrame
+                ctx.send_downstream(frame).await;
+            }
+            FrameEnum::LLMFullResponseEnd(_) => {
+                self.current_context_id = None;
+                self.sentence_count_in_turn = 0;
+                ctx.send_downstream(frame).await;
+            }
+            FrameEnum::Interruption(_) => {
+                if let Some(ref cid) = self.current_context_id.clone() {
+                    self.send_cancel(cid).await;
+                }
+                self.current_context_id = None;
+                self.sentence_count_in_turn = 0;
+                ctx.send_downstream(frame).await;
+            }
+            FrameEnum::Start(_) => {
+                if self.ws_sender.is_none() {
+                    if let Err(e) = self.connect().await {
+                        ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
+                            format!("Cartesia connection failed: {e}"),
+                            false,
+                        )))
+                        .await;
+                    }
+                }
+                ctx.send_downstream(frame).await;
+            }
+            FrameEnum::End(_) | FrameEnum::Cancel(_) => {
+                self.disconnect().await;
+                self.drain_reader_frames(ctx).await;
+                ctx.send_downstream(frame).await;
+            }
+            other => match direction {
+                FrameDirection::Downstream => ctx.send_downstream(other).await,
+                FrameDirection::Upstream => ctx.send_upstream(other).await,
+            },
         }
+    }
+
+    async fn cleanup(&mut self) {
+        self.disconnect().await;
     }
 }
 
@@ -719,13 +832,117 @@ impl AIService for CartesiaTTSService {
 impl TTSService for CartesiaTTSService {
     /// Synthesize speech from text using Cartesia's WebSocket streaming API.
     ///
-    /// The WebSocket connection must have been established via `connect()` before
-    /// calling this method. Returns `TTSStartedFrame`, zero or more
-    /// `TTSAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
-    /// `ErrorFrame` is included in the returned vector.
+    /// Connects if needed, sends the request via the split sink, then polls the
+    /// reader channel until TTSStoppedFrame arrives. Returns collected frames
+    /// converted to `Arc<dyn Frame>` for the trait API.
     async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
-        tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (WebSocket)");
-        self.run_tts_ws(text).await
+        tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
+
+        // Connect if needed
+        if self.ws_sender.is_none() {
+            if let Err(e) = self.connect().await {
+                return vec![
+                    Arc::new(TTSStartedFrame::new(None)),
+                    Arc::new(ErrorFrame::new(
+                        format!("Cartesia connection failed: {e}"),
+                        false,
+                    )),
+                    Arc::new(TTSStoppedFrame::new(None)),
+                ];
+            }
+        }
+
+        let context_id = generate_context_id();
+        let request = CartesiaWsRequest {
+            transcript: text.to_string(),
+            continue_transcript: false,
+            context_id: context_id.clone(),
+            model_id: self.model.clone(),
+            voice: self.build_voice_config(),
+            output_format: self.build_output_format(),
+            add_timestamps: false,
+            language: self.language.clone(),
+            speed: self.params.speed.clone(),
+            generation_config: self.params.generation_config.clone(),
+            pronunciation_dict_id: self.params.pronunciation_dict_id.clone(),
+        };
+
+        let request_json = match serde_json::to_string(&request) {
+            Ok(json) => json,
+            Err(e) => {
+                return vec![
+                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
+                    Arc::new(ErrorFrame::new(
+                        format!("Failed to serialize request: {e}"),
+                        false,
+                    )),
+                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                ];
+            }
+        };
+
+        // Send via sink (clone Arc to avoid borrow conflict on error path)
+        let send_result = {
+            let sender = self.ws_sender.as_ref().unwrap().clone();
+            let mut sink = sender.lock().await;
+            sink.send(WsMessage::Text(request_json)).await
+        };
+        if let Err(e) = send_result {
+            self.ws_sender = None;
+            return vec![
+                Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
+                Arc::new(ErrorFrame::new(
+                    format!("WebSocket send failed: {e}"),
+                    false,
+                )),
+                Arc::new(TTSStoppedFrame::new(Some(context_id))),
+            ];
+        }
+
+        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+
+        // Poll frame_rx with timeout until TTSStoppedFrame arrives
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match tokio::time::timeout_at(deadline, self.frame_rx.recv()).await {
+                Ok(Some(frame_enum)) => {
+                    let is_stopped = matches!(&frame_enum, FrameEnum::TTSStopped(_));
+                    let is_error = matches!(&frame_enum, FrameEnum::Error(_));
+                    frames.push(frame_enum.into_arc_frame());
+                    if is_stopped {
+                        break;
+                    }
+                    if is_error {
+                        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    frames.push(Arc::new(ErrorFrame::new(
+                        "Reader channel closed unexpectedly".to_string(),
+                        false,
+                    )));
+                    frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    break;
+                }
+                Err(_) => {
+                    frames.push(Arc::new(ErrorFrame::new(
+                        "TTS generation timed out after 30s".to_string(),
+                        false,
+                    )));
+                    frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    break;
+                }
+            }
+        }
+
+        self.last_metrics = Some(TTSMetrics {
+            ttfb_ms: 0.0,
+            character_count: text.len(),
+        });
+
+        frames
     }
 }
 
@@ -740,7 +957,8 @@ impl TTSService for CartesiaTTSService {
 /// making this simpler to use but with higher latency compared to the
 /// WebSocket variant.
 pub struct CartesiaHttpTTSService {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     api_key: String,
     voice_id: String,
     model: String,
@@ -769,7 +987,8 @@ impl CartesiaHttpTTSService {
     /// * `voice_id` - ID of the voice to use for synthesis.
     pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
         Self {
-            base: BaseProcessor::new(Some("CartesiaHttpTTSService".to_string()), false),
+            id: obj_id(),
+            name: "CartesiaHttpTTSService".to_string(),
             api_key: api_key.into(),
             voice_id: voice_id.into(),
             model: "sonic-2".to_string(),
@@ -908,7 +1127,7 @@ impl CartesiaHttpTTSService {
             Ok(resp) => {
                 let ttfb = ttfb_start.elapsed();
                 tracing::debug!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     ttfb_ms = %ttfb.as_millis(),
                     status = %resp.status(),
                     "Received HTTP response"
@@ -918,7 +1137,7 @@ impl CartesiaHttpTTSService {
                     let status = resp.status();
                     let error_text = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
                     let error_msg = format!("Cartesia API returned status {status}: {error_text}");
-                    tracing::error!(service = %self.base.name(), "{}", error_msg);
+                    tracing::error!(service = %self.name, "{}", error_msg);
                     frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
                 } else {
                     match resp.bytes().await {
@@ -929,19 +1148,18 @@ impl CartesiaHttpTTSService {
                             });
 
                             tracing::debug!(
-                                service = %self.base.name(),
+                                service = %self.name,
                                 audio_bytes = audio_data.len(),
                                 "Received TTS audio"
                             );
 
-                            let mut audio_frame =
-                                TTSAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
-                            audio_frame.context_id = Some(context_id.clone());
+                            let audio_frame =
+                                OutputAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
                             frames.push(Arc::new(audio_frame));
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
-                            tracing::error!(service = %self.base.name(), "{}", error_msg);
+                            tracing::error!(service = %self.name, "{}", error_msg);
                             frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
                         }
                     }
@@ -949,7 +1167,7 @@ impl CartesiaHttpTTSService {
             }
             Err(e) => {
                 let error_msg = format!("HTTP request to Cartesia failed: {e}");
-                tracing::error!(service = %self.base.name(), "{}", error_msg);
+                tracing::error!(service = %self.name, "{}", error_msg);
                 frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
             }
         }
@@ -964,8 +1182,8 @@ impl CartesiaHttpTTSService {
 impl fmt::Debug for CartesiaHttpTTSService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CartesiaHttpTTSService")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("voice_id", &self.voice_id)
             .field("model", &self.model)
             .field("sample_rate", &self.sample_rate)
@@ -975,44 +1193,9 @@ impl fmt::Debug for CartesiaHttpTTSService {
     }
 }
 
-impl_base_display!(CartesiaHttpTTSService);
-
-#[async_trait]
-impl FrameProcessor for CartesiaHttpTTSService {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
-    }
-
-    /// Process incoming frames.
-    ///
-    /// - `TextFrame`: Triggers TTS generation via the HTTP API.
-    /// - `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame`: Passed through downstream.
-    /// - All other frames: Pushed through in their original direction.
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        let any = frame.as_any();
-
-        if let Some(text_frame) = any.downcast_ref::<TextFrame>() {
-            tracing::debug!(
-                service = %self.base.name(),
-                text = %text_frame.text,
-                "Processing TextFrame for HTTP TTS"
-            );
-            let result_frames = self.run_tts(&text_frame.text).await;
-            for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
-            }
-        } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
-            || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
-        {
-            // LLM response boundary frames are passed through downstream.
-            self.push_frame(frame, FrameDirection::Downstream).await;
-        } else {
-            // Pass all other frames through in their original direction.
-            self.push_frame(frame, direction).await;
-        }
+impl fmt::Display for CartesiaHttpTTSService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
     }
 }
 
@@ -1031,7 +1214,7 @@ impl TTSService for CartesiaHttpTTSService {
     /// as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame` and
     /// `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
     async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
-        tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (HTTP)");
+        tracing::debug!(service = %self.name, text = %text, "Generating TTS (HTTP)");
         self.run_tts_http(text).await
     }
 }

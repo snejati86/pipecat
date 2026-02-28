@@ -410,7 +410,7 @@ impl OllamaLLMService {
                 if chunk.done {
                     let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
                     let completion_tokens = chunk.eval_count.unwrap_or(0);
-                    let total_tokens = prompt_tokens + completion_tokens;
+                    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
 
                     let _usage_metrics = LLMUsageMetricsData {
                         processor: self.base.name().to_string(),
@@ -483,6 +483,73 @@ impl OllamaLLMService {
                             }
                         }
                     } else if let Some(ref content) = message.content {
+                        if !content.is_empty() {
+                            self.base.pending_frames.push((
+                                Arc::new(TextFrame::new(content.clone())),
+                                FrameDirection::Downstream,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Process any remaining data in line_buffer (e.g., final line without trailing newline)
+        let remaining = line_buffer.trim();
+        if !remaining.is_empty() {
+            if let Ok(chunk) = serde_json::from_str::<OllamaChatChunk>(remaining) {
+                if chunk.done {
+                    let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
+                    let completion_tokens = chunk.eval_count.unwrap_or(0);
+                    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+
+                    let _usage_metrics = LLMUsageMetricsData {
+                        processor: self.base.name().to_string(),
+                        model: Some(self.model.clone()),
+                        value: LLMTokenUsage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            cache_read_input_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            reasoning_tokens: None,
+                        },
+                    };
+
+                    let metrics_data = MetricsData {
+                        processor: self.base.name().to_string(),
+                        model: Some(self.model.clone()),
+                    };
+
+                    self.base.pending_frames.push((
+                        Arc::new(MetricsFrame::new(vec![metrics_data])),
+                        FrameDirection::Downstream,
+                    ));
+
+                    if let Some(ref message) = chunk.message {
+                        if let Some(ref tool_calls) = message.tool_calls {
+                            for tool_call in tool_calls {
+                                if let Some(ref func) = tool_call.function {
+                                    let name = func.name.clone().unwrap_or_default();
+                                    let arguments = func.arguments.clone().unwrap_or(
+                                        serde_json::Value::Object(serde_json::Map::new()),
+                                    );
+                                    let tool_call_id =
+                                        format!("ollama_call_{}", function_calls.len());
+                                    function_calls.push(FunctionCallFromLLM {
+                                        function_name: name,
+                                        tool_call_id,
+                                        arguments,
+                                        context: serde_json::Value::Null,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    debug!("Ollama stream completed (final line without newline)");
+                } else if let Some(ref message) = chunk.message {
+                    if let Some(ref content) = message.content {
                         if !content.is_empty() {
                             self.base.pending_frames.push((
                                 Arc::new(TextFrame::new(content.clone())),
@@ -1114,7 +1181,7 @@ mod tests {
 
         let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
         let completion_tokens = chunk.eval_count.unwrap_or(0);
-        let total_tokens = prompt_tokens + completion_tokens;
+        let total_tokens = prompt_tokens.saturating_add(completion_tokens);
 
         assert_eq!(prompt_tokens, 50);
         assert_eq!(completion_tokens, 100);
@@ -1128,7 +1195,7 @@ mod tests {
 
         let prompt_tokens = chunk.prompt_eval_count.unwrap_or(0);
         let completion_tokens = chunk.eval_count.unwrap_or(0);
-        let total_tokens = prompt_tokens + completion_tokens;
+        let total_tokens = prompt_tokens.saturating_add(completion_tokens);
 
         assert_eq!(prompt_tokens, 0);
         assert_eq!(completion_tokens, 0);

@@ -49,7 +49,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -429,6 +429,7 @@ impl ElevenLabsTTSService {
 
         let ttfb_start = Instant::now();
         let mut got_first_audio = false;
+        let mut actual_ttfb = Duration::ZERO;
 
         // Send the request and receive responses under the lock.
         let mut ws_guard = self.ws.lock().await;
@@ -444,6 +445,7 @@ impl ElevenLabsTTSService {
         };
 
         if let Err(e) = ws.send(WsMessage::Text(request_json)).await {
+            *ws_guard = None; // Invalidate broken connection for reconnection
             frames.push(Arc::new(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
@@ -475,10 +477,12 @@ impl ElevenLabsTTSService {
         );
 
         // Read messages until we get a final message or error.
+        let mut ws_broken = false;
         loop {
             let msg = match ws.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
+                    ws_broken = true;
                     frames.push(Arc::new(ErrorFrame::new(
                         format!("WebSocket receive error: {e}"),
                         false,
@@ -487,6 +491,7 @@ impl ElevenLabsTTSService {
                 }
                 None => {
                     // Connection closed unexpectedly.
+                    ws_broken = true;
                     frames.push(Arc::new(ErrorFrame::new(
                         "WebSocket connection closed unexpectedly".to_string(),
                         false,
@@ -498,6 +503,7 @@ impl ElevenLabsTTSService {
             let text_data = match msg {
                 WsMessage::Text(t) => t.to_string(),
                 WsMessage::Close(_) => {
+                    ws_broken = true;
                     tracing::debug!(
                         service = %self.base.name(),
                         "WebSocket closed by server"
@@ -541,10 +547,10 @@ impl ElevenLabsTTSService {
                             if !audio_bytes.is_empty() {
                                 if !got_first_audio {
                                     got_first_audio = true;
-                                    let ttfb = ttfb_start.elapsed();
+                                    actual_ttfb = ttfb_start.elapsed();
                                     tracing::debug!(
                                         service = %self.base.name(),
-                                        ttfb_ms = %ttfb.as_millis(),
+                                        ttfb_ms = %actual_ttfb.as_millis(),
                                         "Time to first byte"
                                     );
                                 }
@@ -559,6 +565,10 @@ impl ElevenLabsTTSService {
                                 service = %self.base.name(),
                                 "Failed to decode base64 audio chunk: {e}"
                             );
+                            frames.push(Arc::new(ErrorFrame::new(
+                                format!("{}: base64 decode failed: {e}", self.base.name()),
+                                false,
+                            )));
                         }
                     }
                 }
@@ -575,10 +585,14 @@ impl ElevenLabsTTSService {
             }
         }
 
-        // Record metrics.
-        let ttfb = ttfb_start.elapsed();
+        // Invalidate broken connection so connect() can reconnect.
+        if ws_broken {
+            *ws_guard = None;
+        }
+
+        // Record metrics using the actual time-to-first-byte, not total time.
         self.last_metrics = Some(TTSMetrics {
-            ttfb_ms: ttfb.as_secs_f64() * 1000.0,
+            ttfb_ms: actual_ttfb.as_secs_f64() * 1000.0,
             character_count: text.len(),
         });
 
@@ -640,6 +654,10 @@ impl FrameProcessor for ElevenLabsTTSService {
             // Pass all other frames through in their original direction.
             self.push_frame(frame, direction).await;
         }
+    }
+
+    async fn cleanup(&mut self) {
+        self.disconnect().await;
     }
 }
 

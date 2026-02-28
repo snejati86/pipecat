@@ -15,6 +15,9 @@
 //! - **Control frames** ([`ControlFrameMarker`]): Ordered control signals, cancelled by interruptions.
 //! - **Uninterruptible** ([`UninterruptibleFrameMarker`]): Mixin that prevents interruption disposal.
 
+pub mod frame_enum;
+pub use frame_enum::{ExtensionFrame, FrameEnum};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -78,7 +81,7 @@ impl AudioRawData {
         let num_frames = if num_channels > 0 {
             let bytes_per_frame = (num_channels as usize).saturating_mul(2);
             if bytes_per_frame > 0 {
-                (audio.len() / bytes_per_frame) as u32
+                (audio.len() / bytes_per_frame).min(u32::MAX as usize) as u32
             } else {
                 0
             }
@@ -289,32 +292,61 @@ pub type FrameRef = Arc<dyn Frame>;
 // Common base fields for all frames
 // ---------------------------------------------------------------------------
 
+/// Transport source/destination info, boxed to save space when unused.
+#[derive(Debug, Clone, Default)]
+pub struct TransportInfo {
+    /// Name of the transport source that created this frame.
+    pub source: Option<String>,
+    /// Name of the transport destination for this frame.
+    pub destination: Option<String>,
+}
+
+/// Returns a reference to a static empty metadata HashMap.
+fn empty_metadata() -> &'static HashMap<String, serde_json::Value> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<HashMap<String, serde_json::Value>> = OnceLock::new();
+    EMPTY.get_or_init(HashMap::new)
+}
+
 /// Common fields stored in every frame struct via the macros.
+///
+/// Optimized for size: ~56 bytes vs the original ~160 bytes.
+/// - `name` removed: derived from the type via `stringify!` in macros
+/// - `metadata` lazy-allocated: `Option<Box<HashMap>>` = 8 bytes when empty
+/// - `transport` boxed: `Option<Box<TransportInfo>>` = 8 bytes when unused
 #[derive(Debug, Clone)]
 pub struct FrameFields {
     pub id: u64,
-    pub name: String,
     pub pts: Option<u64>,
-    pub metadata: HashMap<String, serde_json::Value>,
-    pub transport_source: Option<String>,
-    pub transport_destination: Option<String>,
+    pub metadata: Option<Box<HashMap<String, serde_json::Value>>>,
+    pub transport: Option<Box<TransportInfo>>,
     pub broadcast_sibling_id: Option<u64>,
 }
 
 impl FrameFields {
-    /// Create a new `FrameFields` with a unique ID and the frame type name.
-    pub fn new(type_name: &str) -> Self {
+    /// Create a new `FrameFields` with a unique ID.
+    pub fn new() -> Self {
         Self {
             id: obj_id(),
-            name: type_name.to_string(),
             pts: None,
-            metadata: HashMap::new(),
-            transport_source: None,
-            transport_destination: None,
+            metadata: None,
+            transport: None,
             broadcast_sibling_id: None,
         }
     }
 }
+
+impl Default for FrameFields {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Compile-time size assertion: prevents accidental regressions.
+const _: () = assert!(
+    std::mem::size_of::<FrameFields>() <= 64,
+    "FrameFields grew beyond 64 bytes — check for accidental field additions"
+);
 
 // ---------------------------------------------------------------------------
 // Macros for reducing frame boilerplate
@@ -327,7 +359,7 @@ macro_rules! impl_frame_trait {
             self.fields.id
         }
         fn name(&self) -> &str {
-            &self.fields.name
+            stringify!($name)
         }
         fn pts(&self) -> Option<u64> {
             self.fields.pts
@@ -336,22 +368,28 @@ macro_rules! impl_frame_trait {
             self.fields.pts = pts;
         }
         fn metadata(&self) -> &HashMap<String, serde_json::Value> {
-            &self.fields.metadata
+            self.fields.metadata.as_deref().unwrap_or_else(|| empty_metadata())
         }
         fn metadata_mut(&mut self) -> &mut HashMap<String, serde_json::Value> {
-            &mut self.fields.metadata
+            self.fields.metadata.get_or_insert_with(|| Box::new(HashMap::new()))
         }
         fn transport_source(&self) -> Option<&str> {
-            self.fields.transport_source.as_deref()
+            self.fields.transport.as_ref().and_then(|t| t.source.as_deref())
         }
         fn set_transport_source(&mut self, source: Option<String>) {
-            self.fields.transport_source = source;
+            if source.is_some() || self.fields.transport.is_some() {
+                let t = self.fields.transport.get_or_insert_with(|| Box::new(TransportInfo::default()));
+                t.source = source;
+            }
         }
         fn transport_destination(&self) -> Option<&str> {
-            self.fields.transport_destination.as_deref()
+            self.fields.transport.as_ref().and_then(|t| t.destination.as_deref())
         }
         fn set_transport_destination(&mut self, dest: Option<String>) {
-            self.fields.transport_destination = dest;
+            if dest.is_some() || self.fields.transport.is_some() {
+                let t = self.fields.transport.get_or_insert_with(|| Box::new(TransportInfo::default()));
+                t.destination = dest;
+            }
         }
         fn broadcast_sibling_id(&self) -> Option<u64> {
             self.fields.broadcast_sibling_id
@@ -440,7 +478,7 @@ macro_rules! impl_frame_display_simple {
     ($name:ident) => {
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.fields.name)
+                write!(f, "{}", stringify!($name))
             }
         }
     };
@@ -456,7 +494,7 @@ macro_rules! declare_simple_frame {
         }
         impl $name {
             pub fn new() -> Self {
-                Self { fields: FrameFields::new(stringify!($name)) }
+                Self { fields: FrameFields::new() }
             }
         }
         impl Default for $name {
@@ -473,7 +511,7 @@ macro_rules! declare_simple_frame {
         }
         impl $name {
             pub fn new() -> Self {
-                Self { fields: FrameFields::new(stringify!($name)) }
+                Self { fields: FrameFields::new() }
             }
         }
         impl Default for $name {
@@ -490,7 +528,7 @@ macro_rules! declare_simple_frame {
         }
         impl $name {
             pub fn new() -> Self {
-                Self { fields: FrameFields::new(stringify!($name)) }
+                Self { fields: FrameFields::new() }
             }
         }
         impl Default for $name {
@@ -507,7 +545,7 @@ macro_rules! declare_simple_frame {
         }
         impl $name {
             pub fn new() -> Self {
-                Self { fields: FrameFields::new(stringify!($name)) }
+                Self { fields: FrameFields::new() }
             }
         }
         impl Default for $name {
@@ -553,7 +591,7 @@ impl StartFrame {
         enable_metrics: bool,
     ) -> Self {
         Self {
-            fields: FrameFields::new("StartFrame"),
+            fields: FrameFields::new(),
             audio_in_sample_rate,
             audio_out_sample_rate,
             allow_interruptions,
@@ -597,7 +635,7 @@ pub struct CancelFrame {
 impl CancelFrame {
     pub fn new(reason: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("CancelFrame"),
+            fields: FrameFields::new(),
             reason,
         }
     }
@@ -611,7 +649,7 @@ impl Default for CancelFrame {
 
 impl fmt::Display for CancelFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(reason: {:?})", self.fields.name, self.reason)
+        write!(f, "{}(reason: {:?})", self.name(), self.reason)
     }
 }
 
@@ -633,7 +671,7 @@ pub struct ErrorFrame {
 impl ErrorFrame {
     pub fn new(error: impl Into<String>, fatal: bool) -> Self {
         Self {
-            fields: FrameFields::new("ErrorFrame"),
+            fields: FrameFields::new(),
             error: error.into(),
             fatal,
         }
@@ -650,7 +688,7 @@ impl fmt::Display for ErrorFrame {
         write!(
             f,
             "{}(error: {}, fatal: {})",
-            self.fields.name, self.error, self.fatal
+            self.name(), self.error, self.fatal
         )
     }
 }
@@ -668,7 +706,7 @@ pub struct FatalErrorFrame {
 impl FatalErrorFrame {
     pub fn new(error: String) -> Self {
         Self {
-            fields: FrameFields::new("FatalErrorFrame"),
+            fields: FrameFields::new(),
             error,
         }
     }
@@ -679,7 +717,7 @@ impl fmt::Display for FatalErrorFrame {
         write!(
             f,
             "{}(error: {}, fatal: true)",
-            self.fields.name, self.error
+            self.name(), self.error
         )
     }
 }
@@ -701,14 +739,14 @@ pub struct InterruptionFrame {
 impl InterruptionFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("InterruptionFrame"),
+            fields: FrameFields::new(),
             notify: None,
         }
     }
 
     pub fn with_notify(notify: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            fields: FrameFields::new("InterruptionFrame"),
+            fields: FrameFields::new(),
             notify: Some(notify),
         }
     }
@@ -741,7 +779,7 @@ pub struct UserStartedSpeakingFrame {
 impl UserStartedSpeakingFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("UserStartedSpeakingFrame"),
+            fields: FrameFields::new(),
             emulated: false,
         }
     }
@@ -767,7 +805,7 @@ pub struct UserStoppedSpeakingFrame {
 impl UserStoppedSpeakingFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("UserStoppedSpeakingFrame"),
+            fields: FrameFields::new(),
             emulated: false,
         }
     }
@@ -823,7 +861,7 @@ pub struct MetricsFrame {
 impl MetricsFrame {
     pub fn new(data: Vec<crate::metrics::MetricsData>) -> Self {
         Self {
-            fields: FrameFields::new("MetricsFrame"),
+            fields: FrameFields::new(),
             data,
         }
     }
@@ -843,7 +881,7 @@ pub struct STTMuteFrame {
 impl STTMuteFrame {
     pub fn new(mute: bool) -> Self {
         Self {
-            fields: FrameFields::new("STTMuteFrame"),
+            fields: FrameFields::new(),
             mute,
         }
     }
@@ -863,7 +901,7 @@ pub struct InputAudioRawFrame {
 impl InputAudioRawFrame {
     pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
         Self {
-            fields: FrameFields::new("InputAudioRawFrame"),
+            fields: FrameFields::new(),
             audio: AudioRawData::new(audio, sample_rate, num_channels),
         }
     }
@@ -874,9 +912,9 @@ impl fmt::Display for InputAudioRawFrame {
         write!(
             f,
             "{}(pts: {}, source: {:?}, size: {}, frames: {}, sample_rate: {}, channels: {})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_source,
+            self.transport_source(),
             self.audio.audio.len(),
             self.audio.num_frames,
             self.audio.sample_rate,
@@ -898,7 +936,7 @@ pub struct InputImageRawFrame {
 impl InputImageRawFrame {
     pub fn new(image: Vec<u8>, size: (u32, u32), format: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("InputImageRawFrame"),
+            fields: FrameFields::new(),
             image: ImageRawData {
                 image,
                 size,
@@ -913,9 +951,9 @@ impl fmt::Display for InputImageRawFrame {
         write!(
             f,
             "{}(pts: {}, source: {:?}, size: {:?}, format: {:?})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_source,
+            self.transport_source(),
             self.image.size,
             self.image.format
         )
@@ -935,7 +973,7 @@ pub struct InputTextRawFrame {
 impl InputTextRawFrame {
     pub fn new(text: String) -> Self {
         Self {
-            fields: FrameFields::new("InputTextRawFrame"),
+            fields: FrameFields::new(),
             text,
         }
     }
@@ -946,9 +984,9 @@ impl fmt::Display for InputTextRawFrame {
         write!(
             f,
             "{}(pts: {}, source: {:?}, text: [{}])",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_source,
+            self.transport_source(),
             self.text
         )
     }
@@ -969,7 +1007,7 @@ pub struct VADUserStartedSpeakingFrame {
 impl VADUserStartedSpeakingFrame {
     pub fn new(start_secs: f64, timestamp: f64) -> Self {
         Self {
-            fields: FrameFields::new("VADUserStartedSpeakingFrame"),
+            fields: FrameFields::new(),
             start_secs,
             timestamp,
         }
@@ -992,7 +1030,7 @@ pub struct VADUserStoppedSpeakingFrame {
 impl VADUserStoppedSpeakingFrame {
     pub fn new(stop_secs: f64, timestamp: f64) -> Self {
         Self {
-            fields: FrameFields::new("VADUserStoppedSpeakingFrame"),
+            fields: FrameFields::new(),
             stop_secs,
             timestamp,
         }
@@ -1013,7 +1051,7 @@ pub struct FunctionCallsStartedFrame {
 impl FunctionCallsStartedFrame {
     pub fn new(function_calls: Vec<FunctionCallFromLLM>) -> Self {
         Self {
-            fields: FrameFields::new("FunctionCallsStartedFrame"),
+            fields: FrameFields::new(),
             function_calls,
         }
     }
@@ -1035,7 +1073,7 @@ pub struct FunctionCallCancelFrame {
 impl FunctionCallCancelFrame {
     pub fn new(function_name: String, tool_call_id: String) -> Self {
         Self {
-            fields: FrameFields::new("FunctionCallCancelFrame"),
+            fields: FrameFields::new(),
             function_name,
             tool_call_id,
         }
@@ -1056,7 +1094,7 @@ pub struct InputTransportMessageFrame {
 impl InputTransportMessageFrame {
     pub fn new(message: serde_json::Value) -> Self {
         Self {
-            fields: FrameFields::new("InputTransportMessageFrame"),
+            fields: FrameFields::new(),
             message,
         }
     }
@@ -1064,7 +1102,7 @@ impl InputTransportMessageFrame {
 
 impl fmt::Display for InputTransportMessageFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(message: {})", self.fields.name, self.message)
+        write!(f, "{}(message: {})", self.name(), self.message)
     }
 }
 
@@ -1081,7 +1119,7 @@ pub struct OutputTransportMessageUrgentFrame {
 impl OutputTransportMessageUrgentFrame {
     pub fn new(message: serde_json::Value) -> Self {
         Self {
-            fields: FrameFields::new("OutputTransportMessageUrgentFrame"),
+            fields: FrameFields::new(),
             message,
         }
     }
@@ -1089,7 +1127,7 @@ impl OutputTransportMessageUrgentFrame {
 
 impl fmt::Display for OutputTransportMessageUrgentFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(message: {})", self.fields.name, self.message)
+        write!(f, "{}(message: {})", self.name(), self.message)
     }
 }
 
@@ -1116,7 +1154,7 @@ pub struct UserImageRequestFrame {
 impl UserImageRequestFrame {
     pub fn new(user_id: String) -> Self {
         Self {
-            fields: FrameFields::new("UserImageRequestFrame"),
+            fields: FrameFields::new(),
             user_id,
             text: None,
             append_to_context: None,
@@ -1132,7 +1170,7 @@ impl fmt::Display for UserImageRequestFrame {
         write!(
             f,
             "{}(user: {}, text: {:?}, append_to_context: {:?}, video_source: {:?})",
-            self.fields.name, self.user_id, self.text, self.append_to_context, self.video_source
+            self.name(), self.user_id, self.text, self.append_to_context, self.video_source
         )
     }
 }
@@ -1150,7 +1188,7 @@ pub struct ServiceMetadataFrame {
 impl ServiceMetadataFrame {
     pub fn new(service_name: String) -> Self {
         Self {
-            fields: FrameFields::new("ServiceMetadataFrame"),
+            fields: FrameFields::new(),
             service_name,
         }
     }
@@ -1172,7 +1210,7 @@ pub struct STTMetadataFrame {
 impl STTMetadataFrame {
     pub fn new(service_name: String, ttfs_p99_latency: f64) -> Self {
         Self {
-            fields: FrameFields::new("STTMetadataFrame"),
+            fields: FrameFields::new(),
             service_name,
             ttfs_p99_latency,
         }
@@ -1195,7 +1233,7 @@ pub struct SpeechControlParamsFrame {
 impl SpeechControlParamsFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("SpeechControlParamsFrame"),
+            fields: FrameFields::new(),
             vad_params: None,
             turn_params: None,
         }
@@ -1231,7 +1269,7 @@ pub struct EndTaskFrame {
 impl EndTaskFrame {
     pub fn new(reason: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("EndTaskFrame"),
+            fields: FrameFields::new(),
             reason,
         }
     }
@@ -1245,7 +1283,7 @@ impl Default for EndTaskFrame {
 
 impl fmt::Display for EndTaskFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(reason: {:?})", self.fields.name, self.reason)
+        write!(f, "{}(reason: {:?})", self.name(), self.reason)
     }
 }
 
@@ -1262,7 +1300,7 @@ pub struct CancelTaskFrame {
 impl CancelTaskFrame {
     pub fn new(reason: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("CancelTaskFrame"),
+            fields: FrameFields::new(),
             reason,
         }
     }
@@ -1276,7 +1314,7 @@ impl Default for CancelTaskFrame {
 
 impl fmt::Display for CancelTaskFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(reason: {:?})", self.fields.name, self.reason)
+        write!(f, "{}(reason: {:?})", self.name(), self.reason)
     }
 }
 
@@ -1298,14 +1336,14 @@ pub struct InterruptionTaskFrame {
 impl InterruptionTaskFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("InterruptionTaskFrame"),
+            fields: FrameFields::new(),
             notify: None,
         }
     }
 
     pub fn with_notify(notify: Arc<tokio::sync::Notify>) -> Self {
         Self {
-            fields: FrameFields::new("InterruptionTaskFrame"),
+            fields: FrameFields::new(),
             notify: Some(notify),
         }
     }
@@ -1343,7 +1381,7 @@ pub struct TextFrame {
 impl TextFrame {
     pub fn new(text: impl Into<String>) -> Self {
         Self {
-            fields: FrameFields::new("TextFrame"),
+            fields: FrameFields::new(),
             text: text.into(),
             skip_tts: None,
             includes_inter_frame_spaces: false,
@@ -1369,7 +1407,7 @@ impl fmt::Display for TextFrame {
         write!(
             f,
             "{}(pts: {}, text: [{}])",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
             self.text
         )
@@ -1397,7 +1435,7 @@ pub struct LLMTextFrame {
 impl LLMTextFrame {
     pub fn new(text: String) -> Self {
         Self {
-            fields: FrameFields::new("LLMTextFrame"),
+            fields: FrameFields::new(),
             text,
             skip_tts: None,
             includes_inter_frame_spaces: true,
@@ -1411,7 +1449,7 @@ impl fmt::Display for LLMTextFrame {
         write!(
             f,
             "{}(pts: {}, text: [{}])",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
             self.text
         )
@@ -1431,7 +1469,7 @@ pub struct OutputAudioRawFrame {
 impl OutputAudioRawFrame {
     pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
         Self {
-            fields: FrameFields::new("OutputAudioRawFrame"),
+            fields: FrameFields::new(),
             audio: AudioRawData::new(audio, sample_rate, num_channels),
         }
     }
@@ -1442,9 +1480,9 @@ impl fmt::Display for OutputAudioRawFrame {
         write!(
             f,
             "{}(pts: {}, destination: {:?}, size: {}, frames: {}, sample_rate: {}, channels: {})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_destination,
+            self.transport_destination(),
             self.audio.audio.len(),
             self.audio.num_frames,
             self.audio.sample_rate,
@@ -1468,7 +1506,7 @@ pub struct TTSAudioRawFrame {
 impl TTSAudioRawFrame {
     pub fn new(audio: Vec<u8>, sample_rate: u32, num_channels: u32) -> Self {
         Self {
-            fields: FrameFields::new("TTSAudioRawFrame"),
+            fields: FrameFields::new(),
             audio: AudioRawData::new(audio, sample_rate, num_channels),
             context_id: None,
         }
@@ -1480,9 +1518,9 @@ impl fmt::Display for TTSAudioRawFrame {
         write!(
             f,
             "{}(pts: {}, destination: {:?}, size: {}, frames: {}, sample_rate: {}, channels: {})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_destination,
+            self.transport_destination(),
             self.audio.audio.len(),
             self.audio.num_frames,
             self.audio.sample_rate,
@@ -1504,7 +1542,7 @@ pub struct OutputImageRawFrame {
 impl OutputImageRawFrame {
     pub fn new(image: Vec<u8>, size: (u32, u32), format: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("OutputImageRawFrame"),
+            fields: FrameFields::new(),
             image: ImageRawData {
                 image,
                 size,
@@ -1519,9 +1557,9 @@ impl fmt::Display for OutputImageRawFrame {
         write!(
             f,
             "{}(pts: {}, destination: {:?}, size: {:?}, format: {:?})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
-            self.fields.transport_destination,
+            self.transport_destination(),
             self.image.size,
             self.image.format
         )
@@ -1555,7 +1593,7 @@ impl TranscriptionFrame {
         timestamp: impl Into<String>,
     ) -> Self {
         Self {
-            fields: FrameFields::new("TranscriptionFrame"),
+            fields: FrameFields::new(),
             text: text.into(),
             user_id: user_id.into(),
             timestamp: timestamp.into(),
@@ -1571,7 +1609,7 @@ impl fmt::Display for TranscriptionFrame {
         write!(
             f,
             "{}(user: {}, text: [{}], language: {:?}, timestamp: {})",
-            self.fields.name, self.user_id, self.text, self.language, self.timestamp
+            self.name(), self.user_id, self.text, self.language, self.timestamp
         )
     }
 }
@@ -1601,7 +1639,7 @@ impl InterimTranscriptionFrame {
         timestamp: impl Into<String>,
     ) -> Self {
         Self {
-            fields: FrameFields::new("InterimTranscriptionFrame"),
+            fields: FrameFields::new(),
             text: text.into(),
             user_id: user_id.into(),
             timestamp: timestamp.into(),
@@ -1616,7 +1654,7 @@ impl fmt::Display for InterimTranscriptionFrame {
         write!(
             f,
             "{}(user: {}, text: [{}], language: {:?}, timestamp: {})",
-            self.fields.name, self.user_id, self.text, self.language, self.timestamp
+            self.name(), self.user_id, self.text, self.language, self.timestamp
         )
     }
 }
@@ -1649,7 +1687,7 @@ impl FunctionCallResultFrame {
         result: serde_json::Value,
     ) -> Self {
         Self {
-            fields: FrameFields::new("FunctionCallResultFrame"),
+            fields: FrameFields::new(),
             function_name,
             tool_call_id,
             arguments,
@@ -1676,7 +1714,7 @@ pub struct TTSSpeakFrame {
 impl TTSSpeakFrame {
     pub fn new(text: String) -> Self {
         Self {
-            fields: FrameFields::new("TTSSpeakFrame"),
+            fields: FrameFields::new(),
             text,
             append_to_context: None,
         }
@@ -1697,7 +1735,7 @@ pub struct OutputTransportMessageFrame {
 impl OutputTransportMessageFrame {
     pub fn new(message: serde_json::Value) -> Self {
         Self {
-            fields: FrameFields::new("OutputTransportMessageFrame"),
+            fields: FrameFields::new(),
             message,
         }
     }
@@ -1705,7 +1743,7 @@ impl OutputTransportMessageFrame {
 
 impl fmt::Display for OutputTransportMessageFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(message: {})", self.fields.name, self.message)
+        write!(f, "{}(message: {})", self.name(), self.message)
     }
 }
 
@@ -1724,7 +1762,7 @@ pub struct LLMMessagesAppendFrame {
 impl LLMMessagesAppendFrame {
     pub fn new(messages: Vec<serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("LLMMessagesAppendFrame"),
+            fields: FrameFields::new(),
             messages,
             run_llm: None,
         }
@@ -1747,7 +1785,7 @@ pub struct LLMMessagesUpdateFrame {
 impl LLMMessagesUpdateFrame {
     pub fn new(messages: Vec<serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("LLMMessagesUpdateFrame"),
+            fields: FrameFields::new(),
             messages,
             run_llm: None,
         }
@@ -1768,7 +1806,7 @@ pub struct LLMSetToolsFrame {
 impl LLMSetToolsFrame {
     pub fn new(tools: Vec<serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("LLMSetToolsFrame"),
+            fields: FrameFields::new(),
             tools,
         }
     }
@@ -1793,7 +1831,7 @@ pub struct LLMConfigureOutputFrame {
 impl LLMConfigureOutputFrame {
     pub fn new(skip_tts: bool) -> Self {
         Self {
-            fields: FrameFields::new("LLMConfigureOutputFrame"),
+            fields: FrameFields::new(),
             skip_tts,
         }
     }
@@ -1813,7 +1851,7 @@ pub struct LLMEnablePromptCachingFrame {
 impl LLMEnablePromptCachingFrame {
     pub fn new(enable: bool) -> Self {
         Self {
-            fields: FrameFields::new("LLMEnablePromptCachingFrame"),
+            fields: FrameFields::new(),
             enable,
         }
     }
@@ -1833,7 +1871,7 @@ pub struct OutputDTMFFrame {
 impl OutputDTMFFrame {
     pub fn new(button: KeypadEntry) -> Self {
         Self {
-            fields: FrameFields::new("OutputDTMFFrame"),
+            fields: FrameFields::new(),
             button,
         }
     }
@@ -1841,7 +1879,7 @@ impl OutputDTMFFrame {
 
 impl fmt::Display for OutputDTMFFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(button: {})", self.fields.name, self.button)
+        write!(f, "{}(button: {})", self.name(), self.button)
     }
 }
 
@@ -1858,7 +1896,7 @@ pub struct SpriteFrame {
 impl SpriteFrame {
     pub fn new(images: Vec<ImageRawData>) -> Self {
         Self {
-            fields: FrameFields::new("SpriteFrame"),
+            fields: FrameFields::new(),
             images,
         }
     }
@@ -1869,7 +1907,7 @@ impl fmt::Display for SpriteFrame {
         write!(
             f,
             "{}(pts: {}, size: {})",
-            self.fields.name,
+            self.name(),
             format_pts(self.fields.pts),
             self.images.len()
         )
@@ -1896,14 +1934,14 @@ pub struct EndFrame {
 impl EndFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("EndFrame"),
+            fields: FrameFields::new(),
             reason: None,
         }
     }
 
     pub fn with_reason(reason: String) -> Self {
         Self {
-            fields: FrameFields::new("EndFrame"),
+            fields: FrameFields::new(),
             reason: Some(reason),
         }
     }
@@ -1917,7 +1955,7 @@ impl Default for EndFrame {
 
 impl fmt::Display for EndFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(reason: {:?})", self.fields.name, self.reason)
+        write!(f, "{}(reason: {:?})", self.name(), self.reason)
     }
 }
 
@@ -1934,7 +1972,7 @@ pub struct StopFrame {
 impl StopFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("StopFrame"),
+            fields: FrameFields::new(),
         }
     }
 }
@@ -1959,7 +1997,7 @@ pub struct HeartbeatFrame {
 impl HeartbeatFrame {
     pub fn new(timestamp: u64) -> Self {
         Self {
-            fields: FrameFields::new("HeartbeatFrame"),
+            fields: FrameFields::new(),
             timestamp,
         }
     }
@@ -1979,7 +2017,7 @@ pub struct LLMFullResponseStartFrame {
 impl LLMFullResponseStartFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("LLMFullResponseStartFrame"),
+            fields: FrameFields::new(),
             skip_tts: None,
         }
     }
@@ -2005,7 +2043,7 @@ pub struct LLMFullResponseEndFrame {
 impl LLMFullResponseEndFrame {
     pub fn new() -> Self {
         Self {
-            fields: FrameFields::new("LLMFullResponseEndFrame"),
+            fields: FrameFields::new(),
             skip_tts: None,
         }
     }
@@ -2031,7 +2069,7 @@ pub struct TTSStartedFrame {
 impl TTSStartedFrame {
     pub fn new(context_id: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("TTSStartedFrame"),
+            fields: FrameFields::new(),
             context_id,
         }
     }
@@ -2051,7 +2089,7 @@ pub struct TTSStoppedFrame {
 impl TTSStoppedFrame {
     pub fn new(context_id: Option<String>) -> Self {
         Self {
-            fields: FrameFields::new("TTSStoppedFrame"),
+            fields: FrameFields::new(),
             context_id,
         }
     }
@@ -2071,7 +2109,7 @@ pub struct LLMUpdateSettingsFrame {
 impl LLMUpdateSettingsFrame {
     pub fn new(settings: HashMap<String, serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("LLMUpdateSettingsFrame"),
+            fields: FrameFields::new(),
             settings,
         }
     }
@@ -2091,7 +2129,7 @@ pub struct TTSUpdateSettingsFrame {
 impl TTSUpdateSettingsFrame {
     pub fn new(settings: HashMap<String, serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("TTSUpdateSettingsFrame"),
+            fields: FrameFields::new(),
             settings,
         }
     }
@@ -2111,7 +2149,7 @@ pub struct STTUpdateSettingsFrame {
 impl STTUpdateSettingsFrame {
     pub fn new(settings: HashMap<String, serde_json::Value>) -> Self {
         Self {
-            fields: FrameFields::new("STTUpdateSettingsFrame"),
+            fields: FrameFields::new(),
             settings,
         }
     }
@@ -2134,7 +2172,7 @@ pub struct VADParamsUpdateFrame {
 impl VADParamsUpdateFrame {
     pub fn new(params: crate::audio::vad::VADParams) -> Self {
         Self {
-            fields: FrameFields::new("VADParamsUpdateFrame"),
+            fields: FrameFields::new(),
             params,
         }
     }
@@ -2159,7 +2197,7 @@ pub struct FilterEnableFrame {
 impl FilterEnableFrame {
     pub fn new(enable: bool) -> Self {
         Self {
-            fields: FrameFields::new("FilterEnableFrame"),
+            fields: FrameFields::new(),
             enable,
         }
     }
@@ -2184,7 +2222,7 @@ pub struct MixerEnableFrame {
 impl MixerEnableFrame {
     pub fn new(enable: bool) -> Self {
         Self {
-            fields: FrameFields::new("MixerEnableFrame"),
+            fields: FrameFields::new(),
             enable,
         }
     }
@@ -2223,7 +2261,7 @@ impl LLMContextSummaryRequestFrame {
         summarization_prompt: String,
     ) -> Self {
         Self {
-            fields: FrameFields::new("LLMContextSummaryRequestFrame"),
+            fields: FrameFields::new(),
             request_id,
             context,
             min_messages_to_keep,
@@ -2253,7 +2291,7 @@ pub struct LLMContextSummaryResultFrame {
 impl LLMContextSummaryResultFrame {
     pub fn new(request_id: String, summary: String, last_summarized_index: usize) -> Self {
         Self {
-            fields: FrameFields::new("LLMContextSummaryResultFrame"),
+            fields: FrameFields::new(),
             request_id,
             summary,
             last_summarized_index,
@@ -2282,7 +2320,7 @@ pub struct FunctionCallInProgressFrame {
 impl FunctionCallInProgressFrame {
     pub fn new(function_name: String, tool_call_id: String, arguments: serde_json::Value) -> Self {
         Self {
-            fields: FrameFields::new("FunctionCallInProgressFrame"),
+            fields: FrameFields::new(),
             function_name,
             tool_call_id,
             arguments,
@@ -2314,7 +2352,7 @@ pub struct SleepFrame {
 impl SleepFrame {
     pub fn new(sleep_secs: f64) -> Self {
         Self {
-            fields: FrameFields::new("SleepFrame"),
+            fields: FrameFields::new(),
             sleep_secs,
         }
     }
@@ -2667,5 +2705,77 @@ mod tests {
         let frame = CancelFrame::new(Some("timeout".to_string()));
         let display = format!("{}", frame);
         assert!(display.contains("timeout"));
+    }
+
+    #[test]
+    fn test_metadata_lazy_initialization() {
+        let frame = TextFrame::new("test");
+        // Before mutation, the boxed HashMap should not be allocated
+        assert!(frame.fields.metadata.is_none());
+        // Reading metadata returns the static empty map
+        assert!(frame.metadata().is_empty());
+        // Still no allocation from read-only access
+        assert!(frame.fields.metadata.is_none());
+
+        let mut frame = frame;
+        // Mutable access triggers allocation
+        frame
+            .metadata_mut()
+            .insert("k".to_string(), serde_json::json!(1));
+        assert!(frame.fields.metadata.is_some());
+        assert_eq!(frame.metadata().len(), 1);
+    }
+
+    #[test]
+    fn test_transport_info_lazy_boxing() {
+        let frame = TextFrame::new("test");
+        // Transport starts as None (no heap allocation)
+        assert!(frame.fields.transport.is_none());
+        assert!(frame.transport_source().is_none());
+        assert!(frame.transport_destination().is_none());
+        // Read access should not trigger allocation
+        assert!(frame.fields.transport.is_none());
+
+        let mut frame = frame;
+        frame.set_transport_source(Some("mic-1".to_string()));
+        assert!(frame.fields.transport.is_some());
+        assert_eq!(frame.transport_source(), Some("mic-1"));
+        // Destination is None inside the now-allocated TransportInfo
+        assert_eq!(frame.transport_destination(), None);
+    }
+
+    #[test]
+    fn test_set_transport_none_does_not_allocate() {
+        let mut frame = TextFrame::new("test");
+        // Setting source to None when transport is already None should be a no-op
+        frame.set_transport_source(None);
+        assert!(frame.fields.transport.is_none());
+        frame.set_transport_destination(None);
+        assert!(frame.fields.transport.is_none());
+    }
+
+    #[test]
+    fn test_empty_metadata_returns_same_instance() {
+        let a = empty_metadata();
+        let b = empty_metadata();
+        assert!(std::ptr::eq(a, b));
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn test_frame_fields_clone_deep_copies_metadata() {
+        let mut fields = FrameFields::new();
+        fields.metadata = Some(Box::new(HashMap::from([(
+            "key".to_string(),
+            serde_json::json!("value"),
+        )])));
+        let mut cloned = fields.clone();
+        cloned
+            .metadata
+            .as_mut()
+            .unwrap()
+            .insert("new".to_string(), serde_json::json!(42));
+        assert_eq!(fields.metadata.as_ref().unwrap().len(), 1);
+        assert_eq!(cloned.metadata.as_ref().unwrap().len(), 2);
     }
 }

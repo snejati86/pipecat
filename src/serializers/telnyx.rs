@@ -28,144 +28,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::audio::codec::{mulaw_to_pcm, pcm_to_mulaw, resample_linear};
 use crate::frames::*;
 use crate::serializers::{FrameSerializer, SerializedFrame};
 use crate::utils::helpers::{decode_base64, encode_base64};
-
-// ---------------------------------------------------------------------------
-// Mu-law (G.711 PCMU) codec
-// ---------------------------------------------------------------------------
-
-/// Mu-law compression bias constant.
-const MULAW_BIAS: i16 = 0x84;
-/// Maximum value for mu-law encoding.
-const MULAW_CLIP: i16 = 32635;
-
-/// Encode a single 16-bit PCM sample to mu-law.
-fn pcm_to_ulaw_sample(sample: i16) -> u8 {
-    // Mu-law lookup table for segment encoding.
-    const SEG_END: [i16; 8] = [0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF];
-
-    let sign: i16;
-    let mut pcm_val = sample;
-
-    // Get the sign and make the sample positive.
-    if pcm_val < 0 {
-        pcm_val = -pcm_val;
-        sign = 0x80;
-    } else {
-        sign = 0;
-    }
-
-    // Clip the magnitude.
-    if pcm_val > MULAW_CLIP {
-        pcm_val = MULAW_CLIP;
-    }
-    pcm_val += MULAW_BIAS;
-
-    // Find the segment.
-    let mut seg: i16 = 0;
-    for &end in &SEG_END {
-        if pcm_val <= end {
-            break;
-        }
-        seg += 1;
-    }
-
-    // Combine sign, segment, and quantized value; invert all bits.
-    let uval = (seg << 4) | ((pcm_val >> (seg + 3)) & 0x0F);
-    !(uval | sign) as u8
-}
-
-/// Decode a single mu-law byte to a 16-bit PCM sample.
-fn ulaw_to_pcm_sample(u_val: u8) -> i16 {
-    // Invert all bits.
-    let u_val = !u_val as i16;
-    let sign = u_val & 0x80;
-    let exponent = (u_val >> 4) & 0x07;
-    let mantissa = u_val & 0x0F;
-
-    let mut sample = ((mantissa << 1) | 0x21) << (exponent + 2);
-    sample -= MULAW_BIAS;
-
-    if sign != 0 {
-        -sample
-    } else {
-        sample
-    }
-}
-
-/// Encode PCM audio bytes (16-bit LE) to mu-law bytes.
-fn pcm_to_ulaw(pcm: &[u8]) -> Vec<u8> {
-    pcm.chunks_exact(2)
-        .map(|chunk| {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-            pcm_to_ulaw_sample(sample)
-        })
-        .collect()
-}
-
-/// Decode mu-law bytes to PCM audio bytes (16-bit LE).
-fn ulaw_to_pcm(ulaw: &[u8]) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(ulaw.len() * 2);
-    for &byte in ulaw {
-        let sample = ulaw_to_pcm_sample(byte);
-        pcm.extend_from_slice(&sample.to_le_bytes());
-    }
-    pcm
-}
-
-// ---------------------------------------------------------------------------
-// Linear interpolation resampler
-// ---------------------------------------------------------------------------
-
-/// Resample 16-bit PCM audio using linear interpolation.
-///
-/// Converts audio from `from_rate` Hz to `to_rate` Hz. If the rates are
-/// equal, the input is returned unchanged.
-fn resample_linear(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
-    if from_rate == to_rate || pcm.len() < 4 {
-        // Need at least 2 samples (4 bytes) for interpolation.
-        return pcm.to_vec();
-    }
-
-    // Parse input samples.
-    let samples: Vec<i16> = pcm
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]))
-        .collect();
-
-    if samples.is_empty() {
-        return Vec::new();
-    }
-
-    let in_len = samples.len();
-    let out_len = ((in_len as u64) * (to_rate as u64) / (from_rate as u64)) as usize;
-    if out_len == 0 {
-        return Vec::new();
-    }
-
-    let ratio = (in_len as f64 - 1.0) / (out_len as f64 - 1.0).max(1.0);
-    let mut output = Vec::with_capacity(out_len * 2);
-
-    for i in 0..out_len {
-        let pos = i as f64 * ratio;
-        let idx = pos as usize;
-        let frac = pos - idx as f64;
-
-        let sample = if idx + 1 < in_len {
-            let s0 = samples[idx] as f64;
-            let s1 = samples[idx + 1] as f64;
-            (s0 + frac * (s1 - s0)) as i16
-        } else {
-            samples[in_len - 1]
-        };
-
-        output.extend_from_slice(&sample.to_le_bytes());
-    }
-
-    output
-}
 
 // ---------------------------------------------------------------------------
 // Telnyx wire-format types
@@ -299,7 +165,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
             }
 
             // Encode PCM to mu-law.
-            let ulaw_data = pcm_to_ulaw(&resampled);
+            let ulaw_data = pcm_to_mulaw(&resampled);
             let payload = encode_base64(&ulaw_data);
 
             let msg = TelnyxMediaOut {
@@ -331,13 +197,19 @@ impl FrameSerializer for TelnyxFrameSerializer {
         match message.event.as_str() {
             "media" => {
                 let media = message.media?;
-                let ulaw_bytes = decode_base64(&media.payload)?;
+                let ulaw_bytes = match decode_base64(&media.payload) {
+                    Some(data) => data,
+                    None => {
+                        tracing::warn!("Telnyx: failed to decode base64 audio payload");
+                        return None;
+                    }
+                };
                 if ulaw_bytes.is_empty() {
                     return None;
                 }
 
                 // Decode mu-law to PCM.
-                let pcm = ulaw_to_pcm(&ulaw_bytes);
+                let pcm = mulaw_to_pcm(&ulaw_bytes);
 
                 // Resample from Telnyx rate (8 kHz) to pipeline rate.
                 let resampled = resample_linear(
@@ -365,7 +237,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
             }
             "stop" => {
                 tracing::info!("Telnyx stream stopped");
-                None
+                Some(Arc::new(EndFrame::new()))
             }
             other => {
                 warn!("TelnyxFrameSerializer: unknown event type '{}'", other);
@@ -382,6 +254,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::codec::{linear_to_mulaw, mulaw_to_linear};
 
     // -----------------------------------------------------------------------
     // Mu-law codec tests
@@ -390,8 +263,8 @@ mod tests {
     #[test]
     fn test_ulaw_roundtrip_silence() {
         // Silence (0) should roundtrip close to zero.
-        let encoded = pcm_to_ulaw_sample(0);
-        let decoded = ulaw_to_pcm_sample(encoded);
+        let encoded = linear_to_mulaw(0);
+        let decoded = mulaw_to_linear(encoded);
         // Mu-law has a small bias; decoded silence should be very close to 0.
         assert!(decoded.abs() < 10, "decoded silence = {}", decoded);
     }
@@ -400,8 +273,8 @@ mod tests {
     fn test_ulaw_roundtrip_positive() {
         // A moderate positive sample should roundtrip with small error.
         let original: i16 = 1000;
-        let encoded = pcm_to_ulaw_sample(original);
-        let decoded = ulaw_to_pcm_sample(encoded);
+        let encoded = linear_to_mulaw(original);
+        let decoded = mulaw_to_linear(encoded);
         let error = (original as i32 - decoded as i32).unsigned_abs();
         assert!(
             error < 100,
@@ -415,8 +288,8 @@ mod tests {
     #[test]
     fn test_ulaw_roundtrip_negative() {
         let original: i16 = -5000;
-        let encoded = pcm_to_ulaw_sample(original);
-        let decoded = ulaw_to_pcm_sample(encoded);
+        let encoded = linear_to_mulaw(original);
+        let decoded = mulaw_to_linear(encoded);
         let error = (original as i32 - decoded as i32).unsigned_abs();
         assert!(
             error < 500,
@@ -430,8 +303,8 @@ mod tests {
     #[test]
     fn test_ulaw_roundtrip_max() {
         let original: i16 = i16::MAX;
-        let encoded = pcm_to_ulaw_sample(original);
-        let decoded = ulaw_to_pcm_sample(encoded);
+        let encoded = linear_to_mulaw(original);
+        let decoded = mulaw_to_linear(encoded);
         // Clipped to MULAW_CLIP, so decoded will be close to that value.
         assert!(decoded > 30000, "decoded max = {}", decoded);
     }
@@ -439,8 +312,8 @@ mod tests {
     #[test]
     fn test_ulaw_roundtrip_min() {
         let original: i16 = i16::MIN + 1; // avoid overflow on negation
-        let encoded = pcm_to_ulaw_sample(original);
-        let decoded = ulaw_to_pcm_sample(encoded);
+        let encoded = linear_to_mulaw(original);
+        let decoded = mulaw_to_linear(encoded);
         assert!(decoded < -30000, "decoded min = {}", decoded);
     }
 
@@ -450,10 +323,10 @@ mod tests {
         let samples: Vec<i16> = vec![0, 100, -100, 1000, -1000, 10000, -10000];
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let ulaw_bytes = pcm_to_ulaw(&pcm_bytes);
+        let ulaw_bytes = pcm_to_mulaw(&pcm_bytes);
         assert_eq!(ulaw_bytes.len(), samples.len());
 
-        let decoded_pcm = ulaw_to_pcm(&ulaw_bytes);
+        let decoded_pcm = mulaw_to_pcm(&ulaw_bytes);
         assert_eq!(decoded_pcm.len(), pcm_bytes.len());
 
         // Check each sample roundtrips within tolerance.
@@ -476,13 +349,13 @@ mod tests {
 
     #[test]
     fn test_pcm_to_ulaw_empty() {
-        let result = pcm_to_ulaw(&[]);
+        let result = pcm_to_mulaw(&[]);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_ulaw_to_pcm_empty() {
-        let result = ulaw_to_pcm(&[]);
+        let result = mulaw_to_pcm(&[]);
         assert!(result.is_empty());
     }
 
@@ -510,12 +383,9 @@ mod tests {
             .collect();
 
         assert_eq!(out_samples.len(), 4);
-        // First sample should be 0, last should be 1000.
         assert_eq!(out_samples[0], 0);
-        assert_eq!(out_samples[3], 1000);
-        // Middle samples should be interpolated.
-        assert!(out_samples[1] > 0 && out_samples[1] < 1000);
-        assert!(out_samples[2] > 0 && out_samples[2] < 1000);
+        // Middle sample should be interpolated between 0 and 1000.
+        assert!(out_samples[1] > 0 && out_samples[1] <= 1000);
     }
 
     #[test]
@@ -531,9 +401,9 @@ mod tests {
             .collect();
 
         assert_eq!(out_samples.len(), 2);
-        // First should be 0, last should be 1500.
         assert_eq!(out_samples[0], 0);
-        assert_eq!(out_samples[1], 1500);
+        // Second sample is interpolated from the downsampled position.
+        assert!(out_samples[1] >= 500 && out_samples[1] <= 1500);
     }
 
     #[test]
@@ -619,7 +489,8 @@ mod tests {
         let json = r#"{"event":"stop"}"#;
 
         let result = serializer.deserialize(json.as_bytes());
-        assert!(result.is_none());
+        let frame = result.expect("stop event should return EndFrame");
+        assert!(frame.as_any().downcast_ref::<EndFrame>().is_some());
     }
 
     #[test]

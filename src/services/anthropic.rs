@@ -39,6 +39,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
+use crate::services::shared::sse::{SseEvent, SseParser};
 use crate::frames::{
     ErrorFrame, Frame, FunctionCallFromLLM, FunctionCallResultFrame, FunctionCallsStartedFrame,
     LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMSetToolsFrame,
@@ -498,13 +499,11 @@ impl AnthropicLLMService {
         let mut cache_creation_input_tokens: u64 = 0;
         let mut cache_read_input_tokens: u64 = 0;
 
-        // Buffer for incomplete SSE lines (the byte stream may split mid-line).
-        let mut line_buffer = String::with_capacity(256);
-        let mut current_event_type = String::new();
+        let mut sse_parser = SseParser::new();
 
         let mut byte_stream = response.bytes_stream();
 
-        while let Some(chunk_result) = byte_stream.next().await {
+        'stream: while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
@@ -520,7 +519,6 @@ impl AnthropicLLMService {
                 }
             };
 
-            // Append raw bytes to our line buffer.
             let text = match std::str::from_utf8(&chunk) {
                 Ok(t) => t,
                 Err(_) => {
@@ -528,36 +526,15 @@ impl AnthropicLLMService {
                     continue;
                 }
             };
-            line_buffer.push_str(text);
 
-            // Process all complete lines in the buffer.
-            while let Some(newline_pos) = line_buffer.find('\n') {
-                let line: String = line_buffer[..newline_pos].to_string();
-                line_buffer.drain(..=newline_pos);
-
-                let line = line.trim();
-
-                // Empty line signals end of an SSE event -- we process in the
-                // data: handler so just reset event type.
-                if line.is_empty() {
-                    current_event_type.clear();
-                    continue;
-                }
-
-                // Capture event type.
-                if let Some(event_type) = line.strip_prefix("event:") {
-                    current_event_type = event_type.trim().to_string();
-                    continue;
-                }
-
-                // Only process `data:` lines.
-                let data = match line.strip_prefix("data:") {
-                    Some(d) => d.trim(),
-                    None => continue,
+            for sse_event in sse_parser.feed(text) {
+                let data = match sse_event {
+                    SseEvent::Done => break 'stream,
+                    SseEvent::Data { data, .. } => data,
                 };
 
                 // Parse the JSON payload as a StreamEvent.
-                let event: StreamEvent = match serde_json::from_str(data) {
+                let event: StreamEvent = match serde_json::from_str(&data) {
                     Ok(e) => e,
                     Err(e) => {
                         warn!(error = %e, data = %data, "Failed to parse Anthropic SSE event JSON");
@@ -622,7 +599,7 @@ impl AnthropicLLMService {
                     StreamEvent::MessageDelta { delta: _, usage } => {
                         // Accumulate output tokens from message_delta.
                         if let Some(usage) = usage {
-                            completion_tokens += usage.output_tokens;
+                            completion_tokens = completion_tokens.saturating_add(usage.output_tokens);
                         }
                     }
 
@@ -650,6 +627,7 @@ impl AnthropicLLMService {
                         self.base
                             .pending_frames
                             .push((err_frame, FrameDirection::Upstream));
+                        break 'stream;
                     }
                 }
             }
@@ -684,7 +662,7 @@ impl AnthropicLLMService {
         }
 
         // --- Emit usage metrics --------------------------------------------------
-        let total_tokens = prompt_tokens + completion_tokens;
+        let total_tokens = prompt_tokens.saturating_add(completion_tokens);
         let _usage_metrics = LLMUsageMetricsData {
             processor: self.base.name().to_string(),
             model: Some(self.model.clone()),

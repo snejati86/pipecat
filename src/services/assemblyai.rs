@@ -636,6 +636,7 @@ impl FrameProcessor for AssemblyAISTTService {
             .is_some()
         {
             self.disconnect().await;
+            self.drain_reader_frames().await;
             self.push_frame(frame, direction).await;
             return;
         }

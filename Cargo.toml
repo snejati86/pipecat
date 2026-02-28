@@ -21,6 +21,11 @@ base64 = "0.22"
 bytes = "1"
 prost = "0.13"
 urlencoding = "2"
+rubato = "0.16"
+tokio-util = "0.7"
+ort = { version = "2.0.0-rc.11", optional = true }
+ndarray = { version = "0.17", optional = true }
+rustfft = { version = "6", optional = true }
 
 [build-dependencies]
 prost-build = "0.13"
@@ -30,6 +35,14 @@ tokio-test = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 axum = { version = "0.8", features = ["ws"] }
+
+[features]
+silero-vad = ["ort", "ndarray"]
+smart-turn = ["ort", "ndarray", "rustfft", "silero-vad"]
+
+[[bench]]
+name = "processor_latency"
+harness = false
 
 [[example]]
 name = "twilio_outbound"

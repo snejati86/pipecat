@@ -182,6 +182,10 @@ impl FrameProcessor for WakeCheckFilter {
         &mut self.base
     }
 
+    async fn cleanup(&mut self) {
+        self.awake = false;
+    }
+
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // System frames always pass through
         if frame.is_system_frame() {

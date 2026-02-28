@@ -37,6 +37,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
+use crate::audio::codec::strip_wav_header;
 use crate::frames::{
     ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
     OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
@@ -53,15 +54,6 @@ use crate::services::{AIService, TTSService};
 fn generate_context_id() -> String {
     crate::utils::helpers::generate_unique_id("hume-tts-ctx")
 }
-
-// ---------------------------------------------------------------------------
-// WAV header constants
-// ---------------------------------------------------------------------------
-
-/// Standard WAV file header size in bytes.
-/// WAV headers consist of: RIFF chunk (12 bytes) + fmt sub-chunk (24 bytes)
-/// + data sub-chunk header (8 bytes) = 44 bytes total.
-const WAV_HEADER_SIZE: usize = 44;
 
 // ---------------------------------------------------------------------------
 // Hume AI TTS API types
@@ -145,27 +137,6 @@ pub struct HumeErrorResponse {
     /// Error type/code.
     #[serde(default)]
     pub error: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// WAV header stripping
-// ---------------------------------------------------------------------------
-
-/// Strip the WAV header from raw audio data, returning only the PCM payload.
-///
-/// If the data is shorter than the standard 44-byte WAV header, the original
-/// data is returned as-is.
-pub fn strip_wav_header(data: &[u8]) -> &[u8] {
-    if data.len() > WAV_HEADER_SIZE
-        && data.len() >= 4
-        && &data[0..4] == b"RIFF"
-        && data.len() >= 12
-        && &data[8..12] == b"WAVE"
-    {
-        &data[WAV_HEADER_SIZE..]
-    } else {
-        data
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,9 +1124,9 @@ mod tests {
         header.extend_from_slice(&(0u32.to_le_bytes()));
 
         assert_eq!(header.len(), 44);
-        // Not longer than 44 bytes, so we return as-is.
+        // Exactly 44 bytes with valid RIFF/WAVE, returns empty slice (no PCM data).
         let result = strip_wav_header(&header);
-        assert_eq!(result.len(), 44);
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
