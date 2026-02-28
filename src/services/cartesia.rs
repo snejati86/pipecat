@@ -613,7 +613,7 @@ impl CartesiaTTSService {
 
     /// Drain frames from the background reader task and send them through
     /// the processor context.
-    async fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
+    fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             match &frame {
                 FrameEnum::Error(_) => ctx.send_upstream(frame),
@@ -764,7 +764,7 @@ impl Processor for CartesiaTTSService {
         ctx: &ProcessorContext,
     ) {
         // Always drain any pending frames from the reader task
-        self.drain_reader_frames(ctx).await;
+        self.drain_reader_frames(ctx);
 
         match frame {
             FrameEnum::Text(ref t) if !t.text.is_empty() => {
@@ -804,7 +804,7 @@ impl Processor for CartesiaTTSService {
             }
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 self.disconnect().await;
-                self.drain_reader_frames(ctx).await;
+                self.drain_reader_frames(ctx);
                 ctx.send_downstream(frame);
             }
             other => match direction {

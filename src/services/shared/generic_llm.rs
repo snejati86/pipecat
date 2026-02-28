@@ -376,7 +376,7 @@ impl<P: LlmProtocol> Processor for GenericLlmService<P> {
         match frame {
             // LLMMessagesAppendFrame: accumulate messages and trigger inference.
             FrameEnum::LLMMessagesAppend(m) => {
-                self.messages.extend(m.messages.into_iter());
+                self.messages.extend(m.messages);
                 debug!(
                     total_messages = self.messages.len(),
                     "Appended messages, starting inference"

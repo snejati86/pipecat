@@ -1770,7 +1770,7 @@ impl LLMMessagesAppendFrame {
 }
 
 impl_frame_display_simple!(LLMMessagesAppendFrame);
-impl_data_frame!(LLMMessagesAppendFrame);
+impl_control_frame!(LLMMessagesAppendFrame);
 
 /// Frame containing LLM messages to replace current context.
 #[derive(Debug)]
@@ -1793,7 +1793,7 @@ impl LLMMessagesUpdateFrame {
 }
 
 impl_frame_display_simple!(LLMMessagesUpdateFrame);
-impl_data_frame!(LLMMessagesUpdateFrame);
+impl_control_frame!(LLMMessagesUpdateFrame);
 
 /// Frame containing tools for LLM function calling.
 #[derive(Debug)]
@@ -1813,11 +1813,11 @@ impl LLMSetToolsFrame {
 }
 
 impl_frame_display_simple!(LLMSetToolsFrame);
-impl_data_frame!(LLMSetToolsFrame);
+impl_control_frame!(LLMSetToolsFrame);
 
 declare_simple_frame!(
     /// Frame to trigger LLM processing with current context.
-    LLMRunFrame, data
+    LLMRunFrame, control
 );
 
 /// Frame to configure LLM output.
@@ -1838,7 +1838,7 @@ impl LLMConfigureOutputFrame {
 }
 
 impl_frame_display_simple!(LLMConfigureOutputFrame);
-impl_data_frame!(LLMConfigureOutputFrame);
+impl_control_frame!(LLMConfigureOutputFrame);
 
 /// Frame to enable/disable prompt caching in LLMs.
 #[derive(Debug)]
@@ -1858,7 +1858,7 @@ impl LLMEnablePromptCachingFrame {
 }
 
 impl_frame_display_simple!(LLMEnablePromptCachingFrame);
-impl_data_frame!(LLMEnablePromptCachingFrame);
+impl_control_frame!(LLMEnablePromptCachingFrame);
 
 /// DTMF keypress output frame for transport queuing.
 #[derive(Debug)]
@@ -2622,7 +2622,7 @@ mod tests {
         assert!(frame.is_control_frame());
 
         let frame = LLMRunFrame::new();
-        assert!(frame.is_data_frame());
+        assert!(frame.is_control_frame());
     }
 
     #[test]

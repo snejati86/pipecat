@@ -47,8 +47,17 @@ use crate::services::AIService;
 // Deepgram WebSocket JSON response types
 // ---------------------------------------------------------------------------
 
+/// Lightweight envelope to extract just the message type without allocating
+/// a full serde_json::Value tree. Used as the first parse for all messages;
+/// the hot-path "Results" type then gets a second parse into DgResult.
+#[derive(Deserialize)]
+struct DgTypeOnly {
+    #[serde(rename = "type")]
+    msg_type: Option<String>,
+}
+
 /// A single word/token alternative within a transcription result.
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DgWord {
     word: String,
@@ -60,7 +69,7 @@ struct DgWord {
 }
 
 /// One alternative transcription for a channel.
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DgAlternative {
     transcript: String,
@@ -72,13 +81,13 @@ struct DgAlternative {
 }
 
 /// A single channel's transcription results.
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize)]
 struct DgChannel {
     alternatives: Vec<DgAlternative>,
 }
 
 /// Top-level transcription result message from Deepgram.
-#[derive(Debug, Deserialize, serde::Serialize)]
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DgResult {
     #[serde(rename = "type")]
@@ -445,17 +454,11 @@ impl DeepgramSTTService {
         user_id: &str,
         vad_events: bool,
     ) {
-        // Extract message type with a lightweight Value parse.  For the hot
-        // path ("Results") we then parse the full DgResult struct — this keeps
-        // the total to 2 parses for transcriptions (down from 3) while
-        // correctly handling SpeechStarted/UtteranceEnd whose `channel` field
-        // is an int array rather than the DgChannel object.
-        let msg_type: String = match serde_json::from_str::<serde_json::Value>(text) {
-            Ok(v) => v
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("")
-                .to_string(),
+        // Extract just the message type with a minimal single-field struct
+        // (avoids allocating a full serde_json::Value tree). For the hot path
+        // ("Results") we then parse the full DgResult struct — 2 parses total.
+        let envelope: DgTypeOnly = match serde_json::from_str(text) {
+            Ok(e) => e,
             Err(e) => {
                 tracing::warn!(
                     "DeepgramSTTService: failed to parse message: {}: {}",
@@ -466,13 +469,13 @@ impl DeepgramSTTService {
             }
         };
 
-        let msg_type = msg_type.as_str();
+        let msg_type = envelope.msg_type.as_deref().unwrap_or("");
 
         match msg_type {
             "Results" => {
                 match serde_json::from_str::<DgResult>(text) {
                     Ok(result) => {
-                        Self::handle_transcription_result(result, frame_tx, user_id);
+                        Self::handle_transcription_result(result, text, frame_tx, user_id);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -545,6 +548,7 @@ impl DeepgramSTTService {
     /// Handle a pre-parsed `Results` transcription message.
     fn handle_transcription_result(
         result: DgResult,
+        original_text: &str,
         frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
         user_id: &str,
     ) {
@@ -571,9 +575,9 @@ impl DeepgramSTTService {
         // Extract language if present.
         let language = alternative.languages.first().cloned();
 
-        // Convert the already-parsed result into a JSON Value for the frame
-        // (avoids re-parsing the original text a third time).
-        let raw_result: Option<serde_json::Value> = serde_json::to_value(&result).ok();
+        // Parse the original text as a raw Value for the frame's raw_result field.
+        // This reuses the original text rather than round-tripping through Serialize.
+        let raw_result: Option<serde_json::Value> = serde_json::from_str(original_text).ok();
 
         if is_final {
             tracing::debug!(text = %transcript, "Deepgram: final transcription");
@@ -644,7 +648,7 @@ impl DeepgramSTTService {
     /// Drain any frames that the background reader has produced and send them
     /// via the processor context. This is called from `process` so that frames
     /// are integrated into the normal pipeline flow.
-    async fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
+    fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             if let Some(fe) = FrameEnum::try_from_arc(frame) {
                 match &fe {
@@ -737,7 +741,7 @@ impl Processor for DeepgramSTTService {
             // -- InputAudioRawFrame: forward audio to Deepgram ---------------
             FrameEnum::InputAudioRaw(audio_frame) => {
                 // Drain any frames produced by the WebSocket reader task.
-                self.drain_reader_frames(ctx).await;
+                self.drain_reader_frames(ctx);
 
                 if let Some(ref sender) = self.ws_sender {
                     let mut sink = sender.lock().await;
@@ -769,7 +773,7 @@ impl Processor for DeepgramSTTService {
             FrameEnum::End(_) => {
                 self.disconnect().await;
                 // Drain any final frames that arrived during disconnect.
-                self.drain_reader_frames(ctx).await;
+                self.drain_reader_frames(ctx);
                 // Pass EndFrame downstream.
                 ctx.send_downstream(frame);
             }
@@ -778,13 +782,13 @@ impl Processor for DeepgramSTTService {
             FrameEnum::Cancel(_) => {
                 self.disconnect().await;
                 // Drain any final frames that arrived during disconnect.
-                self.drain_reader_frames(ctx).await;
+                self.drain_reader_frames(ctx);
                 ctx.send_downstream(frame);
             }
 
             // -- All other frames: drain reader and pass through -------------
             other => {
-                self.drain_reader_frames(ctx).await;
+                self.drain_reader_frames(ctx);
                 match direction {
                     FrameDirection::Downstream => ctx.send_downstream(other),
                     FrameDirection::Upstream => ctx.send_upstream(other),

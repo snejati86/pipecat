@@ -165,14 +165,10 @@ impl Processor for LLMResponseAggregator {
             // TextFrame -- accumulate text when inside a response
             FrameEnum::Text(ref text_frame) => {
                 if self.in_response {
-                    if self.aggregation.is_empty() {
-                        self.aggregation.push_str(&text_frame.text);
-                    } else if text_frame.includes_inter_frame_spaces {
-                        self.aggregation.push_str(&text_frame.text);
-                    } else {
+                    if !self.aggregation.is_empty() && !text_frame.includes_inter_frame_spaces {
                         self.aggregation.push(' ');
-                        self.aggregation.push_str(&text_frame.text);
                     }
+                    self.aggregation.push_str(&text_frame.text);
                 }
                 // Pass TextFrame through regardless
                 match direction {
@@ -334,12 +330,10 @@ impl Processor for LLMUserContextAggregator {
             FrameEnum::Transcription(ref transcription) => {
                 let text = transcription.text.trim();
                 if !text.is_empty() {
-                    if self.aggregation.is_empty() {
-                        self.aggregation.push_str(text);
-                    } else {
+                    if !self.aggregation.is_empty() {
                         self.aggregation.push(' ');
-                        self.aggregation.push_str(text);
                     }
+                    self.aggregation.push_str(text);
                     tracing::debug!(text = %text, total = %self.aggregation, "UserContext: transcription received");
                 }
                 // Transcription frames are consumed (not pushed downstream),

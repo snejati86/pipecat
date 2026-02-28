@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::frames::frame_enum::FrameEnum;
+use crate::frames::FrameKind;
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
 
@@ -60,7 +61,7 @@ impl PrioritySender {
     /// Send a frame, routing to priority or data channel based on frame kind.
     pub async fn send(&self, frame: FrameEnum, direction: FrameDirection) {
         let directed = DirectedFrame { frame, direction };
-        if directed.frame.is_system_frame() || directed.frame.is_control_frame() {
+        if matches!(directed.frame.kind(), FrameKind::System | FrameKind::Control) {
             if self.priority_tx.send(directed).is_err() {
                 tracing::warn!("PrioritySender: priority receiver dropped, frame lost");
             }
@@ -203,8 +204,12 @@ impl ChannelPipeline {
                 Box::new(NoopProcessor) as Box<dyn Processor>,
             );
 
-            let mut down_rx = down_rxs[i].take().unwrap();
-            let mut up_rx = up_rxs[i + 1].take().unwrap();
+            let mut down_rx = down_rxs[i]
+                .take()
+                .expect("BUG: down_rx[i] already taken — loop invariant violated");
+            let mut up_rx = up_rxs[i + 1]
+                .take()
+                .expect("BUG: up_rx[i+1] already taken — loop invariant violated");
             let downstream_tx = down_txs[i + 1].clone();
             let upstream_tx = up_txs[i].clone();
             let token = cancel_token.clone();

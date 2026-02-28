@@ -507,7 +507,7 @@ impl AssemblyAISTTService {
     /// Drain any frames that the background reader has produced and push them
     /// downstream. This is called from `process_frame` so that frames are
     /// integrated into the normal pipeline flow.
-    async fn drain_reader_frames(&mut self) {
+    fn drain_reader_frames(&mut self) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             // ErrorFrames go upstream, everything else downstream.
             if frame
@@ -572,7 +572,7 @@ impl FrameProcessor for AssemblyAISTTService {
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         // First, drain any frames produced by the WebSocket reader task so they
         // are pushed into the pipeline in order.
-        self.drain_reader_frames().await;
+        self.drain_reader_frames();
 
         // -- StartFrame: establish WebSocket connection -----------------------
         if let Some(start_frame) = frame.as_ref().as_any().downcast_ref::<StartFrame>() {
@@ -622,7 +622,7 @@ impl FrameProcessor for AssemblyAISTTService {
         if frame.as_ref().as_any().downcast_ref::<EndFrame>().is_some() {
             self.disconnect().await;
             // Drain any final frames that arrived during disconnect.
-            self.drain_reader_frames().await;
+            self.drain_reader_frames();
             // Pass EndFrame downstream.
             self.push_frame(frame, direction).await;
             return;
@@ -636,7 +636,7 @@ impl FrameProcessor for AssemblyAISTTService {
             .is_some()
         {
             self.disconnect().await;
-            self.drain_reader_frames().await;
+            self.drain_reader_frames();
             self.push_frame(frame, direction).await;
             return;
         }
@@ -1202,7 +1202,7 @@ mod tests {
         let frame = Arc::new(TranscriptionFrame::new("hello", "user", "ts"));
         tx.try_send(frame).unwrap();
 
-        stt.drain_reader_frames().await;
+        stt.drain_reader_frames();
 
         assert_eq!(stt.base.pending_frames.len(), 1);
         let (frame, direction) = &stt.base.pending_frames[0];
@@ -1222,7 +1222,7 @@ mod tests {
         let frame = Arc::new(InterimTranscriptionFrame::new("hel", "user", "ts"));
         tx.try_send(frame).unwrap();
 
-        stt.drain_reader_frames().await;
+        stt.drain_reader_frames();
 
         assert_eq!(stt.base.pending_frames.len(), 1);
         let (frame, direction) = &stt.base.pending_frames[0];
@@ -1242,7 +1242,7 @@ mod tests {
         let frame = Arc::new(crate::frames::ErrorFrame::new("oops", false));
         tx.try_send(frame).unwrap();
 
-        stt.drain_reader_frames().await;
+        stt.drain_reader_frames();
 
         assert_eq!(stt.base.pending_frames.len(), 1);
         let (frame, direction) = &stt.base.pending_frames[0];
@@ -1266,7 +1266,7 @@ mod tests {
         tx.try_send(Arc::new(InterimTranscriptionFrame::new("hel", "u", "ts")))
             .unwrap();
 
-        stt.drain_reader_frames().await;
+        stt.drain_reader_frames();
 
         assert_eq!(stt.base.pending_frames.len(), 3);
         // TranscriptionFrame -> Downstream
@@ -1280,7 +1280,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_reader_frames_empty() {
         let mut stt = AssemblyAISTTService::new("key");
-        stt.drain_reader_frames().await;
+        stt.drain_reader_frames();
         assert!(stt.base.pending_frames.is_empty());
     }
 

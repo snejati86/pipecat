@@ -25,9 +25,11 @@ pub use crate::processors::aggregators::llm_context::LLMContext;
 pub use crate::processors::aggregators::sentence::SentenceAggregator;
 pub use crate::processors::audio::input_mute::UserInputMuteProcessor;
 pub use crate::processors::{FrameDirection, Processor, ProcessorContext, ProcessorWeight};
-pub use crate::serializers::FrameSerializer;
+pub use crate::serializers::{FrameSerializer, SerializedFrame};
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
 
+#[cfg(feature = "silero-vad")]
+pub use crate::audio::vad::VADParams;
 #[cfg(feature = "silero-vad")]
 pub use crate::processors::audio::silero_vad::SileroVADProcessor;
 #[cfg(feature = "smart-turn")]
