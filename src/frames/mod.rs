@@ -923,7 +923,7 @@ impl fmt::Display for InputAudioRawFrame {
     }
 }
 
-impl_system_frame!(InputAudioRawFrame);
+impl_data_frame!(InputAudioRawFrame);
 
 /// Raw image input from transport.
 #[derive(Debug)]
@@ -960,7 +960,7 @@ impl fmt::Display for InputImageRawFrame {
     }
 }
 
-impl_system_frame!(InputImageRawFrame);
+impl_data_frame!(InputImageRawFrame);
 
 /// Raw text input from transport.
 #[derive(Debug)]
@@ -992,7 +992,7 @@ impl fmt::Display for InputTextRawFrame {
     }
 }
 
-impl_system_frame!(InputTextRawFrame);
+impl_data_frame!(InputTextRawFrame);
 
 /// VAD detected user started speaking.
 #[derive(Debug)]
@@ -2466,7 +2466,7 @@ mod tests {
         assert_eq!(frame.audio.num_frames, 80);
         assert_eq!(frame.audio.sample_rate, 16000);
         assert_eq!(frame.audio.num_channels, 1);
-        assert!(frame.is_system_frame());
+        assert!(frame.is_data_frame());
     }
 
     #[test]

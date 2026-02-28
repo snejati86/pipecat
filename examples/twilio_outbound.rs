@@ -48,17 +48,9 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
-use pipecat::frames::frame_enum::FrameEnum;
 use pipecat::frames::*;
-use pipecat::pipeline::channel::ChannelPipeline;
 use pipecat::prelude::*;
-use pipecat::processors::aggregators::context_aggregator_pair::LLMContextAggregatorPair;
-use pipecat::processors::aggregators::llm_context::LLMContext;
-use pipecat::processors::aggregators::sentence::SentenceAggregator;
-use pipecat::processors::processor::Processor;
-use pipecat::processors::FrameDirection;
 use pipecat::serializers::twilio::{enable_debug_audio, TwilioFrameSerializer};
-use pipecat::processors::audio::input_mute::UserInputMuteProcessor;
 use pipecat::services::cartesia::CartesiaTTSService;
 use pipecat::services::deepgram::DeepgramSTTService;
 use pipecat::services::openai::OpenAILLMService;
@@ -247,7 +239,6 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     })];
 
     let mut context = LLMContext::new();
-    context.set_system_prompt(system_prompt.to_string());
     context.set_messages(initial_messages.clone());
     let pair = LLMContextAggregatorPair::new(context);
 

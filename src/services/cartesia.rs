@@ -674,10 +674,18 @@ impl CartesiaTTSService {
         };
 
         // Send via the split sink
-        let send_result = {
-            let sender = self.ws_sender.as_ref().unwrap();
-            let mut sink = sender.lock().await;
-            sink.send(WsMessage::Text(request_json)).await
+        let send_result = match self.ws_sender.as_ref() {
+            Some(sender) => {
+                let mut sink = sender.lock().await;
+                sink.send(WsMessage::Text(request_json)).await
+            }
+            None => {
+                ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
+                    "Cartesia WebSocket disconnected before send".to_string(),
+                    false,
+                )));
+                return;
+            }
         };
 
         if let Err(e) = send_result {
@@ -880,10 +888,22 @@ impl TTSService for CartesiaTTSService {
         };
 
         // Send via sink (clone Arc to avoid borrow conflict on error path)
-        let send_result = {
-            let sender = self.ws_sender.as_ref().unwrap().clone();
-            let mut sink = sender.lock().await;
-            sink.send(WsMessage::Text(request_json)).await
+        let send_result = match self.ws_sender.as_ref() {
+            Some(sender) => {
+                let sender = sender.clone();
+                let mut sink = sender.lock().await;
+                sink.send(WsMessage::Text(request_json)).await
+            }
+            None => {
+                return vec![
+                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
+                    Arc::new(ErrorFrame::new(
+                        "Cartesia WebSocket disconnected before send".to_string(),
+                        false,
+                    )),
+                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                ];
+            }
         };
         if let Err(e) = send_result {
             self.ws_sender = None;

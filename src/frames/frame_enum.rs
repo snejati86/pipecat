@@ -482,13 +482,15 @@ impl FrameEnum {
             | Self::TTSAudioRaw(_) | Self::OutputImageRaw(_) | Self::Transcription(_)
             | Self::InterimTranscription(_) | Self::FunctionCallResult(_)
             | Self::TTSSpeak(_) | Self::OutputTransportMessage(_)
-            | Self::LLMMessagesAppend(_) | Self::LLMMessagesUpdate(_)
-            | Self::LLMSetTools(_) | Self::LLMRun(_) | Self::LLMConfigureOutput(_)
-            | Self::LLMEnablePromptCaching(_) | Self::OutputDTMF(_)
+            | Self::OutputDTMF(_)
             | Self::Sprite(_) => FrameKind::Data,
 
-            // Control frames
+            // Control frames — includes LLM pipeline control signals that must not be
+            // blocked behind bounded data channel backpressure
             Self::End(_) | Self::Stop(_) | Self::Heartbeat(_)
+            | Self::LLMMessagesAppend(_) | Self::LLMMessagesUpdate(_)
+            | Self::LLMSetTools(_) | Self::LLMRun(_) | Self::LLMConfigureOutput(_)
+            | Self::LLMEnablePromptCaching(_)
             | Self::LLMFullResponseStart(_) | Self::LLMFullResponseEnd(_)
             | Self::TTSStarted(_) | Self::TTSStopped(_) | Self::LLMUpdateSettings(_)
             | Self::TTSUpdateSettings(_) | Self::STTUpdateSettings(_)
@@ -1049,7 +1051,6 @@ mod tests {
         let frames: Vec<FrameEnum> = vec![
             TextFrame::new("hi").into(),
             LLMTextFrame::new("tok".into()).into(),
-            LLMRunFrame::new().into(),
         ];
         for f in &frames {
             assert_eq!(f.kind(), FrameKind::Data, "Failed for {}", f.name());
@@ -1063,6 +1064,7 @@ mod tests {
             StopFrame::new().into(),
             HeartbeatFrame::new(0).into(),
             TTSStartedFrame::new(None).into(),
+            LLMRunFrame::new().into(),
         ];
         for f in &frames {
             assert_eq!(f.kind(), FrameKind::Control, "Failed for {}", f.name());

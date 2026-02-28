@@ -48,7 +48,7 @@ use crate::services::AIService;
 // ---------------------------------------------------------------------------
 
 /// A single word/token alternative within a transcription result.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DgWord {
     word: String,
@@ -60,7 +60,7 @@ struct DgWord {
 }
 
 /// One alternative transcription for a channel.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DgAlternative {
     transcript: String,
@@ -72,13 +72,13 @@ struct DgAlternative {
 }
 
 /// A single channel's transcription results.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 struct DgChannel {
     alternatives: Vec<DgAlternative>,
 }
 
 /// Top-level transcription result message from Deepgram.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 #[allow(dead_code)]
 struct DgResult {
     #[serde(rename = "type")]
@@ -123,12 +123,6 @@ struct DgError {
     variant: Option<String>,
 }
 
-/// Generic envelope used to determine message type before full deserialization.
-#[derive(Debug, Deserialize)]
-struct DgEnvelope {
-    #[serde(rename = "type")]
-    msg_type: Option<String>,
-}
 
 // ---------------------------------------------------------------------------
 // Type aliases for the WebSocket split halves
@@ -451,12 +445,20 @@ impl DeepgramSTTService {
         user_id: &str,
         vad_events: bool,
     ) {
-        // First determine the message type from the envelope.
-        let envelope: DgEnvelope = match serde_json::from_str(text) {
-            Ok(e) => e,
+        // Extract message type with a lightweight Value parse.  For the hot
+        // path ("Results") we then parse the full DgResult struct — this keeps
+        // the total to 2 parses for transcriptions (down from 3) while
+        // correctly handling SpeechStarted/UtteranceEnd whose `channel` field
+        // is an int array rather than the DgChannel object.
+        let msg_type: String = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => v
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
             Err(e) => {
                 tracing::warn!(
-                    "DeepgramSTTService: failed to parse message envelope: {}: {}",
+                    "DeepgramSTTService: failed to parse message: {}: {}",
                     e,
                     text,
                 );
@@ -464,11 +466,22 @@ impl DeepgramSTTService {
             }
         };
 
-        let msg_type = envelope.msg_type.as_deref().unwrap_or("");
+        let msg_type = msg_type.as_str();
 
         match msg_type {
             "Results" => {
-                Self::handle_transcription_result(text, frame_tx, user_id);
+                match serde_json::from_str::<DgResult>(text) {
+                    Ok(result) => {
+                        Self::handle_transcription_result(result, frame_tx, user_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "DeepgramSTTService: failed to parse Results message: {}: {}",
+                            e,
+                            text,
+                        );
+                    }
+                }
             }
             "SpeechStarted" => {
                 if vad_events {
@@ -529,24 +542,12 @@ impl DeepgramSTTService {
         }
     }
 
-    /// Parse and handle a `Results` transcription message.
+    /// Handle a pre-parsed `Results` transcription message.
     fn handle_transcription_result(
-        text: &str,
+        result: DgResult,
         frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
         user_id: &str,
     ) {
-        let result: DgResult = match serde_json::from_str(text) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "DeepgramSTTService: failed to parse transcription result: {}: {}",
-                    e,
-                    text,
-                );
-                return;
-            }
-        };
-
         let channel = match &result.channel {
             Some(ch) => ch,
             None => return,
@@ -570,8 +571,9 @@ impl DeepgramSTTService {
         // Extract language if present.
         let language = alternative.languages.first().cloned();
 
-        // Serialize the raw result as JSON value for the frame.
-        let raw_result: Option<serde_json::Value> = serde_json::from_str(text).ok();
+        // Convert the already-parsed result into a JSON Value for the frame
+        // (avoids re-parsing the original text a third time).
+        let raw_result: Option<serde_json::Value> = serde_json::to_value(&result).ok();
 
         if is_final {
             tracing::debug!(text = %transcript, "Deepgram: final transcription");

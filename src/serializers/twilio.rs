@@ -466,7 +466,7 @@ impl FrameSerializer for TwilioFrameSerializer {
             // Resample from pipeline rate to Twilio 8kHz using rubato FFT resampler
             let resampled;
             let pcm_data: &[u8] = if audio_frame.audio.sample_rate != TWILIO_SAMPLE_RATE {
-                let mut guard = self.output_resampler.lock().unwrap();
+                let mut guard = self.output_resampler.lock().unwrap_or_else(|e| e.into_inner());
                 let needs_new = match &*guard {
                     Some((rate, _, _)) => *rate != audio_frame.audio.sample_rate,
                     None => true,
@@ -596,7 +596,7 @@ impl FrameSerializer for TwilioFrameSerializer {
 
                 // Resample from 8kHz to pipeline rate using rubato FFT resampler
                 let resampled = if self.sample_rate != TWILIO_SAMPLE_RATE {
-                    let mut guard = self.input_resampler.lock().unwrap();
+                    let mut guard = self.input_resampler.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.is_none() {
                         if let Some(r) = create_resampler(TWILIO_SAMPLE_RATE, self.sample_rate) {
                             *guard = Some((r, Vec::new()));
