@@ -20,6 +20,9 @@ pub use crate::frames::{
 
 pub use crate::observers::Observer;
 pub use crate::pipeline::ChannelPipeline;
+pub use crate::processors::aggregators::context_aggregator_pair::LLMContextAggregatorPair;
+pub use crate::processors::aggregators::llm_context::LLMContext;
+pub use crate::processors::aggregators::sentence::SentenceAggregator;
 pub use crate::processors::audio::input_mute::UserInputMuteProcessor;
 pub use crate::processors::{FrameDirection, Processor, ProcessorContext, ProcessorWeight};
 pub use crate::serializers::FrameSerializer;
@@ -29,8 +32,3 @@ pub use crate::services::{AIService, LLMService, STTService, TTSService};
 pub use crate::processors::audio::silero_vad::SileroVADProcessor;
 #[cfg(feature = "smart-turn")]
 pub use crate::processors::audio::smart_turn_processor::SmartTurnProcessor;
-
-/// Wrap a frame in an Arc for pipeline use.
-pub fn frame<F: Frame + 'static>(f: F) -> FrameRef {
-    Arc::new(f)
-}

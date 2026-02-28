@@ -93,8 +93,9 @@ impl ProcessorContext {
 
     /// Send a frame downstream (input → output direction).
     ///
+    /// This is a synchronous operation (unbounded channel send) that never blocks.
     /// Logs a warning if the receiver has been dropped (e.g., during shutdown).
-    pub async fn send_downstream(&self, frame: FrameEnum) {
+    pub fn send_downstream(&self, frame: FrameEnum) {
         if self.downstream_tx.send(frame).is_err() {
             tracing::warn!("ProcessorContext: downstream receiver dropped, frame lost");
         }
@@ -102,10 +103,21 @@ impl ProcessorContext {
 
     /// Send a frame upstream (output → input direction).
     ///
+    /// This is a synchronous operation (unbounded channel send) that never blocks.
     /// Logs a warning if the receiver has been dropped (e.g., during shutdown).
-    pub async fn send_upstream(&self, frame: FrameEnum) {
+    pub fn send_upstream(&self, frame: FrameEnum) {
         if self.upstream_tx.send(frame).is_err() {
             tracing::warn!("ProcessorContext: upstream receiver dropped, frame lost");
+        }
+    }
+
+    /// Send a frame in the specified direction.
+    ///
+    /// Convenience method to avoid the common `match direction { ... }` pattern.
+    pub fn send(&self, frame: FrameEnum, direction: FrameDirection) {
+        match direction {
+            FrameDirection::Downstream => self.send_downstream(frame),
+            FrameDirection::Upstream => self.send_upstream(frame),
         }
     }
 
@@ -159,9 +171,9 @@ impl fmt::Debug for ProcessorContext {
 ///         match frame {
 ///             FrameEnum::Text(mut text) => {
 ///                 text.text = text.text.to_uppercase();
-///                 ctx.send_downstream(FrameEnum::Text(text)).await;
+///                 ctx.send_downstream(FrameEnum::Text(text));
 ///             }
-///             other => ctx.send_downstream(other).await,
+///             other => ctx.send_downstream(other),
 ///         }
 ///     }
 /// }
@@ -231,7 +243,7 @@ mod tests {
         let (_utx, _urx) = mpsc::unbounded_channel();
         let ctx = ProcessorContext::new(tx, _utx, CancellationToken::new(), 1);
 
-        ctx.send_downstream(FrameEnum::End(EndFrame::new())).await;
+        ctx.send_downstream(FrameEnum::End(EndFrame::new()));
 
         let received = rx.recv().await.unwrap();
         assert!(matches!(received, FrameEnum::End(_)));
@@ -243,7 +255,7 @@ mod tests {
         let (utx, mut urx) = mpsc::unbounded_channel();
         let ctx = ProcessorContext::new(_dtx, utx, CancellationToken::new(), 1);
 
-        ctx.send_upstream(FrameEnum::End(EndFrame::new())).await;
+        ctx.send_upstream(FrameEnum::End(EndFrame::new()));
 
         let received = urx.recv().await.unwrap();
         assert!(matches!(received, FrameEnum::End(_)));
@@ -308,9 +320,9 @@ mod tests {
             match frame {
                 FrameEnum::Text(mut text) => {
                     text.text = text.text.to_uppercase();
-                    ctx.send_downstream(FrameEnum::Text(text)).await;
+                    ctx.send_downstream(FrameEnum::Text(text));
                 }
-                other => ctx.send_downstream(other).await,
+                other => ctx.send_downstream(other),
             }
         }
     }

@@ -144,7 +144,7 @@ impl Processor for SentenceAggregator {
             FrameEnum::Interruption(_) => {
                 self.aggregation.clear();
                 tracing::debug!("Sentence: cleared on interruption");
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // TextFrame -- accumulate and check for sentence boundary
@@ -155,8 +155,8 @@ impl Processor for SentenceAggregator {
                 if is_sentence_end(&self.aggregation) {
                     let sentence = std::mem::take(&mut self.aggregation);
                     tracing::debug!(sentence = %sentence, "Sentence: emitting");
-                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(sentence)))
-                        .await;
+                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(sentence)));
+
                 }
             }
 
@@ -165,19 +165,19 @@ impl Processor for SentenceAggregator {
                 if !self.aggregation.is_empty() {
                     let remaining = std::mem::take(&mut self.aggregation);
                     tracing::debug!(text = %remaining, "Sentence: flushing on response end");
-                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(remaining)))
-                        .await;
+                    ctx.send_downstream(FrameEnum::Text(TextFrame::new(remaining)));
+
                 }
                 ctx.send_downstream(FrameEnum::LLMFullResponseEnd(
                     LLMFullResponseEndFrame::new(),
-                ))
-                .await;
+                ));
+
             }
 
             // All other frames pass through
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }

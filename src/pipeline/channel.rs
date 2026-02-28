@@ -387,7 +387,7 @@ mod tests {
             _direction: FrameDirection,
             ctx: &ProcessorContext,
         ) {
-            ctx.send_downstream(frame).await;
+            ctx.send_downstream(frame);
         }
     }
 
@@ -426,9 +426,9 @@ mod tests {
             match frame {
                 FrameEnum::Text(mut text) => {
                     text.text = text.text.to_uppercase();
-                    ctx.send_downstream(FrameEnum::Text(text)).await;
+                    ctx.send_downstream(FrameEnum::Text(text));
                 }
-                other => ctx.send_downstream(other).await,
+                other => ctx.send_downstream(other),
             }
         }
     }
@@ -631,8 +631,8 @@ mod tests {
         ) {
             // Send text frames upstream, others downstream
             match &frame {
-                FrameEnum::Text(_) => ctx.send_upstream(frame).await,
-                _ => ctx.send_downstream(frame).await,
+                FrameEnum::Text(_) => ctx.send_upstream(frame),
+                _ => ctx.send_downstream(frame),
             }
         }
     }

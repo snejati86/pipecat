@@ -106,9 +106,9 @@ impl Processor for NewUpperCase {
         match frame {
             FrameEnum::Text(mut text) => {
                 text.text = text.text.to_uppercase();
-                ctx.send_downstream(FrameEnum::Text(text)).await;
+                ctx.send_downstream(FrameEnum::Text(text));
             }
-            other => ctx.send_downstream(other).await,
+            other => ctx.send_downstream(other),
         }
     }
 }

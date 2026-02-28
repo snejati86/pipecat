@@ -467,8 +467,7 @@ impl FrameEnum {
             | Self::UserStoppedSpeaking(_) | Self::UserSpeaking(_)
             | Self::BotStartedSpeaking(_) | Self::BotStoppedSpeaking(_)
             | Self::BotSpeaking(_) | Self::UserMuteStarted(_) | Self::UserMuteStopped(_)
-            | Self::Metrics(_) | Self::STTMute(_) | Self::InputAudioRaw(_)
-            | Self::InputImageRaw(_) | Self::InputTextRaw(_)
+            | Self::Metrics(_) | Self::STTMute(_)
             | Self::VADUserStartedSpeaking(_) | Self::VADUserStoppedSpeaking(_)
             | Self::FunctionCallsStarted(_) | Self::FunctionCallCancel(_)
             | Self::InputTransportMessage(_) | Self::OutputTransportMessageUrgent(_)
@@ -478,7 +477,8 @@ impl FrameEnum {
             | Self::Sleep(_) => FrameKind::System,
 
             // Data frames
-            Self::Text(_) | Self::LLMText(_) | Self::OutputAudioRaw(_)
+            Self::InputAudioRaw(_) | Self::InputImageRaw(_) | Self::InputTextRaw(_)
+            | Self::Text(_) | Self::LLMText(_) | Self::OutputAudioRaw(_)
             | Self::TTSAudioRaw(_) | Self::OutputImageRaw(_) | Self::Transcription(_)
             | Self::InterimTranscription(_) | Self::FunctionCallResult(_)
             | Self::TTSSpeak(_) | Self::OutputTransportMessage(_)

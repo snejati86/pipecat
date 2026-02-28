@@ -282,7 +282,7 @@ impl Processor for SileroVADProcessor {
                         Err(e) => tracing::error!("SileroVAD: failed to init: {}", e),
                     }
                 }
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             FrameEnum::InputAudioRaw(ref af) => {
@@ -305,12 +305,12 @@ impl Processor for SileroVADProcessor {
                 self.run_vad_inference(ctx).await;
 
                 // Always pass audio through
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             FrameEnum::VADParamsUpdate(ref pf) => {
                 self.state_machine.update_params(pf.params.clone());
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
@@ -321,13 +321,13 @@ impl Processor for SileroVADProcessor {
                 }
                 self.state_machine.reset();
                 self.sample_buffer.clear();
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // Pass all other frames through
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }

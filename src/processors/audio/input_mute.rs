@@ -136,8 +136,8 @@ impl Processor for UserInputMuteProcessor {
                 // Silently drop
             }
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }

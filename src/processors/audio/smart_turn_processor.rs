@@ -189,7 +189,7 @@ impl SmartTurnProcessor {
                 .await;
         }
         for frame in self.held_frames.drain(..) {
-            ctx.send_downstream(frame).await;
+            ctx.send_downstream(frame);
         }
         self.stop_received_at = None;
     }
@@ -322,7 +322,7 @@ impl Processor for SmartTurnProcessor {
                     self.init_resampler(sf.audio_in_sample_rate);
                     self.initialized = true;
                 }
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             FrameEnum::InputAudioRaw(ref af) => {
@@ -342,7 +342,7 @@ impl Processor for SmartTurnProcessor {
                     self.held_frames.push(frame);
                     self.check_pending(ctx).await;
                 } else {
-                    ctx.send_downstream(frame).await;
+                    ctx.send_downstream(frame);
                 }
             }
 
@@ -369,18 +369,18 @@ impl Processor for SmartTurnProcessor {
                     tracing::debug!("SmartTurn: user resumed speaking, cancelling pending stop");
                     // Release held audio frames but not the stop frame
                     for held in self.held_frames.drain(..) {
-                        ctx.send_downstream(held).await;
+                        ctx.send_downstream(held);
                     }
                     self.cancel_pending();
                 }
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 // Release any pending frames before shutdown
                 self.release_pending(ctx).await;
                 self.audio_buffer.clear();
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             other => {
@@ -389,8 +389,8 @@ impl Processor for SmartTurnProcessor {
                     self.held_frames.push(other);
                 } else {
                     match direction {
-                        FrameDirection::Downstream => ctx.send_downstream(other).await,
-                        FrameDirection::Upstream => ctx.send_upstream(other).await,
+                        FrameDirection::Downstream => ctx.send_downstream(other),
+                        FrameDirection::Upstream => ctx.send_upstream(other),
                     }
                 }
             }

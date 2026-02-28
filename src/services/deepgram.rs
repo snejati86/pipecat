@@ -646,8 +646,8 @@ impl DeepgramSTTService {
         while let Ok(frame) = self.frame_rx.try_recv() {
             if let Some(fe) = FrameEnum::try_from_arc(frame) {
                 match &fe {
-                    FrameEnum::Error(_) => ctx.send_upstream(fe).await,
-                    _ => ctx.send_downstream(fe).await,
+                    FrameEnum::Error(_) => ctx.send_upstream(fe),
+                    _ => ctx.send_downstream(fe),
                 }
             }
         }
@@ -724,23 +724,25 @@ impl Processor for DeepgramSTTService {
                             format!("Deepgram connection failed: {}", e),
                             false,
                         ));
-                        ctx.send_upstream(error_frame).await;
+                        ctx.send_upstream(error_frame);
                     }
                 }
 
                 // Pass the StartFrame downstream so other processors see it.
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // -- InputAudioRawFrame: forward audio to Deepgram ---------------
-            FrameEnum::InputAudioRaw(ref audio_frame) => {
+            FrameEnum::InputAudioRaw(audio_frame) => {
                 // Drain any frames produced by the WebSocket reader task.
                 self.drain_reader_frames(ctx).await;
 
                 if let Some(ref sender) = self.ws_sender {
                     let mut sink = sender.lock().await;
+                    // Take ownership of the audio bytes — no clone needed since
+                    // STT consumes the frame (not forwarded downstream).
                     if let Err(e) = sink
-                        .send(Message::Binary(audio_frame.audio.audio.clone()))
+                        .send(Message::Binary(audio_frame.audio.audio))
                         .await
                     {
                         tracing::error!("DeepgramSTTService: failed to send audio: {}", e);
@@ -751,7 +753,7 @@ impl Processor for DeepgramSTTService {
                             format!("Failed to send audio to Deepgram: {}", e),
                             false,
                         ));
-                        ctx.send_upstream(error_frame).await;
+                        ctx.send_upstream(error_frame);
                     }
                 } else {
                     tracing::warn!(
@@ -767,7 +769,7 @@ impl Processor for DeepgramSTTService {
                 // Drain any final frames that arrived during disconnect.
                 self.drain_reader_frames(ctx).await;
                 // Pass EndFrame downstream.
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // -- CancelFrame: immediate shutdown -----------------------------
@@ -775,15 +777,15 @@ impl Processor for DeepgramSTTService {
                 self.disconnect().await;
                 // Drain any final frames that arrived during disconnect.
                 self.drain_reader_frames(ctx).await;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // -- All other frames: drain reader and pass through -------------
             other => {
                 self.drain_reader_frames(ctx).await;
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(other).await,
-                    FrameDirection::Upstream => ctx.send_upstream(other).await,
+                    FrameDirection::Downstream => ctx.send_downstream(other),
+                    FrameDirection::Upstream => ctx.send_upstream(other),
                 }
             }
         }

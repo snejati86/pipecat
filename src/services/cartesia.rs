@@ -520,8 +520,7 @@ impl CartesiaTTSService {
 
             match msg {
                 WsMessage::Text(text) => {
-                    let text_str = text.to_string();
-                    let response: CartesiaWsResponse = match serde_json::from_str(&text_str) {
+                    let response: CartesiaWsResponse = match serde_json::from_str(&text) {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!(service = %name, "Failed to parse WS message: {e}");
@@ -617,8 +616,8 @@ impl CartesiaTTSService {
     async fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             match &frame {
-                FrameEnum::Error(_) => ctx.send_upstream(frame).await,
-                _ => ctx.send_downstream(frame).await,
+                FrameEnum::Error(_) => ctx.send_upstream(frame),
+                _ => ctx.send_downstream(frame),
             }
         }
     }
@@ -635,8 +634,8 @@ impl CartesiaTTSService {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to auto-connect Cartesia WebSocket: {e}"),
                     false,
-                )))
-                .await;
+                )));
+
                 return;
             }
         }
@@ -668,8 +667,8 @@ impl CartesiaTTSService {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to serialize Cartesia request: {e}"),
                     false,
-                )))
-                .await;
+                )));
+
                 return;
             }
         };
@@ -687,16 +686,15 @@ impl CartesiaTTSService {
             ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
-            )))
-            .await;
+            )));
+
             return;
         }
 
         // Emit TTSStartedFrame synchronously for correct ordering
         ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
             context_id.clone(),
-        ))))
-        .await;
+        ))));
 
         tracing::debug!(
             service = %self.name,
@@ -765,24 +763,24 @@ impl Processor for CartesiaTTSService {
                 self.send_tts_request(&t.text, ctx).await;
                 // Forward TextFrame so downstream AssistantContextAggregator
                 // can accumulate the response into conversation history.
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             FrameEnum::LLMFullResponseStart(_) => {
                 // New LLM turn — fresh context_id will be generated on first TextFrame
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             FrameEnum::LLMFullResponseEnd(_) => {
                 self.current_context_id = None;
                 self.sentence_count_in_turn = 0;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             FrameEnum::Interruption(_) => {
-                if let Some(ref cid) = self.current_context_id.clone() {
-                    self.send_cancel(cid).await;
+                if let Some(cid) = self.current_context_id.take() {
+                    self.send_cancel(&cid).await;
                 }
-                self.current_context_id = None;
+                // take() above already set current_context_id to None
                 self.sentence_count_in_turn = 0;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             FrameEnum::Start(_) => {
                 if self.ws_sender.is_none() {
@@ -790,20 +788,20 @@ impl Processor for CartesiaTTSService {
                         ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                             format!("Cartesia connection failed: {e}"),
                             false,
-                        )))
-                        .await;
+                        )));
+
                     }
                 }
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 self.disconnect().await;
                 self.drain_reader_frames(ctx).await;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }

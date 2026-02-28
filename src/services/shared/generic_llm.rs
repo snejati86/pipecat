@@ -149,8 +149,8 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("HTTP request failed: {e}"),
                     false,
-                )))
-                .await;
+                )));
+
                 return;
             }
         };
@@ -172,16 +172,15 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                     error_body
                 ),
                 false,
-            )))
-            .await;
+            )));
+
             return;
         }
 
         // --- Emit response-start frame ---
         ctx.send_downstream(FrameEnum::LLMFullResponseStart(
             LLMFullResponseStartFrame::new(),
-        ))
-        .await;
+        ));
 
         // --- Parse SSE stream ---
         let mut functions: Vec<String> = Vec::with_capacity(4);
@@ -203,8 +202,8 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                     ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                         format!("SSE stream read error: {e}"),
                         false,
-                    )))
-                    .await;
+                    )));
+
                     break;
                 }
             };
@@ -240,8 +239,8 @@ impl<P: LlmProtocol> GenericLlmService<P> {
 
                     ctx.send_downstream(FrameEnum::Metrics(MetricsFrame::new(vec![
                         metrics_data,
-                    ])))
-                    .await;
+                    ])));
+
                 }
 
                 // Skip chunks with no choices.
@@ -278,8 +277,8 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                 else if let Some(ref content) = delta.content {
                     if !content.is_empty() {
                         tracing::trace!(token = %content, "LLM token");
-                        ctx.send_downstream(FrameEnum::Text(TextFrame::new(content.clone())))
-                            .await;
+                        ctx.send_downstream(FrameEnum::Text(TextFrame::new(content.clone())));
+
                     }
                 }
             }
@@ -314,16 +313,16 @@ impl<P: LlmProtocol> GenericLlmService<P> {
             debug!(count = function_calls.len(), "Emitting FunctionCallsStartedFrame");
             ctx.send_downstream(FrameEnum::FunctionCallsStarted(
                 FunctionCallsStartedFrame::new(function_calls),
-            ))
-            .await;
+            ));
+
         }
 
         // --- Emit response-end frame ---
         tracing::debug!("LLM response stream complete");
         ctx.send_downstream(FrameEnum::LLMFullResponseEnd(
             LLMFullResponseEndFrame::new(),
-        ))
-        .await;
+        ));
+
     }
 }
 
@@ -412,8 +411,8 @@ impl<P: LlmProtocol> Processor for GenericLlmService<P> {
 
             // Default: pass through in the original direction.
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }

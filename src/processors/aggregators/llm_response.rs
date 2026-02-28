@@ -135,14 +135,14 @@ impl Processor for LLMResponseAggregator {
             FrameEnum::Interruption(_) => {
                 self.aggregation.clear();
                 self.in_response = false;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // LLMFullResponseStartFrame -- begin accumulating
             FrameEnum::LLMFullResponseStart(_) => {
                 self.aggregation.clear();
                 self.in_response = true;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // LLMFullResponseEndFrame -- flush accumulated text as append frame
@@ -155,11 +155,11 @@ impl Processor for LLMResponseAggregator {
                     })];
                     ctx.send_downstream(FrameEnum::LLMMessagesAppend(
                         LLMMessagesAppendFrame::new(messages),
-                    ))
-                    .await;
+                    ));
+
                 }
                 self.in_response = false;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // TextFrame -- accumulate text when inside a response
@@ -176,15 +176,15 @@ impl Processor for LLMResponseAggregator {
                 }
                 // Pass TextFrame through regardless
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
             // All other frames pass through
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }
@@ -264,8 +264,8 @@ impl LLMUserContextAggregator {
         // Push append frame downstream
         ctx.send_downstream(FrameEnum::LLMMessagesAppend(
             LLMMessagesAppendFrame::new(vec![message]),
-        ))
-        .await;
+        ));
+
     }
 }
 
@@ -311,13 +311,13 @@ impl Processor for LLMUserContextAggregator {
             FrameEnum::Interruption(_) => {
                 self.aggregation.clear();
                 self.user_speaking = false;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // UserStartedSpeakingFrame
             FrameEnum::UserStartedSpeaking(_) => {
                 self.user_speaking = true;
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // UserStoppedSpeakingFrame -- push aggregation
@@ -327,7 +327,7 @@ impl Processor for LLMUserContextAggregator {
                     tracing::debug!(text = %self.aggregation, "UserContext: pushing user message");
                     self.push_aggregation(ctx).await;
                 }
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // TranscriptionFrame -- accumulate text (consumed, not forwarded)
@@ -354,8 +354,8 @@ impl Processor for LLMUserContextAggregator {
                 }
                 // Pass through so the assistant aggregator also sees it
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
@@ -366,8 +366,8 @@ impl Processor for LLMUserContextAggregator {
                     c.set_messages(update.messages.clone());
                 }
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
@@ -382,15 +382,15 @@ impl Processor for LLMUserContextAggregator {
                     }
                 }
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
             // All other frames pass through
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }
@@ -478,8 +478,7 @@ impl LLMAssistantContextAggregator {
         // Push append frame downstream
         ctx.send_downstream(FrameEnum::LLMMessagesAppend(
             LLMMessagesAppendFrame::new(vec![message]),
-        ))
-        .await;
+        ));
 
         tracing::debug!("AssistantContext: pushed assistant message");
     }
@@ -548,8 +547,8 @@ impl Processor for LLMAssistantContextAggregator {
                 }
                 // Pass TextFrame through so downstream processors (e.g. TTS) see it
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
@@ -558,7 +557,7 @@ impl Processor for LLMAssistantContextAggregator {
                 self.push_aggregation(ctx).await;
                 self.response_depth = 0;
                 self.reset();
-                ctx.send_downstream(frame).await;
+                ctx.send_downstream(frame);
             }
 
             // LLMMessagesAppendFrame -- append messages to shared context
@@ -568,8 +567,8 @@ impl Processor for LLMAssistantContextAggregator {
                     c.add_messages(append.messages.clone());
                 }
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
@@ -580,8 +579,8 @@ impl Processor for LLMAssistantContextAggregator {
                     c.set_messages(update.messages.clone());
                 }
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
@@ -596,15 +595,15 @@ impl Processor for LLMAssistantContextAggregator {
                     }
                 }
                 match direction {
-                    FrameDirection::Downstream => ctx.send_downstream(frame).await,
-                    FrameDirection::Upstream => ctx.send_upstream(frame).await,
+                    FrameDirection::Downstream => ctx.send_downstream(frame),
+                    FrameDirection::Upstream => ctx.send_upstream(frame),
                 }
             }
 
             // All other frames pass through
             other => match direction {
-                FrameDirection::Downstream => ctx.send_downstream(other).await,
-                FrameDirection::Upstream => ctx.send_upstream(other).await,
+                FrameDirection::Downstream => ctx.send_downstream(other),
+                FrameDirection::Upstream => ctx.send_upstream(other),
             },
         }
     }
