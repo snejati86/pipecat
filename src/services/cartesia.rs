@@ -360,8 +360,8 @@ impl CartesiaTTSService {
     }
 
     /// Configure additional input parameters (language, speed, emotion, etc.).
-    pub fn with_params(mut self, params: CartesiaInputParams) -> Self {
-        self.language = params.language.clone();
+    pub fn with_params(mut self, mut params: CartesiaInputParams) -> Self {
+        self.language = std::mem::take(&mut params.language);
         self.params = params;
         self
     }
@@ -699,11 +699,6 @@ impl CartesiaTTSService {
             return;
         }
 
-        // Emit TTSStartedFrame synchronously for correct ordering
-        ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
-            context_id.clone(),
-        ))));
-
         tracing::debug!(
             service = %self.name,
             text = %text,
@@ -711,6 +706,11 @@ impl CartesiaTTSService {
             sentence = self.sentence_count_in_turn,
             "Sent TTS request over WebSocket"
         );
+
+        // Emit TTSStartedFrame synchronously for correct ordering
+        ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id,
+        ))));
     }
 }
 
@@ -1075,8 +1075,8 @@ impl CartesiaHttpTTSService {
     }
 
     /// Configure additional input parameters (language, speed, emotion, etc.).
-    pub fn with_params(mut self, params: CartesiaInputParams) -> Self {
-        self.language = params.language.clone();
+    pub fn with_params(mut self, mut params: CartesiaInputParams) -> Self {
+        self.language = std::mem::take(&mut params.language);
         self.params = params;
         self
     }

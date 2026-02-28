@@ -54,12 +54,6 @@ use pipecat::serializers::twilio::{enable_debug_audio, TwilioFrameSerializer};
 use pipecat::services::cartesia::CartesiaTTSService;
 use pipecat::services::deepgram::DeepgramSTTService;
 use pipecat::services::openai::OpenAILLMService;
-#[cfg(feature = "silero-vad")]
-use pipecat::audio::vad::VADParams;
-#[cfg(feature = "silero-vad")]
-use pipecat::processors::audio::silero_vad::SileroVADProcessor;
-#[cfg(feature = "smart-turn")]
-use pipecat::processors::audio::smart_turn_processor::SmartTurnProcessor;
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -238,8 +232,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
         "content": system_prompt
     })];
 
-    let mut context = LLMContext::new();
-    context.set_messages(initial_messages.clone());
+    let context = LLMContext::with_messages(initial_messages.clone());
     let pair = LLMContextAggregatorPair::new(context);
 
     // Sentence aggregator buffers LLM tokens into complete sentences for TTS
@@ -404,8 +397,8 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
                     let arc_frame = directed.frame.into_arc_frame();
                     if let Some(serialized) = serializer_for_write.serialize(arc_frame) {
                         let msg = match serialized {
-                            pipecat::serializers::SerializedFrame::Text(t) => WsMsg::Text(t.into()),
-                            pipecat::serializers::SerializedFrame::Binary(b) => WsMsg::Binary(b.into()),
+                            SerializedFrame::Text(t) => WsMsg::Text(t.into()),
+                            SerializedFrame::Binary(b) => WsMsg::Binary(b.into()),
                         };
                         if ws_sender.send(msg).await.is_err() {
                             break;

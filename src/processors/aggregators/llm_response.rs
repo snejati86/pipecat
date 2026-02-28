@@ -135,7 +135,7 @@ impl Processor for LLMResponseAggregator {
             FrameEnum::Interruption(_) => {
                 self.aggregation.clear();
                 self.in_response = false;
-                ctx.send_downstream(frame);
+                ctx.send(frame, direction);
             }
 
             // LLMFullResponseStartFrame -- begin accumulating
@@ -307,13 +307,13 @@ impl Processor for LLMUserContextAggregator {
             FrameEnum::Interruption(_) => {
                 self.aggregation.clear();
                 self.user_speaking = false;
-                ctx.send_downstream(frame);
+                ctx.send(frame, direction);
             }
 
             // UserStartedSpeakingFrame
             FrameEnum::UserStartedSpeaking(_) => {
                 self.user_speaking = true;
-                ctx.send_downstream(frame);
+                ctx.send(frame, direction);
             }
 
             // UserStoppedSpeakingFrame -- push aggregation
@@ -323,7 +323,7 @@ impl Processor for LLMUserContextAggregator {
                     tracing::debug!(text = %self.aggregation, "UserContext: pushing user message");
                     self.push_aggregation(ctx).await;
                 }
-                ctx.send_downstream(frame);
+                ctx.send(frame, direction);
             }
 
             // TranscriptionFrame -- accumulate text (consumed, not forwarded)
@@ -551,7 +551,7 @@ impl Processor for LLMAssistantContextAggregator {
                 self.push_aggregation(ctx).await;
                 self.response_depth = 0;
                 self.reset();
-                ctx.send_downstream(frame);
+                ctx.send(frame, direction);
             }
 
             // LLMMessagesAppendFrame -- append messages to shared context

@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
     ErrorFrame, FunctionCallFromLLM, FunctionCallsStartedFrame, LLMFullResponseEndFrame,
-    LLMFullResponseStartFrame, MetricsFrame, TextFrame,
+    LLMFullResponseStartFrame, LLMTextFrame, MetricsFrame,
 };
 use crate::metrics::MetricsData;
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
@@ -277,7 +277,7 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                 else if let Some(ref content) = delta.content {
                     if !content.is_empty() {
                         tracing::trace!(token = %content, "LLM token");
-                        ctx.send_downstream(FrameEnum::Text(TextFrame::new(content.clone())));
+                        ctx.send_downstream(FrameEnum::LLMText(LLMTextFrame::new(content.clone())));
 
                     }
                 }
@@ -381,6 +381,22 @@ impl<P: LlmProtocol> Processor for GenericLlmService<P> {
                     total_messages = self.messages.len(),
                     "Appended messages, starting inference"
                 );
+                self.process_streaming_response(ctx).await;
+            }
+
+            // LLMMessagesUpdateFrame: replace messages and trigger inference.
+            FrameEnum::LLMMessagesUpdate(m) => {
+                self.messages = m.messages;
+                debug!(
+                    total_messages = self.messages.len(),
+                    "Replaced context, starting inference"
+                );
+                self.process_streaming_response(ctx).await;
+            }
+
+            // LLMRunFrame: trigger inference with current context.
+            FrameEnum::LLMRun(_) => {
+                debug!("LLMRun received, starting inference");
                 self.process_streaming_response(ctx).await;
             }
 

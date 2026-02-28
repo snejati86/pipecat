@@ -153,10 +153,15 @@ fn resample_rubato(
         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
         .collect();
 
-    let input_max_abs = new_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    // Only compute debug diagnostics when debug logging is active
+    let input_max_abs = if debug {
+        new_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
+    } else {
+        0.0
+    };
 
     // Prepend residual from previous call
-    let residual_len = residual.len();
+    let residual_len = if debug { residual.len() } else { 0 };
     let samples = if residual.is_empty() {
         new_samples
     } else {
@@ -220,8 +225,8 @@ fn resample_rubato(
     }
     // else: residual was already cleared by std::mem::take above
 
-    let output_max = all_output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     if debug {
+        let output_max = all_output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
         debug!(
             "resample: {} pcm_bytes ({} odd), {} new_samples (max={:.4}), {} residual_in, {} chunks -> {} out_samples (max={:.4}), {} residual_out",
             pcm_data.len(), pcm_data.len() % 2, pcm_data.len() / 2, input_max_abs,
