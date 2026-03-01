@@ -492,7 +492,7 @@ impl WebSocketTransport {
         }
 
         // Convert FrameEnum to Arc<dyn Frame> for the pipeline.
-        let frame: Arc<dyn Frame> = frame_enum.into();
+        let frame: Arc<dyn Frame> = frame_enum.into_arc_frame();
 
         // Push the frame downstream through the input processor.
         let mut proc = input.lock().await;
