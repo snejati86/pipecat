@@ -464,7 +464,12 @@ impl ChannelPipeline {
                                     &ctx,
                                 ).await;
 
-                                // Drain context output from interruption dispatch
+                                // Drain context output from interruption dispatch.
+                                // NOTE: Flush is still active here by design. Any
+                                // interruptible data frames emitted during InterruptionFrame
+                                // processing will be dropped by the flush gate. This is
+                                // intentional — the processor should only emit control/system
+                                // frames during interruption handling.
                                 while let Ok(frame) = ctx_down_rx.try_recv() {
                                     downstream_tx.send(frame, FrameDirection::Downstream).await;
                                 }
@@ -1316,7 +1321,9 @@ mod tests {
         ).await;
         assert!(result.is_ok(), "Uninterruptible data frame must NOT be dropped during flush");
 
-        // ErrorFrame is also uninterruptible — verify it passes through too.
+        // ErrorFrame is FrameKind::System, so it takes the priority channel
+        // path and bypasses the flush gate entirely (same as StartFrame, etc.).
+        // This verifies that System-kind frames are not affected by flush.
         tx.send(
             FrameEnum::Error(ErrorFrame::new("test error", false)),
             FrameDirection::Downstream,
@@ -1325,7 +1332,7 @@ mod tests {
             std::time::Duration::from_millis(50),
             rx.recv(),
         ).await;
-        assert!(result.is_ok(), "ErrorFrame must NOT be dropped during flush");
+        assert!(result.is_ok(), "System-kind ErrorFrame must pass through during flush");
 
         // Regular data frame should still be dropped.
         tx.send(FrameEnum::Text(TextFrame::new("should drop")), FrameDirection::Downstream).await;
