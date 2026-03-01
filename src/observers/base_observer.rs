@@ -30,11 +30,9 @@
 //! }
 //! ```
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
-use crate::frames::Frame;
+use crate::frames::FrameKind;
 use crate::processors::FrameDirection;
 
 /// Event data for frame processing in the pipeline.
@@ -82,9 +80,8 @@ pub struct FramePushed {
     pub direction: FrameDirection,
     /// The time when the frame was pushed, based on the pipeline clock.
     pub timestamp: u64,
-    /// A reference to the actual frame, useful for type-checking in tests
-    /// and for observers that need to inspect frame contents.
-    pub frame: Arc<dyn Frame>,
+    /// The kind (category) of the frame: System, Data, or Control.
+    pub frame_kind: FrameKind,
 }
 
 /// Base trait for pipeline observers that monitor frame flow without modifying it.
@@ -127,7 +124,7 @@ pub trait Observer: Send + Sync {
     ///
     /// * `data` - Event data containing details about the frame transfer,
     ///   including source and destination processors, frame identity, direction,
-    ///   timestamp, and a reference to the actual frame.
+    ///   timestamp, and the frame kind.
     async fn on_push_frame(&self, _data: &FramePushed) {}
 }
 
