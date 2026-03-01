@@ -464,14 +464,17 @@ impl FrameEnum {
             // LLM/TTS sequence delimiters — must maintain FIFO ordering with
             // their associated data frames (LLMText tokens, TTS audio).
             | Self::LLMFullResponseStart(_) | Self::LLMFullResponseEnd(_)
-            | Self::TTSStarted(_) | Self::TTSStopped(_) => FrameKind::Data,
+            | Self::TTSStarted(_) | Self::TTSStopped(_)
+            // LLM context frames -- must maintain FIFO ordering with data frames.
+            // Classified as Data (not Control) so they flow through the bounded
+            // data channel and preserve ordering with TranscriptionFrame, etc.
+            | Self::LLMMessagesAppend(_) | Self::LLMMessagesUpdate(_)
+            | Self::LLMSetTools(_) | Self::LLMRun(_) | Self::LLMConfigureOutput(_)
+            | Self::LLMEnablePromptCaching(_) => FrameKind::Data,
 
             // Control frames — lifecycle, configuration, and trigger signals.
             // Routed to the unbounded priority channel to bypass data backpressure.
             Self::End(_) | Self::Stop(_) | Self::Heartbeat(_)
-            | Self::LLMMessagesAppend(_) | Self::LLMMessagesUpdate(_)
-            | Self::LLMSetTools(_) | Self::LLMRun(_) | Self::LLMConfigureOutput(_)
-            | Self::LLMEnablePromptCaching(_)
             | Self::LLMUpdateSettings(_)
             | Self::TTSUpdateSettings(_) | Self::STTUpdateSettings(_)
             | Self::VADParamsUpdate(_) | Self::FilterControl(_) | Self::FilterEnable(_)
@@ -959,6 +962,8 @@ mod tests {
             LLMFullResponseEndFrame::new().into(),
             TTSStartedFrame::new(None).into(),
             TTSStoppedFrame::new(None).into(),
+            // LLM context frames are Data to preserve FIFO ordering.
+            LLMRunFrame::new().into(),
         ];
         for f in &frames {
             assert_eq!(f.kind(), FrameKind::Data, "Failed for {}", f.name());
@@ -971,7 +976,6 @@ mod tests {
             EndFrame::new().into(),
             StopFrame::new().into(),
             HeartbeatFrame::new(0).into(),
-            LLMRunFrame::new().into(),
         ];
         for f in &frames {
             assert_eq!(f.kind(), FrameKind::Control, "Failed for {}", f.name());

@@ -321,7 +321,7 @@ pub struct CartesiaTTSService {
 
     // -- TTS request serialization --
     // Shared with ws_reader_loop so it can send the next queued request on "done".
-    queue_state: Arc<tokio::sync::Mutex<TtsQueueState>>,
+    queue_state: Arc<std::sync::Mutex<TtsQueueState>>,
     sentence_count_in_turn: u32,
 
     /// Last metrics collected (available after `run_tts` completes).
@@ -353,7 +353,7 @@ impl CartesiaTTSService {
             ws_url: "wss://api.cartesia.ai/tts/websocket".to_string(),
             params: CartesiaInputParams::default(),
             connection: CartesiaConnection::Disconnected,
-            queue_state: Arc::new(tokio::sync::Mutex::new(TtsQueueState {
+            queue_state: Arc::new(std::sync::Mutex::new(TtsQueueState {
                 pending: VecDeque::new(),
                 in_flight: false,
                 current_context_id: None,
@@ -619,7 +619,7 @@ impl CartesiaTTSService {
         }
 
         {
-            let mut state = self.queue_state.lock().await;
+            let mut state = self.queue_state.lock().expect("queue_state poisoned");
             state.pending.clear();
             state.in_flight = false;
             state.current_context_id = None;
@@ -687,7 +687,7 @@ impl CartesiaTTSService {
         up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
         name: String,
         sample_rate: u32,
-        queue_state: Arc<tokio::sync::Mutex<TtsQueueState>>,
+        queue_state: Arc<std::sync::Mutex<TtsQueueState>>,
         ws_sender: Arc<Mutex<CartesiaWsSink>>,
     ) {
         while let Some(msg_result) = stream.next().await {
@@ -751,7 +751,7 @@ impl CartesiaTTSService {
 
                             // Send next queued request if available.
                             let next = {
-                                let mut state = queue_state.lock().await;
+                                let mut state = queue_state.lock().expect("queue_state poisoned");
                                 state.pending.pop_front()
                             };
                             if let Some(req) = next {
@@ -766,7 +766,7 @@ impl CartesiaTTSService {
                                         "Sent queued TTS request"
                                     );
                                     {
-                                        let mut state = queue_state.lock().await;
+                                        let mut state = queue_state.lock().expect("queue_state poisoned");
                                         state.current_context_id =
                                             Some(req.context_id.clone());
                                     }
@@ -778,12 +778,12 @@ impl CartesiaTTSService {
                                         service = %name,
                                         "Failed to send queued TTS request"
                                     );
-                                    let mut state = queue_state.lock().await;
+                                    let mut state = queue_state.lock().expect("queue_state poisoned");
                                     state.in_flight = false;
                                     state.current_context_id = None;
                                 }
                             } else {
-                                let mut state = queue_state.lock().await;
+                                let mut state = queue_state.lock().expect("queue_state poisoned");
                                 state.in_flight = false;
                                 state.current_context_id = None;
                             }
@@ -874,12 +874,12 @@ impl CartesiaTTSService {
         // Check if a TTS request is already in-flight. If so, queue this one
         // to prevent audio interleaving from concurrent Cartesia contexts.
         let already_in_flight = {
-            let state = self.queue_state.lock().await;
+            let state = self.queue_state.lock().expect("queue_state poisoned");
             state.in_flight
         };
 
         if already_in_flight {
-            let mut state = self.queue_state.lock().await;
+            let mut state = self.queue_state.lock().expect("queue_state poisoned");
             state.pending.push_back(PendingTtsRequest {
                 json: request_json,
                 context_id: context_id.clone(),
@@ -922,7 +922,7 @@ impl CartesiaTTSService {
         }
 
         {
-            let mut state = self.queue_state.lock().await;
+            let mut state = self.queue_state.lock().expect("queue_state poisoned");
             state.in_flight = true;
             state.current_context_id = Some(context_id.clone());
         }
@@ -1024,7 +1024,7 @@ impl Processor for CartesiaTTSService {
             }
             FrameEnum::Interruption(_) => {
                 let cid = {
-                    let mut state = self.queue_state.lock().await;
+                    let mut state = self.queue_state.lock().expect("queue_state poisoned");
                     state.pending.clear();
                     state.in_flight = false;
                     state.current_context_id.take()
