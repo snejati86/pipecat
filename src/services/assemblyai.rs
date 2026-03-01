@@ -33,7 +33,8 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing;
 
 use crate::frames::{
-    EndFrame, Frame, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame, TranscriptionFrame,
+    EndFrame, Frame, FrameEnum, InputAudioRawFrame, InterimTranscriptionFrame, StartFrame,
+    TranscriptionFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -157,9 +158,9 @@ pub struct AssemblyAISTTService {
     /// Handle for the background task that reads WebSocket messages.
     ws_reader_task: Option<JoinHandle<()>>,
     /// Channel used by the reader task to push frames back into the processor.
-    frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+    frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
     /// Receiving end -- drained in `process_frame` to push frames downstream.
-    frame_rx: tokio::sync::mpsc::Receiver<Arc<dyn Frame>>,
+    frame_rx: tokio::sync::mpsc::Receiver<FrameEnum>,
 }
 
 impl AssemblyAISTTService {
@@ -295,7 +296,7 @@ impl AssemblyAISTTService {
     /// converts them into pipeline frames sent via `frame_tx`.
     async fn ws_reader_loop(
         mut stream: WsStream,
-        frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: String,
     ) {
         while let Some(msg_result) = stream.next().await {
@@ -332,7 +333,7 @@ impl AssemblyAISTTService {
     /// Parse a text message from AssemblyAI and push the appropriate frame(s).
     fn handle_ws_text_message(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: &str,
     ) {
         // First determine the message type from the envelope.
@@ -351,7 +352,7 @@ impl AssemblyAISTTService {
         // Check for error responses (which may not have a message_type).
         if let Some(ref error_msg) = envelope.error {
             tracing::error!("AssemblyAISTTService: error from server: {}", error_msg);
-            let error_frame = Arc::new(crate::frames::ErrorFrame::new(
+            let error_frame = FrameEnum::Error(crate::frames::ErrorFrame::new(
                 format!("AssemblyAI error: {}", error_msg),
                 false,
             ));
@@ -393,7 +394,7 @@ impl AssemblyAISTTService {
     /// Handle a `PartialTranscript` message and emit an `InterimTranscriptionFrame`.
     fn handle_partial_transcript(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: &str,
     ) {
         let transcript: AaiTranscript = match serde_json::from_str(text) {
@@ -419,7 +420,7 @@ impl AssemblyAISTTService {
             InterimTranscriptionFrame::new(transcript.text, user_id.to_string(), timestamp);
         frame.result = raw_result;
 
-        if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+        if let Err(e) = frame_tx.try_send(FrameEnum::InterimTranscription(frame)) {
             tracing::warn!(
                 "AssemblyAISTTService: failed to send interim transcription frame: {}",
                 e
@@ -430,7 +431,7 @@ impl AssemblyAISTTService {
     /// Handle a `FinalTranscript` message and emit a `TranscriptionFrame`.
     fn handle_final_transcript(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: &str,
     ) {
         let transcript: AaiTranscript = match serde_json::from_str(text) {
@@ -455,7 +456,7 @@ impl AssemblyAISTTService {
         let mut frame = TranscriptionFrame::new(transcript.text, user_id.to_string(), timestamp);
         frame.result = raw_result;
 
-        if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+        if let Err(e) = frame_tx.try_send(FrameEnum::Transcription(frame)) {
             tracing::warn!(
                 "AssemblyAISTTService: failed to send transcription frame: {}",
                 e
@@ -510,20 +511,12 @@ impl AssemblyAISTTService {
     fn drain_reader_frames(&mut self) {
         while let Ok(frame) = self.frame_rx.try_recv() {
             // ErrorFrames go upstream, everything else downstream.
-            if frame
-                .as_ref()
-                .as_any()
-                .downcast_ref::<crate::frames::ErrorFrame>()
-                .is_some()
-            {
-                self.base
-                    .pending_frames
-                    .push((frame, FrameDirection::Upstream));
-            } else {
-                self.base
-                    .pending_frames
-                    .push((frame, FrameDirection::Downstream));
-            }
+            let direction = match &frame {
+                FrameEnum::Error(_) => FrameDirection::Upstream,
+                _ => FrameDirection::Downstream,
+            };
+            let arc_frame: Arc<dyn Frame> = frame.into();
+            self.base.pending_frames.push((arc_frame, direction));
         }
     }
 }
@@ -674,18 +667,18 @@ impl STTService for AssemblyAISTTService {
     /// when an `InputAudioRawFrame` arrives. This method provides a
     /// request-response interface: it sends the audio and then collects any
     /// frames that the reader task has produced.
-    async fn run_stt(&mut self, audio: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn run_stt(&mut self, audio: &[u8]) -> Vec<FrameEnum> {
         if let Some(ref sender) = self.ws_sender {
             let mut sink = sender.lock().await;
             if let Err(e) = sink.send(Message::Binary(audio.to_vec())).await {
                 tracing::error!("AssemblyAISTTService::run_stt: failed to send audio: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Failed to send audio to AssemblyAI: {}", e),
                     false,
                 ))];
             }
         } else {
-            return vec![Arc::new(crate::frames::ErrorFrame::new(
+            return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                 "AssemblyAISTTService: WebSocket not connected".to_string(),
                 false,
             ))];
@@ -694,7 +687,7 @@ impl STTService for AssemblyAISTTService {
         // Give the server a brief moment to respond, then drain available frames.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
         while let Ok(frame) = self.frame_rx.try_recv() {
             frames.push(frame);
         }
@@ -964,11 +957,10 @@ mod tests {
         AssemblyAISTTService::handle_ws_text_message(json, &tx, "user-1");
 
         let frame = rx.try_recv().unwrap();
-        let transcription = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .expect("Expected TranscriptionFrame");
+        let transcription = match &frame {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("Expected TranscriptionFrame"),
+        };
         assert_eq!(transcription.text, "hello world");
         assert_eq!(transcription.user_id, "user-1");
         assert!(transcription.result.is_some());
@@ -989,11 +981,10 @@ mod tests {
         AssemblyAISTTService::handle_ws_text_message(json, &tx, "user-2");
 
         let frame = rx.try_recv().unwrap();
-        let interim = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<InterimTranscriptionFrame>()
-            .expect("Expected InterimTranscriptionFrame");
+        let interim = match &frame {
+            FrameEnum::InterimTranscription(f) => f,
+            _ => panic!("Expected InterimTranscriptionFrame"),
+        };
         assert_eq!(interim.text, "hel");
         assert_eq!(interim.user_id, "user-2");
         assert!(interim.result.is_some());
@@ -1068,11 +1059,10 @@ mod tests {
         AssemblyAISTTService::handle_ws_text_message(json, &tx, "user");
 
         let frame = rx.try_recv().unwrap();
-        let error = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::ErrorFrame>()
-            .expect("Expected ErrorFrame");
+        let error = match &frame {
+            FrameEnum::Error(f) => f,
+            _ => panic!("Expected ErrorFrame"),
+        };
         assert!(error.error.contains("Invalid API key"));
         assert!(!error.fatal);
     }
@@ -1114,11 +1104,10 @@ mod tests {
         AssemblyAISTTService::handle_ws_text_message(json, &tx, "user");
 
         let frame = rx.try_recv().unwrap();
-        let transcription = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .expect("Expected TranscriptionFrame");
+        let transcription = match &frame {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("Expected TranscriptionFrame"),
+        };
 
         // raw result should contain the full JSON.
         let result = transcription.result.as_ref().unwrap();
@@ -1185,11 +1174,10 @@ mod tests {
         let frames = stt.run_stt(&[0u8; 100]).await;
 
         assert_eq!(frames.len(), 1);
-        let error = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::ErrorFrame>()
-            .expect("Expected ErrorFrame");
+        let error = match &frames[0] {
+            FrameEnum::Error(f) => f,
+            _ => panic!("Expected ErrorFrame"),
+        };
         assert!(error.error.contains("WebSocket not connected"));
     }
 
@@ -1199,7 +1187,7 @@ mod tests {
 
         // Simulate the reader task sending a TranscriptionFrame.
         let tx = stt.frame_tx.clone();
-        let frame = Arc::new(TranscriptionFrame::new("hello", "user", "ts"));
+        let frame = FrameEnum::Transcription(TranscriptionFrame::new("hello", "user", "ts"));
         tx.try_send(frame).unwrap();
 
         stt.drain_reader_frames();
@@ -1219,7 +1207,8 @@ mod tests {
         let mut stt = AssemblyAISTTService::new("key");
 
         let tx = stt.frame_tx.clone();
-        let frame = Arc::new(InterimTranscriptionFrame::new("hel", "user", "ts"));
+        let frame =
+            FrameEnum::InterimTranscription(InterimTranscriptionFrame::new("hel", "user", "ts"));
         tx.try_send(frame).unwrap();
 
         stt.drain_reader_frames();
@@ -1239,7 +1228,7 @@ mod tests {
         let mut stt = AssemblyAISTTService::new("key");
 
         let tx = stt.frame_tx.clone();
-        let frame = Arc::new(crate::frames::ErrorFrame::new("oops", false));
+        let frame = FrameEnum::Error(crate::frames::ErrorFrame::new("oops", false));
         tx.try_send(frame).unwrap();
 
         stt.drain_reader_frames();
@@ -1259,12 +1248,18 @@ mod tests {
         let mut stt = AssemblyAISTTService::new("key");
 
         let tx = stt.frame_tx.clone();
-        tx.try_send(Arc::new(TranscriptionFrame::new("hi", "u", "ts")))
-            .unwrap();
-        tx.try_send(Arc::new(crate::frames::ErrorFrame::new("err", false)))
-            .unwrap();
-        tx.try_send(Arc::new(InterimTranscriptionFrame::new("hel", "u", "ts")))
-            .unwrap();
+        tx.try_send(FrameEnum::Transcription(TranscriptionFrame::new(
+            "hi", "u", "ts",
+        )))
+        .unwrap();
+        tx.try_send(FrameEnum::Error(crate::frames::ErrorFrame::new(
+            "err", false,
+        )))
+        .unwrap();
+        tx.try_send(FrameEnum::InterimTranscription(
+            InterimTranscriptionFrame::new("hel", "u", "ts"),
+        ))
+        .unwrap();
 
         stt.drain_reader_frames();
 
@@ -1289,7 +1284,7 @@ mod tests {
         use crate::frames::TextFrame;
 
         let mut stt = AssemblyAISTTService::new("key");
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello"));
+        let frame: Arc<dyn Frame> = FrameEnum::Text(TextFrame::new("hello")).into();
 
         stt.process_frame(frame, FrameDirection::Downstream).await;
 
@@ -1303,7 +1298,8 @@ mod tests {
     #[tokio::test]
     async fn test_process_frame_audio_consumed_without_connection() {
         let mut stt = AssemblyAISTTService::new("key");
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(vec![0u8; 160], 16000, 1));
+        let frame: Arc<dyn Frame> =
+            FrameEnum::InputAudioRaw(InputAudioRawFrame::new(vec![0u8; 160], 16000, 1)).into();
 
         stt.process_frame(frame, FrameDirection::Downstream).await;
 

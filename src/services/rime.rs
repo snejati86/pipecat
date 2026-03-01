@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
+    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
     OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
 use crate::impl_base_display;
@@ -256,9 +256,9 @@ impl RimeTTSService {
     }
 
     /// Perform a TTS request via the Rime AI HTTP API and return frames.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = self.build_request(text);
         let url = self.build_url();
@@ -271,7 +271,9 @@ impl RimeTTSService {
         );
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let response = match self
             .client
@@ -285,11 +287,13 @@ impl RimeTTSService {
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Rime AI TTS HTTP request failed");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Rime AI TTS request failed: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -298,11 +302,13 @@ impl RimeTTSService {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
             error!(status = %status, body = %error_body, "Rime AI TTS API error");
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Rime AI TTS API error (HTTP {status}): {error_body}"),
                 false,
             )));
-            frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+            frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                context_id,
+            ))));
             return frames;
         }
 
@@ -311,11 +317,13 @@ impl RimeTTSService {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
                 error!(error = %e, "Failed to read Rime AI TTS response body");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to read response body: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -326,7 +334,7 @@ impl RimeTTSService {
                 sample_rate = self.sample_rate,
                 "Decoded Rime AI TTS audio"
             );
-            frames.push(Arc::new(OutputAudioRawFrame::new(
+            frames.push(FrameEnum::OutputAudioRaw(OutputAudioRawFrame::new(
                 audio_bytes,
                 self.sample_rate,
                 1, // mono
@@ -334,7 +342,9 @@ impl RimeTTSService {
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -542,7 +552,7 @@ impl TTSService for RimeTTSService {
     ///
     /// Returns `TTSStartedFrame`, zero or one `OutputAudioRawFrame`, and
     /// a `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         debug!(
             speaker = %self.speaker,
             text = %text,
@@ -1161,18 +1171,12 @@ mod tests {
 
         // Should contain TTSStartedFrame, ErrorFrame, TTSStoppedFrame.
         assert!(!frames.is_empty());
-        let has_error = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<ErrorFrame>().is_some());
+        let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(has_error, "Expected an ErrorFrame on connection failure");
 
         // Should still have started and stopped frames.
-        let has_started = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStartedFrame>().is_some());
-        let has_stopped = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStoppedFrame>().is_some());
+        let has_started = frames.iter().any(|f| matches!(f, FrameEnum::TTSStarted(_)));
+        let has_stopped = frames.iter().any(|f| matches!(f, FrameEnum::TTSStopped(_)));
         assert!(has_started, "Expected TTSStartedFrame even on error");
         assert!(has_stopped, "Expected TTSStoppedFrame even on error");
     }
@@ -1185,7 +1189,13 @@ mod tests {
 
         let error_frame = frames
             .iter()
-            .find_map(|f| f.as_any().downcast_ref::<ErrorFrame>())
+            .find_map(|f| {
+                if let FrameEnum::Error(inner) = f {
+                    Some(inner)
+                } else {
+                    None
+                }
+            })
             .expect("Expected an ErrorFrame");
         assert!(
             error_frame.error.contains("Rime AI TTS request failed"),

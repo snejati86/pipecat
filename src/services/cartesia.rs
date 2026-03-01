@@ -65,7 +65,7 @@ use tracing;
 
 use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
-    ErrorFrame, Frame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
+    ErrorFrame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
 };
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
@@ -1085,7 +1085,7 @@ impl TTSService for CartesiaTTSService {
     ///
     /// Connects in standalone mode if needed, sends the request via the split
     /// sink, then polls the standalone receiver until TTSStoppedFrame arrives.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
 
         // Ensure connected in standalone mode with a local channel.
@@ -1103,12 +1103,12 @@ impl TTSService for CartesiaTTSService {
                 }
                 Err(e) => {
                     return vec![
-                        Arc::new(TTSStartedFrame::new(None)),
-                        Arc::new(ErrorFrame::new(
+                        FrameEnum::TTSStarted(TTSStartedFrame::new(None)),
+                        FrameEnum::Error(ErrorFrame::new(
                             format!("Cartesia connection failed: {e}"),
                             false,
                         )),
-                        Arc::new(TTSStoppedFrame::new(None)),
+                        FrameEnum::TTSStopped(TTSStoppedFrame::new(None)),
                     ];
                 }
             }
@@ -1133,12 +1133,12 @@ impl TTSService for CartesiaTTSService {
             Ok(json) => json,
             Err(e) => {
                 return vec![
-                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
-                    Arc::new(ErrorFrame::new(
+                    FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))),
+                    FrameEnum::Error(ErrorFrame::new(
                         format!("Failed to serialize request: {e}"),
                         false,
                     )),
-                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                    FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))),
                 ];
             }
         };
@@ -1148,12 +1148,12 @@ impl TTSService for CartesiaTTSService {
             Some(s) => s,
             None => {
                 return vec![
-                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
-                    Arc::new(ErrorFrame::new(
+                    FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))),
+                    FrameEnum::Error(ErrorFrame::new(
                         "Cartesia WebSocket disconnected before send".to_string(),
                         false,
                     )),
-                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                    FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))),
                 ];
             }
         };
@@ -1164,17 +1164,17 @@ impl TTSService for CartesiaTTSService {
         if let Err(e) = send_result {
             self.connection = CartesiaConnection::Disconnected;
             return vec![
-                Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
-                Arc::new(ErrorFrame::new(
+                FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))),
+                FrameEnum::Error(ErrorFrame::new(
                     format!("WebSocket send failed: {e}"),
                     false,
                 )),
-                Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))),
             ];
         }
 
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        let mut frames: Vec<FrameEnum> = Vec::new();
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))));
 
         // Poll standalone_rx until TTSStoppedFrame arrives.
         // Extract rx from the Standalone variant. If not in Standalone state
@@ -1187,12 +1187,12 @@ impl TTSService for CartesiaTTSService {
                     "run_tts: expected Standalone connection state"
                 );
                 return vec![
-                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
-                    Arc::new(ErrorFrame::new(
+                    FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))),
+                    FrameEnum::Error(ErrorFrame::new(
                         "Internal error: not in standalone connection state".to_string(),
                         false,
                     )),
-                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                    FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))),
                 ];
             }
         };
@@ -1202,29 +1202,29 @@ impl TTSService for CartesiaTTSService {
                 Ok(Some(frame_enum)) => {
                     let is_stopped = matches!(&frame_enum, FrameEnum::TTSStopped(_));
                     let is_error = matches!(&frame_enum, FrameEnum::Error(_));
-                    frames.push(frame_enum.into_arc_frame());
+                    frames.push(frame_enum);
                     if is_stopped {
                         break;
                     }
                     if is_error {
-                        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
                         break;
                     }
                 }
                 Ok(None) => {
-                    frames.push(Arc::new(ErrorFrame::new(
+                    frames.push(FrameEnum::Error(ErrorFrame::new(
                         "Reader channel closed unexpectedly".to_string(),
                         false,
                     )));
-                    frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
                     break;
                 }
                 Err(_) => {
-                    frames.push(Arc::new(ErrorFrame::new(
+                    frames.push(FrameEnum::Error(ErrorFrame::new(
                         "TTS generation timed out after 30s".to_string(),
                         false,
                     )));
-                    frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
                     break;
                 }
             }
@@ -1385,9 +1385,9 @@ impl CartesiaHttpTTSService {
     }
 
     /// Perform a TTS request via the HTTP API.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = CartesiaHttpRequest {
             model_id: self.model.clone(),
@@ -1404,7 +1404,7 @@ impl CartesiaHttpTTSService {
         let ttfb_start = Instant::now();
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))));
 
         let response = self
             .client
@@ -1431,7 +1431,7 @@ impl CartesiaHttpTTSService {
                     let error_text = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
                     let error_msg = format!("Cartesia API returned status {status}: {error_text}");
                     tracing::error!(service = %self.name, "{}", error_msg);
-                    frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                    frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                 } else {
                     match resp.bytes().await {
                         Ok(audio_data) => {
@@ -1448,12 +1448,12 @@ impl CartesiaHttpTTSService {
 
                             let audio_frame =
                                 OutputAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
-                            frames.push(Arc::new(audio_frame));
+                            frames.push(FrameEnum::OutputAudioRaw(audio_frame));
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
                             tracing::error!(service = %self.name, "{}", error_msg);
-                            frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                            frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                         }
                     }
                 }
@@ -1461,12 +1461,12 @@ impl CartesiaHttpTTSService {
             Err(e) => {
                 let error_msg = format!("HTTP request to Cartesia failed: {e}");
                 tracing::error!(service = %self.name, "{}", error_msg);
-                frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
             }
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))));
 
         frames
     }
@@ -1506,7 +1506,7 @@ impl TTSService for CartesiaHttpTTSService {
     /// Makes a `POST` request to `/tts/bytes` and returns the complete audio
     /// as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame` and
     /// `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (HTTP)");
         self.run_tts_http(text).await
     }
@@ -1719,16 +1719,14 @@ mod tests {
 
         // First frame should be TTSStartedFrame.
         let first = frames.first().unwrap();
-        assert!(first.as_any().downcast_ref::<TTSStartedFrame>().is_some());
+        assert!(matches!(first, FrameEnum::TTSStarted(_)));
 
         // Last frame should be TTSStoppedFrame.
         let last = frames.last().unwrap();
-        assert!(last.as_any().downcast_ref::<TTSStoppedFrame>().is_some());
+        assert!(matches!(last, FrameEnum::TTSStopped(_)));
 
         // There should be an error frame in between (connection refused).
-        let has_error = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<ErrorFrame>().is_some());
+        let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(has_error);
     }
 }

@@ -28,7 +28,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::frames::{
-    CancelFrame, EndFrame, Frame, InputAudioRawFrame, StartFrame, TranscriptionFrame,
+    CancelFrame, EndFrame, Frame, FrameEnum, InputAudioRawFrame, StartFrame, TranscriptionFrame,
     UserStoppedSpeakingFrame,
 };
 use crate::impl_base_display;
@@ -485,7 +485,7 @@ impl GoogleSTTService {
     ///
     /// If the buffer is too short (below `min_audio_duration_secs`), the audio
     /// is discarded and no frames are returned.
-    async fn flush_and_transcribe(&mut self) -> Vec<Arc<dyn Frame>> {
+    async fn flush_and_transcribe(&mut self) -> Vec<FrameEnum> {
         let pcm = self.take_buffer();
         if pcm.is_empty() {
             return vec![];
@@ -505,13 +505,13 @@ impl GoogleSTTService {
     }
 
     /// Encode PCM data and send it to the Google Speech-to-Text API.
-    async fn transcribe_pcm(&self, pcm: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn transcribe_pcm(&self, pcm: &[u8]) -> Vec<FrameEnum> {
         self.send_transcription_request(pcm).await
     }
 
     /// Send audio to the Google Speech-to-Text API and parse the response into
     /// frames.
-    async fn send_transcription_request(&self, pcm: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn send_transcription_request(&self, pcm: &[u8]) -> Vec<FrameEnum> {
         let url = self.build_url();
         let request_body = self.build_recognize_request(pcm);
 
@@ -528,7 +528,7 @@ impl GoogleSTTService {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("GoogleSTTService: HTTP request failed: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Google Speech API request failed: {}", e),
                     false,
                 ))];
@@ -540,7 +540,7 @@ impl GoogleSTTService {
             Ok(text) => text,
             Err(e) => {
                 tracing::error!("GoogleSTTService: failed to read response body: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Failed to read Google Speech API response: {}", e),
                     false,
                 ))];
@@ -557,7 +557,7 @@ impl GoogleSTTService {
                 Err(_) => response_text.clone(),
             };
             tracing::error!("GoogleSTTService: API error ({}): {}", status, error_msg);
-            return vec![Arc::new(crate::frames::ErrorFrame::new(
+            return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                 format!("Google Speech API error ({}): {}", status, error_msg),
                 false,
             ))];
@@ -567,7 +567,7 @@ impl GoogleSTTService {
     }
 
     /// Parse the Google Speech-to-Text API response into transcription frames.
-    fn parse_recognize_response(&self, response_text: &str) -> Vec<Arc<dyn Frame>> {
+    fn parse_recognize_response(&self, response_text: &str) -> Vec<FrameEnum> {
         let timestamp = crate::utils::helpers::now_iso8601();
 
         let response: RecognizeResponse = match serde_json::from_str(response_text) {
@@ -578,14 +578,14 @@ impl GoogleSTTService {
                     e,
                     response_text,
                 );
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Failed to parse Google Speech response: {}", e),
                     false,
                 ))];
             }
         };
 
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         for result in &response.results {
             if result.alternatives.is_empty() {
@@ -608,7 +608,7 @@ impl GoogleSTTService {
                 .clone()
                 .or_else(|| Some(self.language.clone()));
             frame.result = serde_json::from_str::<serde_json::Value>(response_text).ok();
-            frames.push(Arc::new(frame));
+            frames.push(frame.into());
         }
 
         frames
@@ -673,16 +673,14 @@ impl FrameProcessor for GoogleSTTService {
             if self.should_flush() {
                 let frames = self.flush_and_transcribe().await;
                 for f in frames {
-                    if f.as_ref()
-                        .as_any()
-                        .downcast_ref::<crate::frames::ErrorFrame>()
-                        .is_some()
-                    {
-                        self.base.pending_frames.push((f, FrameDirection::Upstream));
+                    if matches!(&f, FrameEnum::Error(_)) {
+                        self.base
+                            .pending_frames
+                            .push((f.into(), FrameDirection::Upstream));
                     } else {
                         self.base
                             .pending_frames
-                            .push((f, FrameDirection::Downstream));
+                            .push((f.into(), FrameDirection::Downstream));
                     }
                 }
             }
@@ -699,16 +697,14 @@ impl FrameProcessor for GoogleSTTService {
         {
             let frames = self.flush_and_transcribe().await;
             for f in frames {
-                if f.as_ref()
-                    .as_any()
-                    .downcast_ref::<crate::frames::ErrorFrame>()
-                    .is_some()
-                {
-                    self.base.pending_frames.push((f, FrameDirection::Upstream));
+                if matches!(&f, FrameEnum::Error(_)) {
+                    self.base
+                        .pending_frames
+                        .push((f.into(), FrameDirection::Upstream));
                 } else {
                     self.base
                         .pending_frames
-                        .push((f, FrameDirection::Downstream));
+                        .push((f.into(), FrameDirection::Downstream));
                 }
             }
             // Pass the UserStoppedSpeakingFrame downstream.
@@ -720,16 +716,14 @@ impl FrameProcessor for GoogleSTTService {
         if frame.as_ref().as_any().downcast_ref::<EndFrame>().is_some() {
             let frames = self.flush_and_transcribe().await;
             for f in frames {
-                if f.as_ref()
-                    .as_any()
-                    .downcast_ref::<crate::frames::ErrorFrame>()
-                    .is_some()
-                {
-                    self.base.pending_frames.push((f, FrameDirection::Upstream));
+                if matches!(&f, FrameEnum::Error(_)) {
+                    self.base
+                        .pending_frames
+                        .push((f.into(), FrameDirection::Upstream));
                 } else {
                     self.base
                         .pending_frames
-                        .push((f, FrameDirection::Downstream));
+                        .push((f.into(), FrameDirection::Downstream));
                 }
             }
             self.started = false;
@@ -784,7 +778,7 @@ impl STTService for GoogleSTTService {
     /// This sends the given raw PCM audio directly to the Google Speech-to-Text
     /// API, bypassing the internal buffer. Useful for one-shot transcription
     /// outside of the pipeline.
-    async fn run_stt(&mut self, audio: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn run_stt(&mut self, audio: &[u8]) -> Vec<FrameEnum> {
         self.transcribe_pcm(audio).await
     }
 }
@@ -1161,11 +1155,10 @@ mod tests {
         let frames = stt.parse_recognize_response(response);
 
         assert_eq!(frames.len(), 1);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .expect("Expected TranscriptionFrame");
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("Expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "hello world");
         assert_eq!(frame.user_id, "user-1");
         assert_eq!(frame.language, Some("en-US".to_string()));
@@ -1190,18 +1183,16 @@ mod tests {
         let frames = stt.parse_recognize_response(response);
 
         assert_eq!(frames.len(), 2);
-        let f1 = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let f1 = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(f1.text, "first sentence");
 
-        let f2 = frames[1]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let f2 = match &frames[1] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(f2.text, "second sentence");
     }
 
@@ -1256,11 +1247,10 @@ mod tests {
         }"#;
         let frames = stt.parse_recognize_response(response);
         assert_eq!(frames.len(), 1);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "hello world");
     }
 
@@ -1282,11 +1272,10 @@ mod tests {
         let frames = stt.parse_recognize_response(response);
         assert_eq!(frames.len(), 1);
         // We always use the first (highest confidence) alternative.
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "hello");
     }
 
@@ -1316,11 +1305,10 @@ mod tests {
             }]
         }"#;
         let frames = stt.parse_recognize_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.language, Some("fr-FR".to_string()));
     }
 
@@ -1333,11 +1321,10 @@ mod tests {
             }]
         }"#;
         let frames = stt.parse_recognize_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.language, Some("de-DE".to_string()));
     }
 
@@ -1354,11 +1341,10 @@ mod tests {
             }]
         }"#;
         let frames = stt.parse_recognize_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         let raw = frame.result.as_ref().unwrap();
         assert!(raw["results"].is_array());
     }
@@ -1373,11 +1359,10 @@ mod tests {
         let response = "not valid json at all";
         let frames = stt.parse_recognize_response(response);
         assert_eq!(frames.len(), 1);
-        let error = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::ErrorFrame>()
-            .expect("Expected ErrorFrame");
+        let error = match &frames[0] {
+            FrameEnum::Error(f) => f,
+            _ => panic!("Expected ErrorFrame"),
+        };
         assert!(error
             .error
             .contains("Failed to parse Google Speech response"));
@@ -1728,11 +1713,10 @@ mod tests {
             }]
         }"#;
         let frames = stt.parse_recognize_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.language, Some("zh-CN".to_string()));
     }
 }

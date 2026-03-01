@@ -36,9 +36,60 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use crate::audio::codec::resample_linear;
 use crate::frames::*;
 use crate::serializers::{FrameSerializer, SerializedFrame};
+
+// ---------------------------------------------------------------------------
+// Linear interpolation resampler
+// ---------------------------------------------------------------------------
+
+/// Resample 16-bit PCM audio using linear interpolation.
+///
+/// Converts audio from `from_rate` Hz to `to_rate` Hz. If the rates are
+/// equal, the input is returned unchanged.
+fn resample_linear(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
+    if from_rate == to_rate || pcm.len() < 4 {
+        // Need at least 2 samples (4 bytes) for interpolation.
+        return pcm.to_vec();
+    }
+
+    // Parse input samples.
+    let samples: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let in_len = samples.len();
+    let out_len = ((in_len as u64) * (to_rate as u64) / (from_rate as u64)) as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+
+    let ratio = (in_len as f64 - 1.0) / (out_len as f64 - 1.0).max(1.0);
+    let mut output = Vec::with_capacity(out_len * 2);
+
+    for i in 0..out_len {
+        let pos = i as f64 * ratio;
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
+
+        let sample = if idx + 1 < in_len {
+            let s0 = samples[idx] as f64;
+            let s1 = samples[idx + 1] as f64;
+            (s0 + frac * (s1 - s0)) as i16
+        } else {
+            samples[in_len - 1]
+        };
+
+        output.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    output
+}
 
 // ---------------------------------------------------------------------------
 // Vonage wire-format types (deserialization)
@@ -160,7 +211,7 @@ impl VonageFrameSerializer {
     }
 
     /// Attempt to deserialize a text (JSON) WebSocket message from Vonage.
-    fn deserialize_text(&self, text: &str) -> Option<Arc<dyn Frame>> {
+    fn deserialize_text(&self, text: &str) -> Option<FrameEnum> {
         let message: VonageMessageIn = serde_json::from_str(text).ok()?;
         let event = message.event.as_deref().unwrap_or("");
 
@@ -187,7 +238,7 @@ impl VonageFrameSerializer {
                 if let Some(digit_str) = digit {
                     debug!("Vonage: DTMF digit={}", digit_str);
                     if let Some(entry) = Self::parse_dtmf_digit(digit_str) {
-                        Some(Arc::new(OutputDTMFFrame::new(entry)))
+                        Some(FrameEnum::OutputDTMF(OutputDTMFFrame::new(entry)))
                     } else {
                         warn!("Vonage: unknown DTMF digit '{}'", digit_str);
                         None
@@ -207,7 +258,7 @@ impl VonageFrameSerializer {
     }
 
     /// Attempt to deserialize a binary (audio) WebSocket message from Vonage.
-    fn deserialize_binary(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize_binary(&self, data: &[u8]) -> Option<FrameEnum> {
         if data.is_empty() {
             return None;
         }
@@ -223,7 +274,7 @@ impl VonageFrameSerializer {
             return None;
         }
 
-        Some(Arc::new(InputAudioRawFrame::new(
+        Some(FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
             resampled,
             self.params.sample_rate,
             1, // Vonage always sends mono audio
@@ -287,7 +338,7 @@ impl FrameSerializer for VonageFrameSerializer {
         None
     }
 
-    fn deserialize(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
         // Try to parse as UTF-8 text first (JSON events).
         // If it parses as valid JSON with an "event" field, treat as text event.
         // Otherwise, treat as binary audio data.
@@ -365,8 +416,10 @@ mod tests {
 
         assert_eq!(out_samples.len(), 4);
         assert_eq!(out_samples[0], 0);
-        // Middle sample should be interpolated between 0 and 1000.
-        assert!(out_samples[1] > 0 && out_samples[1] <= 1000);
+        assert_eq!(out_samples[3], 1000);
+        // Middle samples should be interpolated.
+        assert!(out_samples[1] > 0 && out_samples[1] < 1000);
+        assert!(out_samples[2] > 0 && out_samples[2] < 1000);
     }
 
     #[test]
@@ -383,8 +436,7 @@ mod tests {
 
         assert_eq!(out_samples.len(), 2);
         assert_eq!(out_samples[0], 0);
-        // Second sample is interpolated from the downsampled position.
-        assert!(out_samples[1] >= 500 && out_samples[1] <= 1500);
+        assert_eq!(out_samples[1], 1500);
     }
 
     #[test]
@@ -426,7 +478,10 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let frame = serializer.deserialize(&pcm_bytes).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
         // Same rate: no resampling, same byte count.
@@ -444,7 +499,10 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let frame = serializer.deserialize(&pcm_bytes).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
         // 80 samples at 8kHz -> 160 samples at 16kHz -> 320 bytes.
@@ -492,7 +550,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"event":"websocket:dtmf","digit":"5"}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame {
+            FrameEnum::OutputDTMF(inner) => inner,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Five);
     }
 
@@ -501,7 +562,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"event":"websocket:dtmf","dtmf":{"digit":"9"}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame {
+            FrameEnum::OutputDTMF(inner) => inner,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Nine);
     }
 
@@ -510,7 +574,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"event":"websocket:dtmf","digit":"*"}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame {
+            FrameEnum::OutputDTMF(inner) => inner,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Star);
     }
 
@@ -519,7 +586,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r##"{"event":"websocket:dtmf","digit":"#"}"##;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame {
+            FrameEnum::OutputDTMF(inner) => inner,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Pound);
     }
 
@@ -544,7 +614,10 @@ mod tests {
         for (digit, expected) in &digits_and_entries {
             let json = format!(r#"{{"event":"websocket:dtmf","digit":"{}"}}"#, digit);
             let frame = serializer.deserialize(json.as_bytes()).unwrap();
-            let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+            let dtmf = match &frame {
+                FrameEnum::OutputDTMF(inner) => inner,
+                other => panic!("expected OutputDTMFFrame, got {other}"),
+            };
             assert_eq!(dtmf.button, *expected, "Failed for digit '{}'", digit);
         }
     }
@@ -582,11 +655,7 @@ mod tests {
         // "not json at all" is 15 bytes, which is valid binary data but odd-length.
         // The resampler would still produce output. Let's verify it produces an audio frame.
         assert!(result.is_some());
-        let audio = result
-            .unwrap()
-            .downcast_ref::<InputAudioRawFrame>()
-            .is_some();
-        assert!(audio);
+        assert!(matches!(&result.unwrap(), FrameEnum::InputAudioRaw(_)));
     }
 
     // -----------------------------------------------------------------------
@@ -724,7 +793,10 @@ mod tests {
 
         // Deserialize
         let deserialized = serializer.deserialize(bytes).unwrap();
-        let audio = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &deserialized {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
 
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
@@ -766,7 +838,10 @@ mod tests {
 
         // Deserialize
         let deserialized = serializer.deserialize(&bytes).unwrap();
-        let audio = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &deserialized {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
 
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
@@ -860,11 +935,7 @@ mod tests {
         let pcm_data: Vec<u8> = vec![0x00, 0x01, 0xFF, 0x7F]; // two 16-bit samples
         let result = serializer.deserialize(&pcm_data);
         assert!(result.is_some());
-        let audio = result
-            .unwrap()
-            .downcast_ref::<InputAudioRawFrame>()
-            .is_some();
-        assert!(audio);
+        assert!(matches!(&result.unwrap(), FrameEnum::InputAudioRaw(_)));
     }
 
     #[test]

@@ -46,7 +46,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -56,8 +56,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, TTSAudioRawFrame,
-    TTSSpeakFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
+    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+    TTSAudioRawFrame, TTSSpeakFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -317,9 +317,9 @@ impl LmntTTSService {
     ///
     /// This sends the text, then sends an EOF message, then reads messages
     /// from the WebSocket until all audio has been received.
-    async fn run_tts_ws(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_ws(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         // Send the text request.
         let text_request = LmntWsTextRequest {
@@ -329,7 +329,7 @@ impl LmntTTSService {
         let text_json = match serde_json::to_string(&text_request) {
             Ok(json) => json,
             Err(e) => {
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to serialize LMNT text request: {e}"),
                     false,
                 )));
@@ -346,7 +346,7 @@ impl LmntTTSService {
         let eof_json = match serde_json::to_string(&eof_request) {
             Ok(json) => json,
             Err(e) => {
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to serialize LMNT EOF request: {e}"),
                     false,
                 )));
@@ -356,14 +356,13 @@ impl LmntTTSService {
 
         let ttfb_start = Instant::now();
         let mut got_first_audio = false;
-        let mut actual_ttfb = Duration::ZERO;
 
         // Send the request and receive responses under the lock.
         let mut ws_guard = self.ws.lock().await;
         let ws = match ws_guard.as_mut() {
             Some(ws) => ws,
             None => {
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     "WebSocket not connected. Call connect() first.".to_string(),
                     false,
                 )));
@@ -373,8 +372,7 @@ impl LmntTTSService {
 
         // Send text message.
         if let Err(e) = ws.send(WsMessage::Text(text_json)).await {
-            *ws_guard = None; // Invalidate broken connection for reconnection
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS text request over WebSocket: {e}"),
                 false,
             )));
@@ -383,8 +381,7 @@ impl LmntTTSService {
 
         // Send EOF message to flush synthesis.
         if let Err(e) = ws.send(WsMessage::Text(eof_json)).await {
-            *ws_guard = None; // Invalidate broken connection for reconnection
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS EOF request over WebSocket: {e}"),
                 false,
             )));
@@ -392,7 +389,9 @@ impl LmntTTSService {
         }
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         tracing::debug!(
             service = %self.base.name(),
@@ -402,25 +401,22 @@ impl LmntTTSService {
         );
 
         // Read messages until we get a done signal or connection closes.
-        let mut ws_broken = false;
         loop {
             let msg = match ws.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
-                    ws_broken = true;
-                    frames.push(Arc::new(ErrorFrame::new(
+                    frames.push(FrameEnum::Error(ErrorFrame::new(
                         format!("WebSocket receive error: {e}"),
                         false,
                     )));
                     break;
                 }
                 None => {
-                    // Connection closed unexpectedly.
-                    ws_broken = true;
-                    frames.push(Arc::new(ErrorFrame::new(
-                        "WebSocket connection closed unexpectedly".to_string(),
-                        false,
-                    )));
+                    // Connection closed.
+                    tracing::debug!(
+                        service = %self.base.name(),
+                        "WebSocket connection closed"
+                    );
                     break;
                 }
             };
@@ -431,10 +427,10 @@ impl LmntTTSService {
                     if !data.is_empty() {
                         if !got_first_audio {
                             got_first_audio = true;
-                            actual_ttfb = ttfb_start.elapsed();
+                            let ttfb = ttfb_start.elapsed();
                             tracing::debug!(
                                 service = %self.base.name(),
-                                ttfb_ms = %actual_ttfb.as_millis(),
+                                ttfb_ms = %ttfb.as_millis(),
                                 "Time to first byte"
                             );
                         }
@@ -444,7 +440,7 @@ impl LmntTTSService {
                             1, // mono
                         );
                         audio_frame.context_id = Some(context_id.clone());
-                        frames.push(Arc::new(audio_frame));
+                        frames.push(audio_frame.into());
                     }
                 }
                 WsMessage::Text(text_data) => {
@@ -459,7 +455,7 @@ impl LmntTTSService {
                                     error = %error,
                                     "LMNT WebSocket error"
                                 );
-                                frames.push(Arc::new(ErrorFrame::new(
+                                frames.push(FrameEnum::Error(ErrorFrame::new(
                                     format!("LMNT error: {error}"),
                                     false,
                                 )));
@@ -486,7 +482,7 @@ impl LmntTTSService {
                                         error = %error_detail,
                                         "LMNT WebSocket error"
                                     );
-                                    frames.push(Arc::new(ErrorFrame::new(
+                                    frames.push(FrameEnum::Error(ErrorFrame::new(
                                         format!("LMNT error: {error_detail}"),
                                         false,
                                     )));
@@ -527,7 +523,6 @@ impl LmntTTSService {
                     }
                 }
                 WsMessage::Close(_) => {
-                    ws_broken = true;
                     tracing::debug!(
                         service = %self.base.name(),
                         "WebSocket closed by server"
@@ -538,19 +533,17 @@ impl LmntTTSService {
             }
         }
 
-        // Invalidate broken connection so connect() can reconnect.
-        if ws_broken {
-            *ws_guard = None;
-        }
-
-        // Record metrics using the actual time-to-first-byte, not total time.
+        // Record metrics.
+        let ttfb = ttfb_start.elapsed();
         self.last_metrics = Some(LmntTTSMetrics {
-            ttfb_ms: actual_ttfb.as_secs_f64() * 1000.0,
+            ttfb_ms: ttfb.as_secs_f64() * 1000.0,
             character_count: text.len(),
         });
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -598,7 +591,7 @@ impl FrameProcessor for LmntTTSService {
             );
             let result_frames = self.run_tts(&text_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if let Some(speak_frame) = any.downcast_ref::<TTSSpeakFrame>() {
             tracing::debug!(
@@ -608,7 +601,7 @@ impl FrameProcessor for LmntTTSService {
             );
             let result_frames = self.run_tts(&speak_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
             || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
@@ -619,10 +612,6 @@ impl FrameProcessor for LmntTTSService {
             // Pass all other frames through in their original direction.
             self.push_frame(frame, direction).await;
         }
-    }
-
-    async fn cleanup(&mut self) {
-        self.disconnect().await;
     }
 }
 
@@ -649,7 +638,7 @@ impl TTSService for LmntTTSService {
     /// calling this method. Returns `TTSStartedFrame`, zero or more
     /// `TTSAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
     /// `ErrorFrame` is included in the returned vector.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (WebSocket)");
         self.run_tts_ws(text).await
     }
@@ -758,16 +747,18 @@ impl LmntHttpTTSService {
     }
 
     /// Perform a TTS request via the HTTP API.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = self.build_request_body(text);
         let url = format!("{}/v1/ai/speech", self.base_url);
         let ttfb_start = Instant::now();
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let response = self
             .client
@@ -793,7 +784,7 @@ impl LmntHttpTTSService {
                     let error_text = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
                     let error_msg = format!("LMNT API returned status {status}: {error_text}");
                     tracing::error!(service = %self.base.name(), "{}", error_msg);
-                    frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                    frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                 } else {
                     match resp.bytes().await {
                         Ok(audio_data) => {
@@ -814,12 +805,12 @@ impl LmntHttpTTSService {
                                 1, // mono
                             );
                             audio_frame.context_id = Some(context_id.clone());
-                            frames.push(Arc::new(audio_frame));
+                            frames.push(audio_frame.into());
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
                             tracing::error!(service = %self.base.name(), "{}", error_msg);
-                            frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                            frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                         }
                     }
                 }
@@ -827,12 +818,14 @@ impl LmntHttpTTSService {
             Err(e) => {
                 let error_msg = format!("HTTP request to LMNT failed: {e}");
                 tracing::error!(service = %self.base.name(), "{}", error_msg);
-                frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
             }
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -881,7 +874,7 @@ impl FrameProcessor for LmntHttpTTSService {
             );
             let result_frames = self.run_tts(&text_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if let Some(speak_frame) = any.downcast_ref::<TTSSpeakFrame>() {
             tracing::debug!(
@@ -891,7 +884,7 @@ impl FrameProcessor for LmntHttpTTSService {
             );
             let result_frames = self.run_tts(&speak_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
             || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
@@ -919,7 +912,7 @@ impl TTSService for LmntHttpTTSService {
     /// Makes a `POST` request to `/v1/ai/speech` and returns the complete audio
     /// as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame` and
     /// `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (HTTP)");
         self.run_tts_http(text).await
     }
@@ -1238,10 +1231,11 @@ mod tests {
         // Should get an ErrorFrame because WebSocket is not connected.
         assert!(!frames.is_empty());
         let error_found = frames.iter().any(|f| {
-            f.as_any()
-                .downcast_ref::<ErrorFrame>()
-                .map(|e| e.error.contains("WebSocket not connected"))
-                .unwrap_or(false)
+            if let FrameEnum::Error(e) = f {
+                e.error.contains("WebSocket not connected")
+            } else {
+                false
+            }
         });
         assert!(
             error_found,

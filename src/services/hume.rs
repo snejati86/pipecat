@@ -37,9 +37,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
-use crate::audio::codec::strip_wav_header;
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
+    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
     OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
 use crate::impl_base_display;
@@ -54,6 +53,15 @@ use crate::services::{AIService, TTSService};
 fn generate_context_id() -> String {
     crate::utils::helpers::generate_unique_id("hume-tts-ctx")
 }
+
+// ---------------------------------------------------------------------------
+// WAV header constants
+// ---------------------------------------------------------------------------
+
+/// Standard WAV file header size in bytes.
+/// WAV headers consist of: RIFF chunk (12 bytes) + fmt sub-chunk (24 bytes)
+/// + data sub-chunk header (8 bytes) = 44 bytes total.
+const WAV_HEADER_SIZE: usize = 44;
 
 // ---------------------------------------------------------------------------
 // Hume AI TTS API types
@@ -137,6 +145,27 @@ pub struct HumeErrorResponse {
     /// Error type/code.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// WAV header stripping
+// ---------------------------------------------------------------------------
+
+/// Strip the WAV header from raw audio data, returning only the PCM payload.
+///
+/// If the data is shorter than the standard 44-byte WAV header, the original
+/// data is returned as-is.
+pub fn strip_wav_header(data: &[u8]) -> &[u8] {
+    if data.len() > WAV_HEADER_SIZE
+        && data.len() >= 4
+        && &data[0..4] == b"RIFF"
+        && data.len() >= 12
+        && &data[8..12] == b"WAVE"
+    {
+        &data[WAV_HEADER_SIZE..]
+    } else {
+        data
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,9 +336,9 @@ impl HumeTTSService {
     }
 
     /// Perform a TTS request via the Hume AI HTTP API and return frames.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = self.build_request(text);
         let url = self.build_url();
@@ -322,7 +351,9 @@ impl HumeTTSService {
         );
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let response = match self
             .client
@@ -336,11 +367,13 @@ impl HumeTTSService {
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Hume AI TTS HTTP request failed");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Hume AI TTS request failed: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -349,11 +382,13 @@ impl HumeTTSService {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
             error!(status = %status, body = %error_body, "Hume AI TTS API error");
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Hume AI TTS API error (HTTP {status}): {error_body}"),
                 false,
             )));
-            frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+            frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                context_id,
+            ))));
             return frames;
         }
 
@@ -362,11 +397,13 @@ impl HumeTTSService {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
                 error!(error = %e, "Failed to read Hume AI TTS response body");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to read response body: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -385,7 +422,7 @@ impl HumeTTSService {
                     sample_rate = self.sample_rate,
                     "Decoded Hume AI TTS audio"
                 );
-                frames.push(Arc::new(OutputAudioRawFrame::new(
+                frames.push(FrameEnum::OutputAudioRaw(OutputAudioRawFrame::new(
                     pcm_data,
                     self.sample_rate,
                     1, // mono
@@ -394,7 +431,9 @@ impl HumeTTSService {
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -611,7 +650,7 @@ impl TTSService for HumeTTSService {
     ///
     /// Returns `TTSStartedFrame`, zero or one `OutputAudioRawFrame`, and
     /// a `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         debug!(
             voice = ?self.voice_name,
             text = %text,
@@ -1124,9 +1163,9 @@ mod tests {
         header.extend_from_slice(&(0u32.to_le_bytes()));
 
         assert_eq!(header.len(), 44);
-        // Exactly 44 bytes with valid RIFF/WAVE, returns empty slice (no PCM data).
+        // Not longer than 44 bytes, so we return as-is.
         let result = strip_wav_header(&header);
-        assert_eq!(result.len(), 0);
+        assert_eq!(result.len(), 44);
     }
 
     #[test]
@@ -1410,18 +1449,12 @@ mod tests {
 
         // Should contain TTSStartedFrame, ErrorFrame, TTSStoppedFrame.
         assert!(!frames.is_empty());
-        let has_error = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<ErrorFrame>().is_some());
+        let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(has_error, "Expected an ErrorFrame on connection failure");
 
         // Should still have started and stopped frames.
-        let has_started = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStartedFrame>().is_some());
-        let has_stopped = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStoppedFrame>().is_some());
+        let has_started = frames.iter().any(|f| matches!(f, FrameEnum::TTSStarted(_)));
+        let has_stopped = frames.iter().any(|f| matches!(f, FrameEnum::TTSStopped(_)));
         assert!(has_started, "Expected TTSStartedFrame even on error");
         assert!(has_stopped, "Expected TTSStoppedFrame even on error");
     }
@@ -1434,7 +1467,13 @@ mod tests {
 
         let error_frame = frames
             .iter()
-            .find_map(|f| f.as_any().downcast_ref::<ErrorFrame>())
+            .find_map(|f| {
+                if let FrameEnum::Error(inner) = f {
+                    Some(inner)
+                } else {
+                    None
+                }
+            })
             .expect("Expected an ErrorFrame");
         assert!(
             error_frame.error.contains("Hume AI TTS request failed"),
