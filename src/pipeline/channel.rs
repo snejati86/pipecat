@@ -20,7 +20,8 @@
 //! - **CancellationToken**: Cooperative cancellation per generation.
 
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -54,23 +55,62 @@ pub struct DirectedFrame {
 ///
 /// System and control frames go to the unbounded priority channel;
 /// data frames go to the bounded data channel.
+///
+/// The `flushing` flag enables pipeline-wide interruption support: when set,
+/// data frames are silently dropped while system/control frames still pass
+/// through. This prevents stale data from being sent downstream while an
+/// interruption is being processed.
 #[derive(Clone)]
 pub struct PrioritySender {
     priority_tx: mpsc::UnboundedSender<DirectedFrame>,
     data_tx: mpsc::Sender<DirectedFrame>,
+    flushing: Arc<AtomicBool>,
 }
 
 impl PrioritySender {
     /// Send a frame, routing to priority or data channel based on frame kind.
+    ///
+    /// System and control frames always pass through, even during a flush.
+    /// Data frames are silently dropped when the flush flag is set, UNLESS
+    /// they are uninterruptible (e.g., `FunctionCallResultFrame`, `ErrorFrame`).
     pub async fn send(&self, frame: FrameEnum, direction: FrameDirection) {
         let directed = DirectedFrame { frame, direction };
         if matches!(directed.frame.kind(), FrameKind::System | FrameKind::Control) {
             if self.priority_tx.send(directed).is_err() {
                 tracing::warn!("PrioritySender: priority receiver dropped, frame lost");
             }
-        } else if self.data_tx.send(directed).await.is_err() {
-            tracing::warn!("PrioritySender: data receiver dropped, frame lost");
+        } else {
+            // Single-writer invariant: only the processor task loop calls
+            // start_flush/stop_flush, so Acquire/Release ordering is sufficient.
+            if self.flushing.load(Ordering::Acquire) && !directed.frame.is_uninterruptible() {
+                tracing::trace!(
+                    frame = %directed.frame,
+                    "PrioritySender: dropping data frame during flush"
+                );
+                return;
+            }
+            if self.data_tx.send(directed).await.is_err() {
+                tracing::warn!("PrioritySender: data receiver dropped, frame lost");
+            }
         }
+    }
+
+    /// Begin flushing: interruptible data frames sent via `send()` will be silently dropped.
+    ///
+    /// System/control frames and uninterruptible data frames always pass through.
+    /// Calling this while already flushing is a no-op (idempotent).
+    pub fn start_flush(&self) {
+        self.flushing.store(true, Ordering::Release);
+    }
+
+    /// Stop flushing: data frames will flow normally again.
+    pub fn stop_flush(&self) {
+        self.flushing.store(false, Ordering::Release);
+    }
+
+    /// Returns `true` if the sender is currently in flush mode.
+    pub fn is_flushing(&self) -> bool {
+        self.flushing.load(Ordering::Acquire)
     }
 }
 
@@ -136,6 +176,7 @@ fn priority_channel(data_capacity: usize) -> (PrioritySender, PriorityReceiver) 
         PrioritySender {
             priority_tx,
             data_tx,
+            flushing: Arc::new(AtomicBool::new(false)),
         },
         PriorityReceiver {
             priority_rx,
@@ -362,6 +403,12 @@ impl ChannelPipeline {
                         match result {
                             MonitorResult::Cancelled => break 'outer,
                             MonitorResult::Interrupted(int_frame) => {
+                                // Activate flush: any background tasks pushing
+                                // data frames through this sender will have them
+                                // silently dropped until we finish processing the
+                                // interruption.
+                                downstream_tx.start_flush();
+
                                 // Drain stale context output selectively
                                 let mut ctx_discarded = 0usize;
                                 while let Ok(frame) = ctx_down_rx.try_recv() {
@@ -417,13 +464,22 @@ impl ChannelPipeline {
                                     &ctx,
                                 ).await;
 
-                                // Drain context output from interruption dispatch
+                                // Drain context output from interruption dispatch.
+                                // NOTE: Flush is still active here by design. Any
+                                // interruptible data frames emitted during InterruptionFrame
+                                // processing will be dropped by the flush gate. This is
+                                // intentional — the processor should only emit control/system
+                                // frames during interruption handling.
                                 while let Ok(frame) = ctx_down_rx.try_recv() {
                                     downstream_tx.send(frame, FrameDirection::Downstream).await;
                                 }
                                 while let Ok(frame) = ctx_up_rx.try_recv() {
                                     upstream_tx.send(frame, FrameDirection::Upstream).await;
                                 }
+
+                                // Deactivate flush: interruption processing is
+                                // complete, data frames may flow normally again.
+                                downstream_tx.stop_flush();
 
                                 // Re-dispatch any buffered priority frames
                                 for pf in buffered_priority.drain(..) {
@@ -1157,5 +1213,149 @@ mod tests {
         );
 
         pipeline.shutdown().await;
+    }
+
+    // -- PrioritySender flush flag tests --------------------------------------
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_drops_data() {
+        let (tx, mut rx) = priority_channel(64);
+
+        // Start flushing
+        tx.start_flush();
+        assert!(tx.is_flushing());
+
+        // Send a data frame (TextFrame is Data kind)
+        tx.send(FrameEnum::Text(TextFrame::new("should be dropped")), FrameDirection::Downstream).await;
+
+        // The data frame should NOT be received (channel should be empty)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_err(), "Data frame should have been dropped during flush, but was received");
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_passes_system() {
+        use crate::frames::InterruptionFrame;
+
+        let (tx, mut rx) = priority_channel(64);
+
+        // Start flushing
+        tx.start_flush();
+        assert!(tx.is_flushing());
+
+        // Send a system frame (InterruptionFrame is System kind)
+        tx.send(
+            FrameEnum::Interruption(InterruptionFrame::new()),
+            FrameDirection::Downstream,
+        ).await;
+
+        // The system frame SHOULD be received even during flush
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "System frame should pass through during flush");
+        let directed = result.unwrap().expect("channel should not be closed");
+        assert!(
+            matches!(directed.frame, FrameEnum::Interruption(_)),
+            "Expected InterruptionFrame, got {}",
+            directed.frame.name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_toggle() {
+        let (tx, mut rx) = priority_channel(64);
+
+        // Phase 1: flush is active — data frames are dropped
+        tx.start_flush();
+        tx.send(FrameEnum::Text(TextFrame::new("dropped")), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_err(), "Data frame should be dropped while flushing");
+
+        // Phase 2: stop flush — data frames flow normally
+        tx.stop_flush();
+        assert!(!tx.is_flushing());
+
+        tx.send(FrameEnum::Text(TextFrame::new("hello")), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "Data frame should flow after flush is stopped");
+        let directed = result.unwrap().expect("channel should not be closed");
+        match directed.frame {
+            FrameEnum::Text(text) => assert_eq!(text.text, "hello"),
+            other => panic!("Expected TextFrame, got {}", other.name()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_preserves_uninterruptible_data() {
+        use crate::frames::{FunctionCallResultFrame, ErrorFrame};
+
+        let (tx, mut rx) = priority_channel(64);
+        tx.start_flush();
+
+        // FunctionCallResultFrame is FrameKind::Data but is_uninterruptible() == true.
+        // It must NOT be dropped during flush.
+        let result_frame = FunctionCallResultFrame::new(
+            "test_fn".to_string(),
+            "call_123".to_string(),
+            serde_json::json!({"arg": "val"}),
+            serde_json::json!({"status": "ok"}),
+        );
+        tx.send(FrameEnum::FunctionCallResult(result_frame), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "Uninterruptible data frame must NOT be dropped during flush");
+
+        // ErrorFrame is FrameKind::System, so it takes the priority channel
+        // path and bypasses the flush gate entirely (same as StartFrame, etc.).
+        // This verifies that System-kind frames are not affected by flush.
+        tx.send(
+            FrameEnum::Error(ErrorFrame::new("test error", false)),
+            FrameDirection::Downstream,
+        ).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "System-kind ErrorFrame must pass through during flush");
+
+        // Regular data frame should still be dropped.
+        tx.send(FrameEnum::Text(TextFrame::new("should drop")), FrameDirection::Downstream).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_err(), "Regular data frame should be dropped during flush");
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_passes_control() {
+        let (tx, mut rx) = priority_channel(64);
+        tx.start_flush();
+
+        // EndFrame is FrameKind::Control — must pass through during flush.
+        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "Control frame should pass through during flush");
+        assert!(matches!(result.unwrap().unwrap().frame, FrameEnum::End(_)));
     }
 }
