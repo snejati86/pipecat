@@ -9,15 +9,18 @@
 
 pub use std::sync::Arc;
 
+pub use async_trait::async_trait;
+
 pub use crate::frames::{
-    AudioRawData, CancelFrame, EndFrame, ErrorFrame, ExtensionFrame, Frame, FrameEnum, FrameKind,
-    FrameRef, InputAudioRawFrame, InterimTranscriptionFrame, InterruptionFrame,
+    AudioRawData, CancelFrame, EndFrame, ErrorFrame, ExtensionFrame, Frame, FrameEnum, FrameFields,
+    FrameKind, FrameRef, InputAudioRawFrame, InterimTranscriptionFrame, InterruptionFrame,
     LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMTextFrame,
     MetricsFrame, OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame,
     TTSStoppedFrame, TextFrame, TranscriptionFrame, UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 };
-
+pub use crate::impl_base_debug_display;
+pub use crate::impl_processor;
 pub use crate::observers::Observer;
 pub use crate::pipeline::ChannelPipeline;
 pub use crate::processors::aggregators::context_aggregator_pair::LLMContextAggregatorPair;
@@ -28,6 +31,7 @@ pub use crate::processors::{FrameDirection, Processor, ProcessorContext, Process
 pub use crate::serializers::{FrameSerializer, SerializedFrame};
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
 pub use crate::turns::user_start::vad_strategy::VADUserTurnStartStrategy;
+pub use crate::utils::base_object::obj_id;
 
 #[cfg(feature = "silero-vad")]
 pub use crate::audio::vad::VADParams;
