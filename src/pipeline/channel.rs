@@ -71,7 +71,8 @@ impl PrioritySender {
     /// Send a frame, routing to priority or data channel based on frame kind.
     ///
     /// System and control frames always pass through, even during a flush.
-    /// Data frames are silently dropped when the flush flag is set.
+    /// Data frames are silently dropped when the flush flag is set, UNLESS
+    /// they are uninterruptible (e.g., `FunctionCallResultFrame`, `ErrorFrame`).
     pub async fn send(&self, frame: FrameEnum, direction: FrameDirection) {
         let directed = DirectedFrame { frame, direction };
         if matches!(directed.frame.kind(), FrameKind::System | FrameKind::Control) {
@@ -79,7 +80,9 @@ impl PrioritySender {
                 tracing::warn!("PrioritySender: priority receiver dropped, frame lost");
             }
         } else {
-            if self.flushing.load(Ordering::Acquire) {
+            // Single-writer invariant: only the processor task loop calls
+            // start_flush/stop_flush, so Acquire/Release ordering is sufficient.
+            if self.flushing.load(Ordering::Acquire) && !directed.frame.is_uninterruptible() {
                 tracing::trace!(
                     frame = %directed.frame,
                     "PrioritySender: dropping data frame during flush"
@@ -92,9 +95,10 @@ impl PrioritySender {
         }
     }
 
-    /// Begin flushing: data frames sent via `send()` will be silently dropped.
+    /// Begin flushing: interruptible data frames sent via `send()` will be silently dropped.
     ///
-    /// System and control frames are unaffected and always pass through.
+    /// System/control frames and uninterruptible data frames always pass through.
+    /// Calling this while already flushing is a no-op (idempotent).
     pub fn start_flush(&self) {
         self.flushing.store(true, Ordering::Release);
     }
@@ -1287,5 +1291,64 @@ mod tests {
             FrameEnum::Text(text) => assert_eq!(text.text, "hello"),
             other => panic!("Expected TextFrame, got {}", other.name()),
         }
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_preserves_uninterruptible_data() {
+        use crate::frames::{FunctionCallResultFrame, ErrorFrame};
+
+        let (tx, mut rx) = priority_channel(64);
+        tx.start_flush();
+
+        // FunctionCallResultFrame is FrameKind::Data but is_uninterruptible() == true.
+        // It must NOT be dropped during flush.
+        let result_frame = FunctionCallResultFrame::new(
+            "test_fn".to_string(),
+            "call_123".to_string(),
+            serde_json::json!({"arg": "val"}),
+            serde_json::json!({"status": "ok"}),
+        );
+        tx.send(FrameEnum::FunctionCallResult(result_frame), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "Uninterruptible data frame must NOT be dropped during flush");
+
+        // ErrorFrame is also uninterruptible — verify it passes through too.
+        tx.send(
+            FrameEnum::Error(ErrorFrame::new("test error", false)),
+            FrameDirection::Downstream,
+        ).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "ErrorFrame must NOT be dropped during flush");
+
+        // Regular data frame should still be dropped.
+        tx.send(FrameEnum::Text(TextFrame::new("should drop")), FrameDirection::Downstream).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_err(), "Regular data frame should be dropped during flush");
+    }
+
+    #[tokio::test]
+    async fn test_priority_sender_flush_passes_control() {
+        let (tx, mut rx) = priority_channel(64);
+        tx.start_flush();
+
+        // EndFrame is FrameKind::Control — must pass through during flush.
+        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        ).await;
+        assert!(result.is_ok(), "Control frame should pass through during flush");
+        assert!(matches!(result.unwrap().unwrap().frame, FrameEnum::End(_)));
     }
 }
