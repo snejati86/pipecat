@@ -257,6 +257,44 @@ type CartesiaWsReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream
 // CartesiaTTSService (WebSocket streaming)
 // ---------------------------------------------------------------------------
 
+/// Connection state for [`CartesiaTTSService`].
+///
+/// Tracks the WebSocket connection lifecycle and associated channel resources.
+/// Transitions:
+/// - `Disconnected` -> `PipelinePending` (when process() captures pipeline senders)
+/// - `PipelinePending` -> `Pipeline` (when WebSocket connects in pipeline mode)
+/// - `Disconnected` -> `Standalone` (when connect() is called without pipeline senders)
+/// - `Pipeline` | `Standalone` | `PipelinePending` -> `Disconnected` (on disconnect/cleanup)
+enum CartesiaConnection {
+    /// Not connected. Initial state.
+    Disconnected,
+    /// Pipeline senders captured from ProcessorContext, but WebSocket not yet connected.
+    /// This state occurs between the first `process()` call and the actual WebSocket connect.
+    PipelinePending {
+        down_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+        up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+    },
+    /// Connected in pipeline mode -- WS reader pushes directly to pipeline channels.
+    ///
+    /// The `down_tx`/`up_tx` fields are retained to keep the sender halves alive
+    /// for the duration of the connection (the reader task holds its own clones,
+    /// but we keep these so the channel stays open if the task exits early).
+    Pipeline {
+        ws_sender: Arc<Mutex<CartesiaWsSink>>,
+        ws_reader_task: JoinHandle<()>,
+        #[allow(dead_code)]
+        down_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+        #[allow(dead_code)]
+        up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+    },
+    /// Connected in standalone mode -- WS reader pushes to a local channel.
+    Standalone {
+        ws_sender: Arc<Mutex<CartesiaWsSink>>,
+        ws_reader_task: JoinHandle<()>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<FrameEnum>,
+    },
+}
+
 /// Cartesia TTS service using WebSocket streaming.
 ///
 /// Connects to Cartesia's WebSocket API and streams audio chunks as they are
@@ -278,17 +316,8 @@ pub struct CartesiaTTSService {
     ws_url: String,
     params: CartesiaInputParams,
 
-    // -- Split WebSocket --
-    ws_sender: Option<Arc<Mutex<CartesiaWsSink>>>,
-    ws_reader_task: Option<JoinHandle<()>>,
-
-    // -- Pipeline mode: WS reader pushes directly to pipeline ctx channels --
-    // Captured from ProcessorContext on first process() call.
-    pipeline_down_tx: Option<tokio::sync::mpsc::UnboundedSender<FrameEnum>>,
-    pipeline_up_tx: Option<tokio::sync::mpsc::UnboundedSender<FrameEnum>>,
-
-    // -- Standalone mode (run_tts): WS reader pushes to a local channel --
-    standalone_rx: Option<tokio::sync::mpsc::UnboundedReceiver<FrameEnum>>,
+    /// WebSocket connection state (disconnected, pipeline, or standalone).
+    connection: CartesiaConnection,
 
     // -- TTS request serialization --
     // Shared with ws_reader_loop so it can send the next queued request on "done".
@@ -323,11 +352,7 @@ impl CartesiaTTSService {
             cartesia_version: "2025-04-16".to_string(),
             ws_url: "wss://api.cartesia.ai/tts/websocket".to_string(),
             params: CartesiaInputParams::default(),
-            ws_sender: None,
-            ws_reader_task: None,
-            pipeline_down_tx: None,
-            pipeline_up_tx: None,
-            standalone_rx: None,
+            connection: CartesiaConnection::Disconnected,
             queue_state: Arc::new(tokio::sync::Mutex::new(TtsQueueState {
                 pending: VecDeque::new(),
                 in_flight: false,
@@ -393,20 +418,32 @@ impl CartesiaTTSService {
         self
     }
 
-    /// Internal connect that takes explicit output senders for the WS reader.
+    /// Returns true if a WebSocket connection is currently established.
+    fn is_connected(&self) -> bool {
+        matches!(
+            self.connection,
+            CartesiaConnection::Pipeline { .. } | CartesiaConnection::Standalone { .. }
+        )
+    }
+
+    /// Returns a clone of the WebSocket sender if connected (Pipeline or Standalone).
+    fn ws_sender(&self) -> Option<Arc<Mutex<CartesiaWsSink>>> {
+        match &self.connection {
+            CartesiaConnection::Pipeline { ws_sender, .. }
+            | CartesiaConnection::Standalone { ws_sender, .. } => Some(ws_sender.clone()),
+            _ => None,
+        }
+    }
+
+    /// Internal connect: establishes WebSocket and spawns reader task.
     ///
-    /// Audio/TTSStopped frames go to `down_tx`; errors go to `up_tx`.
-    /// In pipeline mode these are the pipeline's context channels (so audio
-    /// flows downstream immediately). In standalone mode they're temp channels.
-    async fn connect_with_output(
-        &mut self,
+    /// Returns `(ws_sender, ws_reader_task)` on success. Callers construct
+    /// the appropriate `CartesiaConnection` variant from these resources.
+    async fn open_websocket(
+        &self,
         down_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
         up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
-    ) -> Result<(), String> {
-        if self.ws_sender.is_some() {
-            return Ok(());
-        }
-
+    ) -> Result<(Arc<Mutex<CartesiaWsSink>>, JoinHandle<()>), String> {
         let url = format!(
             "{}?api_key={}&cartesia_version={}",
             self.ws_url, self.api_key, self.cartesia_version
@@ -437,13 +474,13 @@ impl CartesiaTTSService {
         };
 
         let (sink, stream) = ws_stream.split();
-        self.ws_sender = Some(Arc::new(Mutex::new(sink)));
+        let ws_sender = Arc::new(Mutex::new(sink));
 
         let name = self.name.clone();
         let sample_rate = self.sample_rate;
         let queue_state = self.queue_state.clone();
-        let ws_sender_for_reader = self.ws_sender.as_ref().unwrap().clone();
-        self.ws_reader_task = Some(tokio::spawn(async move {
+        let ws_sender_for_reader = ws_sender.clone();
+        let ws_reader_task = tokio::spawn(async move {
             Self::ws_reader_loop(
                 stream,
                 down_tx,
@@ -454,27 +491,52 @@ impl CartesiaTTSService {
                 ws_sender_for_reader,
             )
             .await;
-        }));
+        });
 
-        Ok(())
+        Ok((ws_sender, ws_reader_task))
     }
 
     /// Connect using pipeline context channels (for use within process()).
     ///
-    /// Requires `pipeline_down_tx`/`pipeline_up_tx` to be set first
-    /// (captured from ProcessorContext on first process() call).
+    /// Requires the connection to be in `PipelinePending` state (pipeline senders
+    /// captured from ProcessorContext on first process() call).
     async fn connect_pipeline(&mut self) -> Result<(), String> {
-        let down_tx = self
-            .pipeline_down_tx
-            .as_ref()
-            .ok_or("connect_pipeline called before pipeline senders captured")?
-            .clone();
-        let up_tx = self
-            .pipeline_up_tx
-            .as_ref()
-            .ok_or("connect_pipeline called before pipeline senders captured")?
-            .clone();
-        self.connect_with_output(down_tx, up_tx).await
+        if self.is_connected() {
+            return Ok(());
+        }
+        // Take pipeline senders from PipelinePending state.
+        let (down_tx, up_tx) = match std::mem::replace(
+            &mut self.connection,
+            CartesiaConnection::Disconnected,
+        ) {
+            CartesiaConnection::PipelinePending { down_tx, up_tx } => (down_tx, up_tx),
+            CartesiaConnection::Pipeline { .. } | CartesiaConnection::Standalone { .. } => {
+                // Already connected -- should not reach here due to is_connected() guard.
+                return Ok(());
+            }
+            CartesiaConnection::Disconnected => {
+                return Err(
+                    "connect_pipeline called before pipeline senders captured".to_string(),
+                );
+            }
+        };
+
+        match self.open_websocket(down_tx.clone(), up_tx.clone()).await {
+            Ok((ws_sender, ws_reader_task)) => {
+                self.connection = CartesiaConnection::Pipeline {
+                    ws_sender,
+                    ws_reader_task,
+                    down_tx,
+                    up_tx,
+                };
+                Ok(())
+            }
+            Err(e) => {
+                // Restore PipelinePending so senders aren't lost.
+                self.connection = CartesiaConnection::PipelinePending { down_tx, up_tx };
+                Err(e)
+            }
+        }
     }
 
     /// Establish the WebSocket connection to Cartesia.
@@ -483,21 +545,54 @@ impl CartesiaTTSService {
     /// audio directly to the pipeline. In standalone mode (before any process()
     /// call), creates a local channel for use with `run_tts()`.
     pub async fn connect(&mut self) -> Result<(), String> {
-        if self.pipeline_down_tx.is_some() {
+        if self.is_connected() {
+            return Ok(());
+        }
+        if matches!(
+            self.connection,
+            CartesiaConnection::PipelinePending { .. } | CartesiaConnection::Pipeline { .. }
+        ) {
             return self.connect_pipeline().await;
         }
         // Standalone mode: create temporary channels.
-        // Clone down_tx as the up_tx so errors also arrive on standalone_rx
+        // Clone down_tx as the up_tx so errors also arrive on standalone rx
         // (there's no pipeline to propagate upstream to).
         let (down_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let up_tx = down_tx.clone();
-        self.standalone_rx = Some(rx);
-        self.connect_with_output(down_tx, up_tx).await
+        let (ws_sender, ws_reader_task) = self.open_websocket(down_tx, up_tx).await?;
+        self.connection = CartesiaConnection::Standalone {
+            ws_sender,
+            ws_reader_task,
+            rx,
+        };
+        Ok(())
     }
 
     /// Disconnect the WebSocket connection and stop the reader task.
+    ///
+    /// Transitions from any connected state to `Disconnected`.
     pub async fn disconnect(&mut self) {
-        if let Some(sender) = self.ws_sender.take() {
+        // Take ownership of the current connection state.
+        let prev = std::mem::replace(&mut self.connection, CartesiaConnection::Disconnected);
+
+        // Extract ws_sender and ws_reader_task from connected variants.
+        let (ws_sender, ws_reader_task) = match prev {
+            CartesiaConnection::Pipeline {
+                ws_sender,
+                ws_reader_task,
+                ..
+            } => (Some(ws_sender), Some(ws_reader_task)),
+            CartesiaConnection::Standalone {
+                ws_sender,
+                ws_reader_task,
+                ..
+            } => (Some(ws_sender), Some(ws_reader_task)),
+            CartesiaConnection::PipelinePending { .. } | CartesiaConnection::Disconnected => {
+                (None, None)
+            }
+        };
+
+        if let Some(sender) = ws_sender {
             tracing::debug!(service = %self.name, "Disconnecting from Cartesia WebSocket");
             let mut sink = sender.lock().await;
             if let Err(e) = sink.close().await {
@@ -505,7 +600,7 @@ impl CartesiaTTSService {
             }
         }
 
-        if let Some(handle) = self.ws_reader_task.take() {
+        if let Some(handle) = ws_reader_task {
             let abort_handle = handle.abort_handle();
             let timeout_result =
                 tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
@@ -535,7 +630,7 @@ impl CartesiaTTSService {
 
     /// Cancel an active WebSocket context (e.g., on interruption).
     async fn send_cancel(&self, context_id: &str) {
-        if let Some(ref sender) = self.ws_sender {
+        if let Some(sender) = self.ws_sender() {
             let cancel = CartesiaWsCancelRequest {
                 context_id: context_id.to_string(),
                 cancel: true,
@@ -737,7 +832,7 @@ impl CartesiaTTSService {
     /// reader task and flow directly to the pipeline (no drain needed).
     async fn send_tts_request(&mut self, text: &str, ctx: &ProcessorContext) {
         // Auto-connect if needed (pipeline mode).
-        if self.ws_sender.is_none() {
+        if !self.is_connected() {
             if let Err(e) = self.connect_pipeline().await {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to auto-connect Cartesia WebSocket: {e}"),
@@ -800,12 +895,9 @@ impl CartesiaTTSService {
             return;
         }
 
-        // No request in-flight — send immediately via the split sink.
-        let send_result = match self.ws_sender.as_ref() {
-            Some(sender) => {
-                let mut sink = sender.lock().await;
-                sink.send(WsMessage::Text(request_json)).await
-            }
+        // No request in-flight -- send immediately via the split sink.
+        let sender = match self.ws_sender() {
+            Some(s) => s,
             None => {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     "Cartesia WebSocket disconnected before send".to_string(),
@@ -814,10 +906,14 @@ impl CartesiaTTSService {
                 return;
             }
         };
+        let send_result = {
+            let mut sink = sender.lock().await;
+            sink.send(WsMessage::Text(request_json)).await
+        };
 
         if let Err(e) = send_result {
             tracing::error!(service = %self.name, "Failed to send TTS request: {e}");
-            self.ws_sender = None;
+            self.connection = CartesiaConnection::Disconnected;
             ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
@@ -855,7 +951,7 @@ impl fmt::Debug for CartesiaTTSService {
             .field("model", &self.model)
             .field("sample_rate", &self.sample_rate)
             .field("encoding", &self.encoding)
-            .field("connected", &self.ws_sender.is_some())
+            .field("connected", &self.is_connected())
             .finish()
     }
 }
@@ -900,14 +996,18 @@ impl Processor for CartesiaTTSService {
     ) {
         // Capture pipeline senders on first call so WS reader can push
         // audio directly into the pipeline without going through process().
-        if self.pipeline_down_tx.is_none() {
-            self.pipeline_down_tx = Some(ctx.downstream_sender());
-            self.pipeline_up_tx = Some(ctx.upstream_sender());
-            // If already connected with standalone senders, reconnect
-            // so the WS reader uses pipeline channels.
-            if self.ws_sender.is_some() {
+        if matches!(
+            self.connection,
+            CartesiaConnection::Disconnected | CartesiaConnection::Standalone { .. }
+        ) {
+            let down_tx = ctx.downstream_sender();
+            let up_tx = ctx.upstream_sender();
+            // If already connected with standalone senders, disconnect first
+            // so the WS reader will use pipeline channels on reconnect.
+            if self.is_connected() {
                 self.disconnect().await;
             }
+            self.connection = CartesiaConnection::PipelinePending { down_tx, up_tx };
         }
 
         match frame {
@@ -936,7 +1036,7 @@ impl Processor for CartesiaTTSService {
                 ctx.send_downstream(frame);
             }
             FrameEnum::Start(_) => {
-                if self.ws_sender.is_none() {
+                if !self.is_connected() {
                     if let Err(e) = self.connect_pipeline().await {
                         ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                             format!("Cartesia connection failed: {e}"),
@@ -959,9 +1059,8 @@ impl Processor for CartesiaTTSService {
 
     async fn cleanup(&mut self) {
         self.disconnect().await;
-        // Clear pipeline senders so they're re-captured on next pipeline start.
-        self.pipeline_down_tx = None;
-        self.pipeline_up_tx = None;
+        // disconnect() already transitions to Disconnected, clearing all
+        // connection resources including pipeline senders.
     }
 }
 
@@ -990,20 +1089,28 @@ impl TTSService for CartesiaTTSService {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
 
         // Ensure connected in standalone mode with a local channel.
-        if self.ws_sender.is_none() || self.standalone_rx.is_none() {
+        if !matches!(self.connection, CartesiaConnection::Standalone { .. }) {
             self.disconnect().await;
             let (down_tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let up_tx = down_tx.clone();
-            self.standalone_rx = Some(rx);
-            if let Err(e) = self.connect_with_output(down_tx, up_tx).await {
-                return vec![
-                    Arc::new(TTSStartedFrame::new(None)),
-                    Arc::new(ErrorFrame::new(
-                        format!("Cartesia connection failed: {e}"),
-                        false,
-                    )),
-                    Arc::new(TTSStoppedFrame::new(None)),
-                ];
+            match self.open_websocket(down_tx, up_tx).await {
+                Ok((ws_sender, ws_reader_task)) => {
+                    self.connection = CartesiaConnection::Standalone {
+                        ws_sender,
+                        ws_reader_task,
+                        rx,
+                    };
+                }
+                Err(e) => {
+                    return vec![
+                        Arc::new(TTSStartedFrame::new(None)),
+                        Arc::new(ErrorFrame::new(
+                            format!("Cartesia connection failed: {e}"),
+                            false,
+                        )),
+                        Arc::new(TTSStoppedFrame::new(None)),
+                    ];
+                }
             }
         }
 
@@ -1037,12 +1144,8 @@ impl TTSService for CartesiaTTSService {
         };
 
         // Send via sink
-        let send_result = match self.ws_sender.as_ref() {
-            Some(sender) => {
-                let sender = sender.clone();
-                let mut sink = sender.lock().await;
-                sink.send(WsMessage::Text(request_json)).await
-            }
+        let sender = match self.ws_sender() {
+            Some(s) => s,
             None => {
                 return vec![
                     Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
@@ -1054,8 +1157,12 @@ impl TTSService for CartesiaTTSService {
                 ];
             }
         };
+        let send_result = {
+            let mut sink = sender.lock().await;
+            sink.send(WsMessage::Text(request_json)).await
+        };
         if let Err(e) = send_result {
-            self.ws_sender = None;
+            self.connection = CartesiaConnection::Disconnected;
             return vec![
                 Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
                 Arc::new(ErrorFrame::new(
@@ -1069,8 +1176,26 @@ impl TTSService for CartesiaTTSService {
         let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
         frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
 
-        // Poll standalone_rx until TTSStoppedFrame arrives
-        let rx = self.standalone_rx.as_mut().expect("standalone_rx must be set");
+        // Poll standalone_rx until TTSStoppedFrame arrives.
+        // Extract rx from the Standalone variant. If not in Standalone state
+        // (should not happen given the check above), log and return error.
+        let rx = match &mut self.connection {
+            CartesiaConnection::Standalone { rx, .. } => rx,
+            _ => {
+                tracing::error!(
+                    service = %self.name,
+                    "run_tts: expected Standalone connection state"
+                );
+                return vec![
+                    Arc::new(TTSStartedFrame::new(Some(context_id.clone()))),
+                    Arc::new(ErrorFrame::new(
+                        "Internal error: not in standalone connection state".to_string(),
+                        false,
+                    )),
+                    Arc::new(TTSStoppedFrame::new(Some(context_id))),
+                ];
+            }
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
