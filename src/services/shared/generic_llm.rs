@@ -178,6 +178,11 @@ impl<P: LlmProtocol> GenericLlmService<P> {
         }
 
         // --- Emit response-start frame ---
+        // NOTE: If the SSE loop below is interrupted, no matching
+        // LLMFullResponseEndFrame will be emitted. Downstream aggregators
+        // (LLMResponseAggregator, LLMAssistantContextAggregator) rely on the
+        // InterruptionFrame -- dispatched by the pipeline after this method
+        // returns -- to reset their state.
         ctx.send_downstream(FrameEnum::LLMFullResponseStart(
             LLMFullResponseStartFrame::new(),
         ));
@@ -194,7 +199,21 @@ impl<P: LlmProtocol> GenericLlmService<P> {
         let mut sse_parser = SseParser::new();
         let mut byte_stream = response.bytes_stream();
 
-        'stream: while let Some(chunk_result) = byte_stream.next().await {
+        'stream: loop {
+            // Race the next SSE chunk against the interruption token.
+            // If interrupted, break immediately — don't wait for the next chunk.
+            let chunk_result = tokio::select! {
+                biased;
+                _ = ctx.interruption_token().cancelled() => {
+                    debug!("LLM: SSE streaming interrupted");
+                    break 'stream;
+                }
+                chunk = byte_stream.next() => match chunk {
+                    Some(c) => c,
+                    None => break 'stream,
+                },
+            };
+
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
@@ -278,10 +297,24 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                     if !content.is_empty() {
                         tracing::trace!(token = %content, "LLM token");
                         ctx.send_downstream(FrameEnum::LLMText(LLMTextFrame::new(content.clone())));
-
                     }
                 }
+
+                // Belt-and-suspenders: check interruption between SSE events
+                if ctx.is_interrupted() {
+                    debug!("LLM: interrupted between SSE events");
+                    break 'stream;
+                }
             }
+        }
+
+        // If interrupted, skip tool call finalization and response-end emission.
+        // Partial tool calls would be corrupt, and downstream will be reset by
+        // the InterruptionFrame that the pipeline dispatches after this returns.
+        if ctx.is_interrupted() {
+            debug!("LLM: skipping finalization due to interruption");
+            drop(byte_stream); // Explicitly close the HTTP response body
+            return;
         }
 
         // --- Finalize tool calls ---
@@ -433,6 +466,12 @@ impl<P: LlmProtocol> Processor for GenericLlmService<P> {
                     "Function call result received, re-running inference"
                 );
                 self.process_streaming_response(ctx).await;
+            }
+
+            // InterruptionFrame: pass through for further processors.
+            FrameEnum::Interruption(_) => {
+                debug!("LLM: received InterruptionFrame, forwarding");
+                ctx.send(frame, direction);
             }
 
             // Default: pass through in the original direction.

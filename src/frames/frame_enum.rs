@@ -483,16 +483,19 @@ impl FrameEnum {
             | Self::InterimTranscription(_) | Self::FunctionCallResult(_)
             | Self::TTSSpeak(_) | Self::OutputTransportMessage(_)
             | Self::OutputDTMF(_)
-            | Self::Sprite(_) => FrameKind::Data,
+            | Self::Sprite(_)
+            // LLM/TTS sequence delimiters — must maintain FIFO ordering with
+            // their associated data frames (LLMText tokens, TTS audio).
+            | Self::LLMFullResponseStart(_) | Self::LLMFullResponseEnd(_)
+            | Self::TTSStarted(_) | Self::TTSStopped(_) => FrameKind::Data,
 
-            // Control frames — includes LLM pipeline control signals that must not be
-            // blocked behind bounded data channel backpressure
+            // Control frames — lifecycle, configuration, and trigger signals.
+            // Routed to the unbounded priority channel to bypass data backpressure.
             Self::End(_) | Self::Stop(_) | Self::Heartbeat(_)
             | Self::LLMMessagesAppend(_) | Self::LLMMessagesUpdate(_)
             | Self::LLMSetTools(_) | Self::LLMRun(_) | Self::LLMConfigureOutput(_)
             | Self::LLMEnablePromptCaching(_)
-            | Self::LLMFullResponseStart(_) | Self::LLMFullResponseEnd(_)
-            | Self::TTSStarted(_) | Self::TTSStopped(_) | Self::LLMUpdateSettings(_)
+            | Self::LLMUpdateSettings(_)
             | Self::TTSUpdateSettings(_) | Self::STTUpdateSettings(_)
             | Self::VADParamsUpdate(_) | Self::FilterControl(_) | Self::FilterEnable(_)
             | Self::MixerControl(_) | Self::MixerEnable(_)
@@ -512,6 +515,8 @@ impl FrameEnum {
             Self::Start(_)
                 | Self::End(_)
                 | Self::Stop(_)
+                | Self::Error(_)
+                | Self::FatalError(_)
                 | Self::FunctionCallResult(_)
                 | Self::LLMUpdateSettings(_)
                 | Self::TTSUpdateSettings(_)
@@ -1051,6 +1056,10 @@ mod tests {
         let frames: Vec<FrameEnum> = vec![
             TextFrame::new("hi").into(),
             LLMTextFrame::new("tok".into()).into(),
+            LLMFullResponseStartFrame::new().into(),
+            LLMFullResponseEndFrame::new().into(),
+            TTSStartedFrame::new(None).into(),
+            TTSStoppedFrame::new(None).into(),
         ];
         for f in &frames {
             assert_eq!(f.kind(), FrameKind::Data, "Failed for {}", f.name());
@@ -1063,7 +1072,6 @@ mod tests {
             EndFrame::new().into(),
             StopFrame::new().into(),
             HeartbeatFrame::new(0).into(),
-            TTSStartedFrame::new(None).into(),
             LLMRunFrame::new().into(),
         ];
         for f in &frames {
@@ -1076,6 +1084,7 @@ mod tests {
         assert!(FrameEnum::from(StartFrame::default()).is_uninterruptible());
         assert!(FrameEnum::from(EndFrame::new()).is_uninterruptible());
         assert!(FrameEnum::from(StopFrame::new()).is_uninterruptible());
+        assert!(FrameEnum::from(ErrorFrame::new("err", false)).is_uninterruptible());
         assert!(!FrameEnum::from(TextFrame::new("hi")).is_uninterruptible());
         assert!(!FrameEnum::from(HeartbeatFrame::new(0)).is_uninterruptible());
     }

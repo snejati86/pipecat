@@ -20,7 +20,7 @@
 //!                     Audio flows bidirectionally:
 //!
 //! [Twilio WS Input] -> [Silero VAD*] -> [Smart Turn*] -> [Deepgram STT]
-//!        -> [User Context Aggregator] -> [OpenAI LLM] -> [Sentence Aggregator]
+//!        -> [VAD Turn Start] -> [User Context Aggregator] -> [OpenAI LLM] -> [Sentence Aggregator]
 //!        -> [Cartesia TTS] -> [Assistant Context Aggregator] -> [Output]
 //!
 //! * Silero VAD enabled with `--features silero-vad`
@@ -239,7 +239,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     let sentence_aggregator = SentenceAggregator::new();
 
     // Build the pipeline:
-    //   [Mute] -> [VAD] -> [Smart Turn] -> STT -> User Context -> LLM -> Sentence Aggregator -> TTS -> Assistant Context
+    //   [Mute] -> [VAD] -> [Smart Turn] -> STT -> VAD Turn Start -> User Context -> LLM -> Sentence Aggregator -> TTS -> Assistant Context
     let mut processors: Vec<Box<dyn Processor>> = Vec::new();
 
     // Input mute: gates user audio when bot is speaking (echo cancellation)
@@ -263,6 +263,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     }
 
     processors.push(Box::new(stt));
+    processors.push(Box::new(VADUserTurnStartStrategy::new()));
     processors.push(Box::new(pair.user_aggregator));
     processors.push(Box::new(llm));
     processors.push(Box::new(sentence_aggregator));
@@ -429,7 +430,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,pipecat=debug".parse().unwrap()),
+                .unwrap_or_else(|_| "debug,pipecat=trace".parse().unwrap()),
         )
         .init();
 

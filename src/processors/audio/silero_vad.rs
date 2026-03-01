@@ -153,7 +153,7 @@ impl SileroVADProcessor {
     ///
     /// This is factored out of `process` to avoid borrow-checker conflicts
     /// between `self.silero`, `self.sample_buffer`, and `self.state_machine`.
-    async fn run_vad_inference(&mut self, ctx: &ProcessorContext) {
+    fn run_vad_inference(&mut self, ctx: &ProcessorContext) {
         let silero = match self.silero.as_mut() {
             Some(s) => s,
             None => return,
@@ -173,12 +173,10 @@ impl SileroVADProcessor {
 
                             ctx.send_downstream(FrameEnum::UserStartedSpeaking(
                                 UserStartedSpeakingFrame::new(),
-                            ))
-                            .await;
+                            ));
                             ctx.send_downstream(FrameEnum::VADUserStartedSpeaking(
                                 VADUserStartedSpeakingFrame::new(start_secs, ts),
-                            ))
-                            .await;
+                            ));
 
                             tracing::debug!(
                                 "SileroVAD: speech started (prob={:.3})",
@@ -191,12 +189,10 @@ impl SileroVADProcessor {
 
                             ctx.send_downstream(FrameEnum::UserStoppedSpeaking(
                                 UserStoppedSpeakingFrame::new(),
-                            ))
-                            .await;
+                            ));
                             ctx.send_downstream(FrameEnum::VADUserStoppedSpeaking(
                                 VADUserStoppedSpeakingFrame::new(stop_secs, ts),
-                            ))
-                            .await;
+                            ));
 
                             tracing::debug!(
                                 "SileroVAD: speech stopped (prob={:.3})",
@@ -302,7 +298,7 @@ impl Processor for SileroVADProcessor {
                 self.sample_buffer.extend_from_slice(&resampled);
 
                 // Process buffered audio through VAD
-                self.run_vad_inference(ctx).await;
+                self.run_vad_inference(ctx);
 
                 // Always pass audio through
                 ctx.send_downstream(frame);

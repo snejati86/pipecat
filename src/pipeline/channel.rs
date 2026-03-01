@@ -6,9 +6,11 @@
 //! This replaces the mutex-chain approach with mpsc channels between processors.
 //! Key features:
 //!
-//! - **Priority channels**: System/control frames use unbounded channels (checked
-//!   first via `select! { biased; ... }`), ensuring they are never blocked by
-//!   backpressure from data frames.
+//! - **Priority channels**: System and control frames use unbounded channels
+//!   (checked first via `select! { biased; ... }`), ensuring interruptions and
+//!   lifecycle signals are never blocked by backpressure. Data frames use bounded
+//!   channels to preserve FIFO ordering (e.g., LLM tokens must arrive before
+//!   LLMFullResponseEnd).
 //! - **Bounded data channels**: Data frames use bounded channels sized by
 //!   processor weight (Light=32, Standard=64, Heavy=128).
 //! - **Task isolation**: Each processor runs on its own tokio task, enabling true
@@ -17,6 +19,7 @@
 //!   for clean shutdown.
 //! - **CancellationToken**: Cooperative cancellation per generation.
 
+use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
@@ -49,7 +52,7 @@ pub struct DirectedFrame {
 
 /// Sender half of a priority channel pair.
 ///
-/// System/control frames go to the unbounded priority channel;
+/// System and control frames go to the unbounded priority channel;
 /// data frames go to the bounded data channel.
 #[derive(Clone)]
 pub struct PrioritySender {
@@ -86,6 +89,42 @@ impl PriorityReceiver {
             Some(frame) = self.data_rx.recv() => Some(frame),
             else => None,
         }
+    }
+
+    /// Receive the next priority frame only.
+    ///
+    /// This is an async blocking receive on the priority channel only.
+    /// Used by the two-level monitoring loop inside `tokio::select!` to check
+    /// for InterruptionFrame while a Heavy processor's `process()` is running.
+    pub async fn recv_priority(&mut self) -> Option<DirectedFrame> {
+        self.priority_rx.recv().await
+    }
+
+    /// Drain the data channel, preserving uninterruptible frames.
+    ///
+    /// Returns `(preserved_frames, discarded_count)`. Preserved frames are
+    /// those for which `is_uninterruptible()` returns true (e.g.,
+    /// `FunctionCallResultFrame`, settings frames, `ErrorFrame`).
+    pub fn drain_data_selective(&mut self) -> (Vec<DirectedFrame>, usize) {
+        let mut preserved = Vec::new();
+        let mut discarded = 0usize;
+
+        while let Ok(directed) = self.data_rx.try_recv() {
+            if directed.frame.is_uninterruptible() {
+                preserved.push(directed);
+            } else {
+                discarded += 1;
+            }
+        }
+
+        // Also drain priority channel — all priority frames are preserved
+        // unconditionally. They were routed to the priority channel because
+        // they are system/control frames that should not be lost.
+        while let Ok(directed) = self.priority_rx.try_recv() {
+            preserved.push(directed);
+        }
+
+        (preserved, discarded)
     }
 }
 
@@ -126,7 +165,7 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 /// - An input `PriorityReceiver` for frames flowing toward it
 /// - A `ProcessorContext` with senders to push output frames downstream/upstream
 ///
-/// System and control frames bypass data backpressure via unbounded priority channels.
+/// System frames bypass data backpressure via unbounded priority channels.
 pub struct ChannelPipeline {
     /// Input sender: frames sent here enter the first processor.
     input_tx: PrioritySender,
@@ -220,29 +259,202 @@ impl ChannelPipeline {
             let (ctx_up_tx, mut ctx_up_rx) = mpsc::unbounded_channel::<FrameEnum>();
             let ctx = ProcessorContext::new(ctx_down_tx, ctx_up_tx, token.clone(), generation_id);
 
+            let is_heavy = processor.weight() == ProcessorWeight::Heavy;
             let mut processor = processor;
+            let mut ctx = ctx;
             join_set.spawn(async move {
                 processor.setup().await;
-                tracing::debug!(processor = %processor.name(), "Pipeline: processor started");
+                tracing::debug!(
+                    processor = %processor.name(),
+                    weight = %if is_heavy { "Heavy" } else { "Light/Standard" },
+                    "Pipeline: processor started"
+                );
 
-                loop {
-                    // Wait for next input frame (downstream or upstream), or cancellation
+                'outer: loop {
+                    // Wait for next input frame, background output, or cancellation.
+                    // Background output (ctx channels) is also polled so that frames
+                    // produced by processor-internal tasks (e.g. WS reader loops)
+                    // are forwarded even when no input frames are arriving.
                     let directed = tokio::select! {
                         biased;
                         _ = token.cancelled() => break,
                         Some(d) = down_rx.recv() => d,
                         Some(d) = up_rx.recv() => d,
+                        Some(frame) = ctx_down_rx.recv() => {
+                            downstream_tx.send(frame, FrameDirection::Downstream).await;
+                            continue;
+                        }
+                        Some(frame) = ctx_up_rx.recv() => {
+                            upstream_tx.send(frame, FrameDirection::Upstream).await;
+                            continue;
+                        }
                         else => break,
                     };
 
-                    // Process the frame — this may push frames to ctx channels
                     tracing::trace!(
                         processor = %processor.name(),
                         frame = %directed.frame,
                         direction = ?directed.direction,
                         "Pipeline: dispatching"
                     );
-                    processor.process(directed.frame, directed.direction, &ctx).await;
+
+                    if is_heavy {
+                        // --- Heavy processor: two-level monitoring ---
+                        // Race process() against the priority channel so we can
+                        // detect InterruptionFrame while process() is blocked
+                        // (e.g., streaming an LLM SSE response).
+
+                        // Fresh interruption token for this process() call
+                        let interrupt_token = CancellationToken::new();
+                        ctx.set_interruption_token(interrupt_token.clone());
+
+                        // Capture processor name before the mutable borrow
+                        let proc_name = processor.name().to_string();
+
+                        let mut buffered_priority: Vec<DirectedFrame> = Vec::new();
+
+                        // Result of the inner monitoring loop.
+                        // The process future borrows &mut processor, so all
+                        // post-interruption processor access must happen after
+                        // this block scope ends and the borrow is released.
+                        enum MonitorResult {
+                            Completed,
+                            Interrupted(DirectedFrame),
+                            Cancelled,
+                        }
+
+                        let result = {
+                            let mut process_fut = pin!(
+                                processor.process(directed.frame, directed.direction, &ctx)
+                            );
+
+                            loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => break MonitorResult::Cancelled,
+                                    () = &mut process_fut => {
+                                        break MonitorResult::Completed;
+                                    }
+                                    Some(pf) = down_rx.recv_priority() => {
+                                        if matches!(pf.frame, FrameEnum::Interruption(_)) {
+                                            tracing::debug!(
+                                                processor = %proc_name,
+                                                "Pipeline: InterruptionFrame detected during Heavy process()"
+                                            );
+
+                                            // Signal the processor to break out early
+                                            interrupt_token.cancel();
+
+                                            // Wait for process() to finish cooperatively
+                                            process_fut.await;
+
+                                            break MonitorResult::Interrupted(pf);
+                                        } else {
+                                            // Non-interruption priority frame: buffer for later
+                                            buffered_priority.push(pf);
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        // process_fut is dropped here — processor borrow released.
+
+                        match result {
+                            MonitorResult::Cancelled => break 'outer,
+                            MonitorResult::Interrupted(int_frame) => {
+                                // Drain stale context output selectively
+                                let mut ctx_discarded = 0usize;
+                                while let Ok(frame) = ctx_down_rx.try_recv() {
+                                    if frame.is_uninterruptible() {
+                                        downstream_tx.send(frame, FrameDirection::Downstream).await;
+                                    } else {
+                                        ctx_discarded += 1;
+                                    }
+                                }
+                                while let Ok(frame) = ctx_up_rx.try_recv() {
+                                    if frame.is_uninterruptible() {
+                                        upstream_tx.send(frame, FrameDirection::Upstream).await;
+                                    } else {
+                                        ctx_discarded += 1;
+                                    }
+                                }
+                                if ctx_discarded > 0 {
+                                    tracing::debug!(
+                                        processor = %proc_name,
+                                        ctx_discarded,
+                                        "Pipeline: drained stale context output frames"
+                                    );
+                                }
+
+                                // Drain stale data channel selectively
+                                let (preserved, discarded) = down_rx.drain_data_selective();
+                                if discarded > 0 {
+                                    tracing::debug!(
+                                        processor = %proc_name,
+                                        discarded,
+                                        preserved = preserved.len(),
+                                        "Pipeline: drained stale data frames"
+                                    );
+                                }
+
+                                // Re-inject preserved frames in their original direction
+                                for pf in preserved {
+                                    match pf.direction {
+                                        FrameDirection::Downstream => {
+                                            downstream_tx.send(pf.frame, pf.direction).await;
+                                        }
+                                        FrameDirection::Upstream => {
+                                            upstream_tx.send(pf.frame, pf.direction).await;
+                                        }
+                                    }
+                                }
+
+                                // Dispatch InterruptionFrame to process() for cleanup
+                                ctx.set_interruption_token(CancellationToken::new());
+                                processor.process(
+                                    int_frame.frame,
+                                    int_frame.direction,
+                                    &ctx,
+                                ).await;
+
+                                // Drain context output from interruption dispatch
+                                while let Ok(frame) = ctx_down_rx.try_recv() {
+                                    downstream_tx.send(frame, FrameDirection::Downstream).await;
+                                }
+                                while let Ok(frame) = ctx_up_rx.try_recv() {
+                                    upstream_tx.send(frame, FrameDirection::Upstream).await;
+                                }
+
+                                // Re-dispatch any buffered priority frames
+                                for pf in buffered_priority.drain(..) {
+                                    processor.process(pf.frame, pf.direction, &ctx).await;
+                                    while let Ok(frame) = ctx_down_rx.try_recv() {
+                                        downstream_tx.send(frame, FrameDirection::Downstream).await;
+                                    }
+                                    while let Ok(frame) = ctx_up_rx.try_recv() {
+                                        upstream_tx.send(frame, FrameDirection::Upstream).await;
+                                    }
+                                }
+
+                                continue;
+                            }
+                            MonitorResult::Completed => {
+                                // Re-dispatch any buffered priority frames
+                                for pf in buffered_priority.drain(..) {
+                                    processor.process(pf.frame, pf.direction, &ctx).await;
+                                    while let Ok(frame) = ctx_down_rx.try_recv() {
+                                        downstream_tx.send(frame, FrameDirection::Downstream).await;
+                                    }
+                                    while let Ok(frame) = ctx_up_rx.try_recv() {
+                                        upstream_tx.send(frame, FrameDirection::Upstream).await;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // --- Light/Standard: simple direct call ---
+                        processor.process(directed.frame, directed.direction, &ctx).await;
+                    }
 
                     // Drain all context output into priority channels before
                     // accepting the next input. This ensures correct ordering:
@@ -352,7 +564,9 @@ impl Processor for NoopProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{EndFrame, TextFrame};
+    use crate::frames::{
+        EndFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, TextFrame,
+    };
 
     /// Simple passthrough processor for testing.
     struct PassthroughProc {
@@ -537,7 +751,7 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
-        // End frame is a control frame (should use priority channel)
+        // End frame is a control frame (routed through unbounded priority channel)
         pipeline.send(FrameEnum::End(EndFrame::new())).await;
 
         let received = tokio::time::timeout(
@@ -549,6 +763,58 @@ mod tests {
         .expect("channel closed");
 
         assert!(matches!(received.frame, FrameEnum::End(_)));
+
+        pipeline.shutdown().await;
+    }
+
+    /// Regression test: LLMText tokens must arrive before LLMFullResponseEnd.
+    ///
+    /// Before the fix, LLMFullResponseStart/End were Control frames routed to the
+    /// unbounded priority channel, while LLMText was Data routed to the bounded
+    /// data channel. The biased select delivered Control before Data, breaking
+    /// FIFO ordering and defeating incremental LLM-to-TTS streaming.
+    #[tokio::test]
+    async fn test_llm_token_ordering_preserved() {
+        let procs: Vec<Box<dyn Processor>> =
+            vec![Box::new(PassthroughProc::new(1, "PT"))];
+        let mut pipeline = ChannelPipeline::new(procs);
+        let mut output = pipeline.take_output().unwrap();
+
+        // Send frames in expected order: Start, tokens, End
+        let frames = vec![
+            FrameEnum::LLMFullResponseStart(LLMFullResponseStartFrame::new()),
+            FrameEnum::LLMText(LLMTextFrame::new("Hello ".into())),
+            FrameEnum::LLMText(LLMTextFrame::new("world.".into())),
+            FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()),
+        ];
+        for f in frames {
+            pipeline.send(f).await;
+        }
+
+        // Verify arrival order matches send order
+        let expected_names = [
+            "LLMFullResponseStartFrame",
+            "LLMTextFrame",
+            "LLMTextFrame",
+            "LLMFullResponseEndFrame",
+        ];
+        for expected_name in &expected_names {
+            let received = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                output.recv(),
+            )
+            .await
+            .expect("timeout waiting for frame")
+            .expect("channel closed");
+
+            assert_eq!(
+                received.frame.name(),
+                *expected_name,
+                "Frame ordering violated: expected {} but got {}",
+                expected_name,
+                received.frame.name()
+            );
+        }
 
         pipeline.shutdown().await;
     }
@@ -671,6 +937,225 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(vec![]);
         assert!(pipeline.take_output().is_some());
         assert!(pipeline.take_output().is_none());
+        pipeline.shutdown().await;
+    }
+
+    // -- drain_data_selective tests -------------------------------------------
+
+    #[tokio::test]
+    async fn test_drain_data_selective_preserves_uninterruptible() {
+        let (tx, mut rx) = priority_channel(64);
+
+        // Send a mix of data and uninterruptible frames
+        tx.send(FrameEnum::Text(TextFrame::new("discard me")), FrameDirection::Downstream).await;
+        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream).await;
+        tx.send(FrameEnum::Text(TextFrame::new("discard too")), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::Error(crate::frames::ErrorFrame::new("keep me", false)),
+            FrameDirection::Downstream,
+        ).await;
+
+        // Give channels time to deliver
+        tokio::task::yield_now().await;
+
+        let (preserved, discarded) = rx.drain_data_selective();
+
+        assert_eq!(discarded, 2, "should discard 2 TextFrames");
+        assert_eq!(preserved.len(), 2, "should preserve EndFrame and ErrorFrame");
+
+        let names: Vec<&str> = preserved.iter().map(|p| p.frame.name()).collect();
+        assert!(names.contains(&"EndFrame"));
+        assert!(names.contains(&"ErrorFrame"));
+    }
+
+    #[tokio::test]
+    async fn test_drain_data_selective_empty_channel() {
+        let (_tx, mut rx) = priority_channel(64);
+        let (preserved, discarded) = rx.drain_data_selective();
+        assert_eq!(preserved.len(), 0);
+        assert_eq!(discarded, 0);
+    }
+
+    // -- Heavy processor interruption tests -----------------------------------
+
+    /// A slow Heavy processor that simulates LLM streaming by sleeping in a loop,
+    /// checking the interruption token between iterations.
+    struct SlowHeavyProc {
+        /// How many 10ms sleep iterations to do before completing.
+        iterations: usize,
+        /// Set to true if process() was interrupted.
+        was_interrupted: bool,
+        /// Count of frames processed.
+        frames_processed: usize,
+    }
+
+    impl SlowHeavyProc {
+        fn new(iterations: usize) -> Self {
+            Self {
+                iterations,
+                was_interrupted: false,
+                frames_processed: 0,
+            }
+        }
+    }
+
+    impl std::fmt::Debug for SlowHeavyProc {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowHeavyProc")
+        }
+    }
+    impl std::fmt::Display for SlowHeavyProc {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SlowHeavy")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Processor for SlowHeavyProc {
+        fn name(&self) -> &str {
+            "SlowHeavy"
+        }
+        fn id(&self) -> u64 {
+            42
+        }
+        fn weight(&self) -> ProcessorWeight {
+            ProcessorWeight::Heavy
+        }
+
+        async fn process(
+            &mut self,
+            frame: FrameEnum,
+            _direction: FrameDirection,
+            ctx: &ProcessorContext,
+        ) {
+            self.frames_processed += 1;
+
+            match frame {
+                FrameEnum::Text(_) => {
+                    // Simulate slow streaming: sleep in a loop, checking token
+                    for i in 0..self.iterations {
+                        tokio::select! {
+                            biased;
+                            _ = ctx.interruption_token().cancelled() => {
+                                self.was_interrupted = true;
+                                // Emit partial output to verify drain
+                                ctx.send_downstream(FrameEnum::Text(
+                                    TextFrame::new(format!("partial-{}", i))
+                                ));
+                                return;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                                ctx.send_downstream(FrameEnum::Text(
+                                    TextFrame::new(format!("token-{}", i))
+                                ));
+                            }
+                        }
+                    }
+                }
+                FrameEnum::Interruption(_) => {
+                    // Forward interruption downstream
+                    ctx.send_downstream(frame);
+                }
+                other => {
+                    ctx.send_downstream(other);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heavy_processor_interruption() {
+        use crate::frames::InterruptionFrame;
+
+        // Create a pipeline with a slow heavy processor (100 iterations = ~1s)
+        let procs: Vec<Box<dyn Processor>> = vec![
+            Box::new(SlowHeavyProc::new(100)),
+        ];
+        let mut pipeline = ChannelPipeline::new(procs);
+        let mut output = pipeline.take_output().unwrap();
+
+        // Send a text frame that will trigger the slow processing
+        pipeline.send(FrameEnum::Text(TextFrame::new("hello"))).await;
+
+        // Wait a bit for processing to start
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Send InterruptionFrame while process() is running
+        pipeline.send(FrameEnum::Interruption(InterruptionFrame::new())).await;
+
+        // Collect output frames with a timeout
+        let mut received_frames = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                output.recv(),
+            ).await {
+                Ok(Some(directed)) => {
+                    received_frames.push(directed.frame);
+                    // Stop after seeing the interruption frame
+                    if matches!(received_frames.last(), Some(FrameEnum::Interruption(_))) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // Verify we got the InterruptionFrame (it was dispatched after interruption)
+        let has_interruption = received_frames.iter().any(|f| matches!(f, FrameEnum::Interruption(_)));
+        assert!(
+            has_interruption,
+            "InterruptionFrame should be forwarded through the pipeline"
+        );
+
+        // Verify the processor was interrupted quickly (not all 100 iterations)
+        // We should have far fewer than 100 token-N frames
+        let token_count = received_frames
+            .iter()
+            .filter(|f| matches!(f, FrameEnum::Text(_)))
+            .count();
+        assert!(
+            token_count < 50,
+            "Slow processor should be interrupted early, got {} tokens",
+            token_count
+        );
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_heavy_processor_normal_completion() {
+        // Verify Heavy processors still work normally without interruption
+        let procs: Vec<Box<dyn Processor>> = vec![
+            Box::new(SlowHeavyProc::new(3)),  // 3 iterations = ~30ms
+        ];
+        let mut pipeline = ChannelPipeline::new(procs);
+        let mut output = pipeline.take_output().unwrap();
+
+        pipeline.send(FrameEnum::Text(TextFrame::new("test"))).await;
+
+        // Collect all output
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                output.recv(),
+            ).await {
+                Ok(Some(directed)) => received.push(directed.frame),
+                _ => break,
+            }
+        }
+
+        // Should get all 3 tokens
+        let token_count = received
+            .iter()
+            .filter(|f| matches!(f, FrameEnum::Text(_)))
+            .count();
+        assert_eq!(
+            token_count, 3,
+            "Should complete all iterations without interruption"
+        );
+
         pipeline.shutdown().await;
     }
 }

@@ -27,6 +27,7 @@ pub use crate::processors::audio::input_mute::UserInputMuteProcessor;
 pub use crate::processors::{FrameDirection, Processor, ProcessorContext, ProcessorWeight};
 pub use crate::serializers::{FrameSerializer, SerializedFrame};
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
+pub use crate::turns::user_start::vad_strategy::VADUserTurnStartStrategy;
 
 #[cfg(feature = "silero-vad")]
 pub use crate::audio::vad::VADParams;

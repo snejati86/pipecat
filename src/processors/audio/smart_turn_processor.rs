@@ -182,11 +182,10 @@ impl SmartTurnProcessor {
     }
 
     /// Release the pending stop frame and all held frames downstream.
-    async fn release_pending(&mut self, ctx: &ProcessorContext) {
+    fn release_pending(&mut self, ctx: &ProcessorContext) {
         tracing::debug!(held_frames = self.held_frames.len(), "SmartTurn: releasing pending stop");
         if let Some(stop_frame) = self.pending_stop.take() {
-            ctx.send_downstream(FrameEnum::UserStoppedSpeaking(stop_frame))
-                .await;
+            ctx.send_downstream(FrameEnum::UserStoppedSpeaking(stop_frame));
         }
         for frame in self.held_frames.drain(..) {
             ctx.send_downstream(frame);
@@ -212,7 +211,7 @@ impl SmartTurnProcessor {
     }
 
     /// Check hard timeout and run inference if pending.
-    async fn check_pending(&mut self, ctx: &ProcessorContext) {
+    fn check_pending(&mut self, ctx: &ProcessorContext) {
         if self.pending_stop.is_none() {
             return;
         }
@@ -221,7 +220,7 @@ impl SmartTurnProcessor {
         if let Some(received_at) = self.stop_received_at {
             if received_at.elapsed() >= self.hard_timeout {
                 tracing::debug!("SmartTurn: hard timeout reached, releasing stop frame");
-                self.release_pending(ctx).await;
+                self.release_pending(ctx);
                 return;
             }
         }
@@ -235,7 +234,7 @@ impl SmartTurnProcessor {
                         tracing::debug!("SmartTurn: turn completion probability = {:.3}", prob);
                         if prob >= self.completion_threshold {
                             tracing::debug!("SmartTurn: turn complete, releasing stop frame");
-                            self.release_pending(ctx).await;
+                            self.release_pending(ctx);
                         }
                     }
                     Err(e) => {
@@ -243,13 +242,13 @@ impl SmartTurnProcessor {
                             "SmartTurn: inference error: {}, releasing stop frame",
                             e
                         );
-                        self.release_pending(ctx).await;
+                        self.release_pending(ctx);
                     }
                 }
             }
         } else {
             // No model loaded, pass through immediately
-            self.release_pending(ctx).await;
+            self.release_pending(ctx);
         }
     }
 }
@@ -340,7 +339,7 @@ impl Processor for SmartTurnProcessor {
                     // Audio arriving while we're holding a stop frame
                     // Hold it and run inference
                     self.held_frames.push(frame);
-                    self.check_pending(ctx).await;
+                    self.check_pending(ctx);
                 } else {
                     ctx.send_downstream(frame);
                 }
@@ -354,12 +353,11 @@ impl Processor for SmartTurnProcessor {
                     tracing::debug!(audio_samples = self.audio_buffer.len(), "SmartTurn: holding UserStoppedSpeaking");
 
                     // Run immediate inference on current audio buffer
-                    self.check_pending(ctx).await;
+                    self.check_pending(ctx);
                 } else {
                     // No model, pass through
                     tracing::debug!("SmartTurn: no model, passing UserStoppedSpeaking through");
-                    ctx.send_downstream(FrameEnum::UserStoppedSpeaking(stop_frame))
-                        .await;
+                    ctx.send_downstream(FrameEnum::UserStoppedSpeaking(stop_frame));
                 }
             }
 
@@ -378,7 +376,7 @@ impl Processor for SmartTurnProcessor {
 
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 // Release any pending frames before shutdown
-                self.release_pending(ctx).await;
+                self.release_pending(ctx);
                 self.audio_buffer.clear();
                 ctx.send_downstream(frame);
             }

@@ -45,6 +45,7 @@
 //! # }
 //! ```
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -207,6 +208,23 @@ struct CartesiaWsCancelRequest {
     cancel: bool,
 }
 
+/// A pre-built TTS request waiting to be sent over the WebSocket.
+struct PendingTtsRequest {
+    json: String,
+    context_id: String,
+}
+
+/// Shared state for serializing TTS requests between `process()` and `ws_reader_loop`.
+///
+/// Ensures only one TTS request is in-flight at a time. When Cartesia signals
+/// completion ("done"), the next queued request is sent. This prevents audio
+/// interleaving when multiple sentences arrive in quick succession.
+struct TtsQueueState {
+    pending: VecDeque<PendingTtsRequest>,
+    in_flight: bool,
+    current_context_id: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // HTTP request/response types
 // ---------------------------------------------------------------------------
@@ -260,16 +278,21 @@ pub struct CartesiaTTSService {
     ws_url: String,
     params: CartesiaInputParams,
 
-    // -- Split WebSocket (Deepgram pattern) --
+    // -- Split WebSocket --
     ws_sender: Option<Arc<Mutex<CartesiaWsSink>>>,
     ws_reader_task: Option<JoinHandle<()>>,
 
-    // -- Reader → processor channel (bounded, 256) --
-    frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
-    frame_rx: tokio::sync::mpsc::Receiver<FrameEnum>,
+    // -- Pipeline mode: WS reader pushes directly to pipeline ctx channels --
+    // Captured from ProcessorContext on first process() call.
+    pipeline_down_tx: Option<tokio::sync::mpsc::UnboundedSender<FrameEnum>>,
+    pipeline_up_tx: Option<tokio::sync::mpsc::UnboundedSender<FrameEnum>>,
 
-    // -- Context continuation within an LLM turn --
-    current_context_id: Option<String>,
+    // -- Standalone mode (run_tts): WS reader pushes to a local channel --
+    standalone_rx: Option<tokio::sync::mpsc::UnboundedReceiver<FrameEnum>>,
+
+    // -- TTS request serialization --
+    // Shared with ws_reader_loop so it can send the next queued request on "done".
+    queue_state: Arc<std::sync::Mutex<TtsQueueState>>,
     sentence_count_in_turn: u32,
 
     /// Last metrics collected (available after `run_tts` completes).
@@ -287,7 +310,6 @@ impl CartesiaTTSService {
     /// * `api_key` - Cartesia API key for authentication.
     /// * `voice_id` - ID of the voice to use for synthesis.
     pub fn new(api_key: impl Into<String>, voice_id: impl Into<String>) -> Self {
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(256);
         Self {
             id: obj_id(),
             name: "CartesiaTTSService".to_string(),
@@ -303,9 +325,14 @@ impl CartesiaTTSService {
             params: CartesiaInputParams::default(),
             ws_sender: None,
             ws_reader_task: None,
-            frame_tx,
-            frame_rx,
-            current_context_id: None,
+            pipeline_down_tx: None,
+            pipeline_up_tx: None,
+            standalone_rx: None,
+            queue_state: Arc::new(std::sync::Mutex::new(TtsQueueState {
+                pending: VecDeque::new(),
+                in_flight: false,
+                current_context_id: None,
+            })),
             sentence_count_in_turn: 0,
             last_metrics: None,
         }
@@ -366,11 +393,16 @@ impl CartesiaTTSService {
         self
     }
 
-    /// Establish the WebSocket connection to Cartesia, split into sender/reader.
+    /// Internal connect that takes explicit output senders for the WS reader.
     ///
-    /// Spawns a background reader task that pushes frames via an mpsc channel.
-    /// If the connection is already open, this is a no-op.
-    pub async fn connect(&mut self) -> Result<(), String> {
+    /// Audio/TTSStopped frames go to `down_tx`; errors go to `up_tx`.
+    /// In pipeline mode these are the pipeline's context channels (so audio
+    /// flows downstream immediately). In standalone mode they're temp channels.
+    async fn connect_with_output(
+        &mut self,
+        down_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+        up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+    ) -> Result<(), String> {
         if self.ws_sender.is_some() {
             return Ok(());
         }
@@ -407,14 +439,60 @@ impl CartesiaTTSService {
         let (sink, stream) = ws_stream.split();
         self.ws_sender = Some(Arc::new(Mutex::new(sink)));
 
-        let frame_tx = self.frame_tx.clone();
         let name = self.name.clone();
         let sample_rate = self.sample_rate;
+        let queue_state = self.queue_state.clone();
+        let ws_sender_for_reader = self.ws_sender.as_ref().unwrap().clone();
         self.ws_reader_task = Some(tokio::spawn(async move {
-            Self::ws_reader_loop(stream, frame_tx, name, sample_rate).await;
+            Self::ws_reader_loop(
+                stream,
+                down_tx,
+                up_tx,
+                name,
+                sample_rate,
+                queue_state,
+                ws_sender_for_reader,
+            )
+            .await;
         }));
 
         Ok(())
+    }
+
+    /// Connect using pipeline context channels (for use within process()).
+    ///
+    /// Requires `pipeline_down_tx`/`pipeline_up_tx` to be set first
+    /// (captured from ProcessorContext on first process() call).
+    async fn connect_pipeline(&mut self) -> Result<(), String> {
+        let down_tx = self
+            .pipeline_down_tx
+            .as_ref()
+            .ok_or("connect_pipeline called before pipeline senders captured")?
+            .clone();
+        let up_tx = self
+            .pipeline_up_tx
+            .as_ref()
+            .ok_or("connect_pipeline called before pipeline senders captured")?
+            .clone();
+        self.connect_with_output(down_tx, up_tx).await
+    }
+
+    /// Establish the WebSocket connection to Cartesia.
+    ///
+    /// In pipeline mode (after process() has captured context senders), routes
+    /// audio directly to the pipeline. In standalone mode (before any process()
+    /// call), creates a local channel for use with `run_tts()`.
+    pub async fn connect(&mut self) -> Result<(), String> {
+        if self.pipeline_down_tx.is_some() {
+            return self.connect_pipeline().await;
+        }
+        // Standalone mode: create temporary channels.
+        // Clone down_tx as the up_tx so errors also arrive on standalone_rx
+        // (there's no pipeline to propagate upstream to).
+        let (down_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let up_tx = down_tx.clone();
+        self.standalone_rx = Some(rx);
+        self.connect_with_output(down_tx, up_tx).await
     }
 
     /// Disconnect the WebSocket connection and stop the reader task.
@@ -445,7 +523,12 @@ impl CartesiaTTSService {
             }
         }
 
-        self.current_context_id = None;
+        {
+            let mut state = self.queue_state.lock().unwrap();
+            state.pending.clear();
+            state.in_flight = false;
+            state.current_context_id = None;
+        }
         self.sentence_count_in_turn = 0;
         tracing::debug!(service = %self.name, "Disconnected from Cartesia WebSocket");
     }
@@ -498,19 +581,26 @@ impl CartesiaTTSService {
     }
 
     /// Background task that reads messages from the Cartesia WebSocket and
-    /// pushes `FrameEnum` variants via the mpsc channel.
+    /// pushes frames directly to pipeline channels.
+    ///
+    /// Audio and TTSStopped go to `down_tx` (downstream); errors go to `up_tx`.
+    /// In pipeline mode, `down_tx` is the pipeline's context channel, so audio
+    /// appears downstream immediately without waiting for process() to drain.
     async fn ws_reader_loop(
         mut stream: CartesiaWsReadStream,
-        frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
+        down_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
+        up_tx: tokio::sync::mpsc::UnboundedSender<FrameEnum>,
         name: String,
         sample_rate: u32,
+        queue_state: Arc<std::sync::Mutex<TtsQueueState>>,
+        ws_sender: Arc<Mutex<CartesiaWsSink>>,
     ) {
         while let Some(msg_result) = stream.next().await {
             let msg = match msg_result {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!(service = %name, "WebSocket read error: {e}");
-                    let _ = frame_tx.try_send(FrameEnum::Error(ErrorFrame::new(
+                    let _ = up_tx.send(FrameEnum::Error(ErrorFrame::new(
                         format!("Cartesia WebSocket read error: {e}"),
                         false,
                     )));
@@ -536,11 +626,12 @@ impl CartesiaTTSService {
                                         let frame = FrameEnum::OutputAudioRaw(
                                             OutputAudioRawFrame::new(audio_bytes, sample_rate, 1),
                                         );
-                                        if let Err(e) = frame_tx.try_send(frame) {
+                                        if down_tx.send(frame).is_err() {
                                             tracing::warn!(
                                                 service = %name,
-                                                "Failed to send audio frame: {e}"
+                                                "Pipeline receiver dropped, stopping reader"
                                             );
+                                            break;
                                         }
                                     }
                                     Err(e) => {
@@ -561,11 +652,45 @@ impl CartesiaTTSService {
                             let frame = FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
                                 response.context_id.clone(),
                             )));
-                            if let Err(e) = frame_tx.try_send(frame) {
-                                tracing::warn!(
-                                    service = %name,
-                                    "Failed to send TTSStoppedFrame: {e}"
-                                );
+                            let _ = down_tx.send(frame);
+
+                            // Send next queued request if available.
+                            let next = {
+                                let mut state = queue_state.lock().unwrap();
+                                state.pending.pop_front()
+                            };
+                            if let Some(req) = next {
+                                let send_ok = {
+                                    let mut sink = ws_sender.lock().await;
+                                    sink.send(WsMessage::Text(req.json)).await.is_ok()
+                                };
+                                if send_ok {
+                                    tracing::debug!(
+                                        service = %name,
+                                        context_id = %req.context_id,
+                                        "Sent queued TTS request"
+                                    );
+                                    {
+                                        let mut state = queue_state.lock().unwrap();
+                                        state.current_context_id =
+                                            Some(req.context_id.clone());
+                                    }
+                                    let _ = down_tx.send(FrameEnum::TTSStarted(
+                                        TTSStartedFrame::new(Some(req.context_id)),
+                                    ));
+                                } else {
+                                    tracing::error!(
+                                        service = %name,
+                                        "Failed to send queued TTS request"
+                                    );
+                                    let mut state = queue_state.lock().unwrap();
+                                    state.in_flight = false;
+                                    state.current_context_id = None;
+                                }
+                            } else {
+                                let mut state = queue_state.lock().unwrap();
+                                state.in_flight = false;
+                                state.current_context_id = None;
                             }
                         }
                         "error" => {
@@ -578,16 +703,10 @@ impl CartesiaTTSService {
                                 error = %error_detail,
                                 "Cartesia WebSocket error"
                             );
-                            let frame = FrameEnum::Error(ErrorFrame::new(
+                            let _ = up_tx.send(FrameEnum::Error(ErrorFrame::new(
                                 format!("Cartesia error: {error_detail}"),
                                 false,
-                            ));
-                            if let Err(e) = frame_tx.try_send(frame) {
-                                tracing::warn!(
-                                    service = %name,
-                                    "Failed to send error frame: {e}"
-                                );
-                            }
+                            )));
                         }
                         "timestamps" => {
                             tracing::trace!(service = %name, "Received word timestamps");
@@ -611,40 +730,25 @@ impl CartesiaTTSService {
         tracing::debug!(service = %name, "Cartesia WebSocket reader loop ended");
     }
 
-    /// Drain frames from the background reader task and send them through
-    /// the processor context.
-    fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            match &frame {
-                FrameEnum::Error(_) => ctx.send_upstream(frame),
-                _ => ctx.send_downstream(frame),
-            }
-        }
-    }
-
     /// Send a TTS request over the WebSocket (non-blocking).
     ///
     /// Builds the request, sends it via the split sink, and emits
-    /// TTSStartedFrame synchronously. Audio frames will arrive via the
-    /// background reader task and be drained in subsequent `process()` calls.
+    /// TTSStartedFrame synchronously. Audio frames arrive via the background
+    /// reader task and flow directly to the pipeline (no drain needed).
     async fn send_tts_request(&mut self, text: &str, ctx: &ProcessorContext) {
-        // Auto-connect if needed.
+        // Auto-connect if needed (pipeline mode).
         if self.ws_sender.is_none() {
-            if let Err(e) = self.connect().await {
+            if let Err(e) = self.connect_pipeline().await {
                 ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to auto-connect Cartesia WebSocket: {e}"),
                     false,
                 )));
-
                 return;
             }
         }
 
-        // Each sentence gets a fresh context_id. Cartesia closes contexts after
-        // the first sentence finishes generating, so continuation fails for
-        // complete-sentence workloads. Fresh IDs are safe and still non-blocking.
+        // Each sentence gets a fresh context_id.
         let context_id = generate_context_id();
-        self.current_context_id = Some(context_id.clone());
         self.sentence_count_in_turn += 1;
 
         let request = CartesiaWsRequest {
@@ -668,12 +772,35 @@ impl CartesiaTTSService {
                     format!("Failed to serialize Cartesia request: {e}"),
                     false,
                 )));
-
                 return;
             }
         };
 
-        // Send via the split sink
+        // Check if a TTS request is already in-flight. If so, queue this one
+        // to prevent audio interleaving from concurrent Cartesia contexts.
+        let already_in_flight = {
+            let state = self.queue_state.lock().unwrap();
+            state.in_flight
+        };
+
+        if already_in_flight {
+            let mut state = self.queue_state.lock().unwrap();
+            state.pending.push_back(PendingTtsRequest {
+                json: request_json,
+                context_id: context_id.clone(),
+            });
+            tracing::debug!(
+                service = %self.name,
+                text = %text,
+                context_id = %context_id,
+                sentence = self.sentence_count_in_turn,
+                queue_depth = state.pending.len(),
+                "Queued TTS request (in-flight request active)"
+            );
+            return;
+        }
+
+        // No request in-flight — send immediately via the split sink.
         let send_result = match self.ws_sender.as_ref() {
             Some(sender) => {
                 let mut sink = sender.lock().await;
@@ -695,8 +822,13 @@ impl CartesiaTTSService {
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
             )));
-
             return;
+        }
+
+        {
+            let mut state = self.queue_state.lock().unwrap();
+            state.in_flight = true;
+            state.current_context_id = Some(context_id.clone());
         }
 
         tracing::debug!(
@@ -707,7 +839,7 @@ impl CartesiaTTSService {
             "Sent TTS request over WebSocket"
         );
 
-        // Emit TTSStartedFrame synchronously for correct ordering
+        // Emit TTSStartedFrame synchronously for correct ordering.
         ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
             context_id,
         ))));
@@ -748,14 +880,17 @@ impl Processor for CartesiaTTSService {
         ProcessorWeight::Heavy
     }
 
-    /// Process incoming frames (non-blocking TTS with drain pattern).
+    /// Process incoming frames (non-blocking TTS, no drain needed).
+    ///
+    /// Audio from the WS reader flows directly to the pipeline via context
+    /// channels — no drain_reader_frames() or block-wait required.
     ///
     /// - `FrameEnum::Text`: Sends TTS request via WebSocket (non-blocking).
     /// - `FrameEnum::LLMFullResponseStart`: Signals new LLM turn.
     /// - `FrameEnum::LLMFullResponseEnd`: Resets context for next turn.
     /// - `FrameEnum::Interruption`: Cancels in-flight TTS and resets context.
     /// - `FrameEnum::Start`: Establishes WebSocket connection.
-    /// - `FrameEnum::End` / `FrameEnum::Cancel`: Disconnects and drains.
+    /// - `FrameEnum::End` / `FrameEnum::Cancel`: Disconnects.
     /// - All other frames: Passed through in the same direction.
     async fn process(
         &mut self,
@@ -763,48 +898,56 @@ impl Processor for CartesiaTTSService {
         direction: FrameDirection,
         ctx: &ProcessorContext,
     ) {
-        // Always drain any pending frames from the reader task
-        self.drain_reader_frames(ctx);
+        // Capture pipeline senders on first call so WS reader can push
+        // audio directly into the pipeline without going through process().
+        if self.pipeline_down_tx.is_none() {
+            self.pipeline_down_tx = Some(ctx.downstream_sender());
+            self.pipeline_up_tx = Some(ctx.upstream_sender());
+            // If already connected with standalone senders, reconnect
+            // so the WS reader uses pipeline channels.
+            if self.ws_sender.is_some() {
+                self.disconnect().await;
+            }
+        }
 
         match frame {
             FrameEnum::Text(ref t) if !t.text.is_empty() => {
                 self.send_tts_request(&t.text, ctx).await;
-                // Forward TextFrame so downstream AssistantContextAggregator
-                // can accumulate the response into conversation history.
                 ctx.send_downstream(frame);
             }
             FrameEnum::LLMFullResponseStart(_) => {
-                // New LLM turn — fresh context_id will be generated on first TextFrame
                 ctx.send_downstream(frame);
             }
             FrameEnum::LLMFullResponseEnd(_) => {
-                self.current_context_id = None;
                 self.sentence_count_in_turn = 0;
                 ctx.send_downstream(frame);
             }
             FrameEnum::Interruption(_) => {
-                if let Some(cid) = self.current_context_id.take() {
+                let cid = {
+                    let mut state = self.queue_state.lock().unwrap();
+                    state.pending.clear();
+                    state.in_flight = false;
+                    state.current_context_id.take()
+                };
+                if let Some(cid) = cid {
                     self.send_cancel(&cid).await;
                 }
-                // take() above already set current_context_id to None
                 self.sentence_count_in_turn = 0;
                 ctx.send_downstream(frame);
             }
             FrameEnum::Start(_) => {
                 if self.ws_sender.is_none() {
-                    if let Err(e) = self.connect().await {
+                    if let Err(e) = self.connect_pipeline().await {
                         ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                             format!("Cartesia connection failed: {e}"),
                             false,
                         )));
-
                     }
                 }
                 ctx.send_downstream(frame);
             }
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 self.disconnect().await;
-                self.drain_reader_frames(ctx);
                 ctx.send_downstream(frame);
             }
             other => match direction {
@@ -816,6 +959,9 @@ impl Processor for CartesiaTTSService {
 
     async fn cleanup(&mut self) {
         self.disconnect().await;
+        // Clear pipeline senders so they're re-captured on next pipeline start.
+        self.pipeline_down_tx = None;
+        self.pipeline_up_tx = None;
     }
 }
 
@@ -838,15 +984,18 @@ impl AIService for CartesiaTTSService {
 impl TTSService for CartesiaTTSService {
     /// Synthesize speech from text using Cartesia's WebSocket streaming API.
     ///
-    /// Connects if needed, sends the request via the split sink, then polls the
-    /// reader channel until TTSStoppedFrame arrives. Returns collected frames
-    /// converted to `Arc<dyn Frame>` for the trait API.
+    /// Connects in standalone mode if needed, sends the request via the split
+    /// sink, then polls the standalone receiver until TTSStoppedFrame arrives.
     async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
 
-        // Connect if needed
-        if self.ws_sender.is_none() {
-            if let Err(e) = self.connect().await {
+        // Ensure connected in standalone mode with a local channel.
+        if self.ws_sender.is_none() || self.standalone_rx.is_none() {
+            self.disconnect().await;
+            let (down_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let up_tx = down_tx.clone();
+            self.standalone_rx = Some(rx);
+            if let Err(e) = self.connect_with_output(down_tx, up_tx).await {
                 return vec![
                     Arc::new(TTSStartedFrame::new(None)),
                     Arc::new(ErrorFrame::new(
@@ -887,7 +1036,7 @@ impl TTSService for CartesiaTTSService {
             }
         };
 
-        // Send via sink (clone Arc to avoid borrow conflict on error path)
+        // Send via sink
         let send_result = match self.ws_sender.as_ref() {
             Some(sender) => {
                 let sender = sender.clone();
@@ -920,10 +1069,11 @@ impl TTSService for CartesiaTTSService {
         let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
         frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
 
-        // Poll frame_rx with timeout until TTSStoppedFrame arrives
+        // Poll standalone_rx until TTSStoppedFrame arrives
+        let rx = self.standalone_rx.as_mut().expect("standalone_rx must be set");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
-            match tokio::time::timeout_at(deadline, self.frame_rx.recv()).await {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(frame_enum)) => {
                     let is_stopped = matches!(&frame_enum, FrameEnum::TTSStopped(_));
                     let is_error = matches!(&frame_enum, FrameEnum::Error(_));

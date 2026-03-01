@@ -61,8 +61,8 @@ impl fmt::Display for ProcessorWeight {
 /// Context provided to processors during frame processing.
 ///
 /// Carries the channel senders for downstream/upstream frame delivery,
-/// a cancellation token for cooperative shutdown, and a generation ID
-/// for cache invalidation.
+/// a cancellation token for cooperative shutdown, an interruption token
+/// for cooperative interruption, and a generation ID for cache invalidation.
 pub struct ProcessorContext {
     /// Channel sender for downstream frames (unbounded to prevent deadlock).
     downstream_tx: mpsc::UnboundedSender<FrameEnum>,
@@ -70,6 +70,10 @@ pub struct ProcessorContext {
     upstream_tx: mpsc::UnboundedSender<FrameEnum>,
     /// Cancellation token for cooperative shutdown.
     cancel_token: CancellationToken,
+    /// Interruption token — cancelled when an InterruptionFrame arrives
+    /// while this processor's process() is running. Processors can use this
+    /// in `tokio::select!` inside long-running loops to break out early.
+    interruption_token: CancellationToken,
     /// Generation ID — incremented on pipeline reconfiguration.
     /// Processors can use this to invalidate cached state.
     generation_id: u64,
@@ -87,8 +91,18 @@ impl ProcessorContext {
             downstream_tx,
             upstream_tx,
             cancel_token,
+            interruption_token: CancellationToken::new(),
             generation_id,
         }
+    }
+
+    /// Create a context suitable for unit tests (no interruption wiring needed).
+    #[cfg(test)]
+    pub fn for_test(
+        downstream_tx: mpsc::UnboundedSender<FrameEnum>,
+        upstream_tx: mpsc::UnboundedSender<FrameEnum>,
+    ) -> Self {
+        Self::new(downstream_tx, upstream_tx, CancellationToken::new(), 1)
     }
 
     /// Send a frame downstream (input → output direction).
@@ -131,9 +145,43 @@ impl ProcessorContext {
         &self.cancel_token
     }
 
+    /// Get the interruption token for cooperative interruption.
+    ///
+    /// Processors with long-running `process()` calls (e.g., LLM SSE streaming)
+    /// should check this token in their inner loops via `tokio::select!` to
+    /// break out early when an `InterruptionFrame` arrives.
+    pub fn interruption_token(&self) -> &CancellationToken {
+        &self.interruption_token
+    }
+
+    /// Convenience: check if this processor has been interrupted.
+    pub fn is_interrupted(&self) -> bool {
+        self.interruption_token.is_cancelled()
+    }
+
+    /// Replace the interruption token. Called by the pipeline task loop
+    /// before each `process()` invocation on Heavy processors.
+    pub(crate) fn set_interruption_token(&mut self, token: CancellationToken) {
+        self.interruption_token = token;
+    }
+
     /// Get the current generation ID.
     pub fn generation_id(&self) -> u64 {
         self.generation_id
+    }
+
+    /// Get a clone of the downstream sender for use by background tasks.
+    ///
+    /// Background tasks (e.g., WebSocket reader loops) can use this to push
+    /// frames directly into the pipeline without waiting for `process()`.
+    /// The pipeline loop will pick these up and forward them downstream.
+    pub fn downstream_sender(&self) -> mpsc::UnboundedSender<FrameEnum> {
+        self.downstream_tx.clone()
+    }
+
+    /// Get a clone of the upstream sender for use by background tasks.
+    pub fn upstream_sender(&self) -> mpsc::UnboundedSender<FrameEnum> {
+        self.upstream_tx.clone()
     }
 }
 
@@ -142,6 +190,7 @@ impl fmt::Debug for ProcessorContext {
         f.debug_struct("ProcessorContext")
             .field("generation_id", &self.generation_id)
             .field("cancelled", &self.cancel_token.is_cancelled())
+            .field("interrupted", &self.interruption_token.is_cancelled())
             .finish()
     }
 }
@@ -378,4 +427,60 @@ mod tests {
         assert!(format!("{:?}", proc).contains("UpperCaseProcessor"));
     }
 
+    // -- Interruption token tests ---------------------------------------------
+
+    #[test]
+    fn test_context_interruption_token_initial_state() {
+        let (tx, _rx) = mpsc::unbounded_channel::<FrameEnum>();
+        let (utx, _urx) = mpsc::unbounded_channel::<FrameEnum>();
+        let ctx = ProcessorContext::new(tx, utx, CancellationToken::new(), 1);
+        assert!(!ctx.is_interrupted());
+    }
+
+    #[test]
+    fn test_context_interruption_token_cancel() {
+        let (tx, _rx) = mpsc::unbounded_channel::<FrameEnum>();
+        let (utx, _urx) = mpsc::unbounded_channel::<FrameEnum>();
+        let ctx = ProcessorContext::new(tx, utx, CancellationToken::new(), 1);
+
+        let token = ctx.interruption_token().clone();
+        assert!(!ctx.is_interrupted());
+
+        token.cancel();
+        assert!(ctx.is_interrupted());
+    }
+
+    #[test]
+    fn test_context_set_interruption_token() {
+        let (tx, _rx) = mpsc::unbounded_channel::<FrameEnum>();
+        let (utx, _urx) = mpsc::unbounded_channel::<FrameEnum>();
+        let mut ctx = ProcessorContext::new(tx, utx, CancellationToken::new(), 1);
+
+        // Cancel the initial token
+        ctx.interruption_token().clone().cancel();
+        assert!(ctx.is_interrupted());
+
+        // Replace with a fresh token
+        ctx.set_interruption_token(CancellationToken::new());
+        assert!(!ctx.is_interrupted());
+    }
+
+    #[test]
+    fn test_context_for_test_helper() {
+        let (tx, _rx) = mpsc::unbounded_channel::<FrameEnum>();
+        let (utx, _urx) = mpsc::unbounded_channel::<FrameEnum>();
+        let ctx = ProcessorContext::for_test(tx, utx);
+        assert!(!ctx.is_cancelled());
+        assert!(!ctx.is_interrupted());
+        assert_eq!(ctx.generation_id(), 1);
+    }
+
+    #[test]
+    fn test_context_debug_includes_interrupted() {
+        let (tx, _rx) = mpsc::unbounded_channel::<FrameEnum>();
+        let (utx, _urx) = mpsc::unbounded_channel::<FrameEnum>();
+        let ctx = ProcessorContext::new(tx, utx, CancellationToken::new(), 5);
+        let debug = format!("{:?}", ctx);
+        assert!(debug.contains("interrupted"));
+    }
 }

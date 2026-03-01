@@ -19,7 +19,8 @@ pub mod serializers;
 pub mod services;
 pub mod utils;
 
+pub mod turns;
+
 // Legacy FrameProcessor modules — commented out until migrated:
 // pub mod tests;
 // pub mod transports;
-// pub mod turns;

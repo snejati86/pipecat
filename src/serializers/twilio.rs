@@ -30,9 +30,8 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
 
-use rubato::{FftFixedIn, Resampler};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -103,146 +102,6 @@ fn debug_audio_append(filename: &str, data: &[u8]) {
 
 /// Twilio's native audio sample rate (8kHz).
 const TWILIO_SAMPLE_RATE: u32 = 8000;
-
-/// FFT resampler chunk size in frames. Sized to match typical Twilio 20ms frames
-/// (160 samples at 8kHz) so most frames use the full `process_into_buffer` path
-/// rather than the partial-chunk path which can affect resampler state.
-const RESAMPLE_CHUNK_SIZE: usize = 160;
-
-// ---------------------------------------------------------------------------
-// Sample rate conversion (rubato FFT-based resampling)
-// ---------------------------------------------------------------------------
-
-/// Create a rubato FFT resampler for the given rate conversion.
-fn create_resampler(from_rate: u32, to_rate: u32) -> Option<FftFixedIn<f32>> {
-    match FftFixedIn::<f32>::new(
-        from_rate as usize,
-        to_rate as usize,
-        RESAMPLE_CHUNK_SIZE,
-        1, // sub_chunks
-        1, // channels
-    ) {
-        Ok(resampler) => Some(resampler),
-        Err(e) => {
-            tracing::error!("Failed to create resampler ({from_rate}→{to_rate}): {e}");
-            None
-        }
-    }
-}
-
-/// Resample PCM audio using a rubato FFT resampler with streaming support.
-///
-/// Uses a `residual` buffer to carry over samples between calls so that only
-/// full chunks are ever fed to `process_into_buffer`. This avoids calling
-/// `process_partial_into_buffer` which corrupts the resampler's internal FFT
-/// state and produces audible artifacts on subsequent frames.
-fn resample_rubato(
-    resampler: &mut FftFixedIn<f32>,
-    residual: &mut Vec<f32>,
-    pcm_data: &[u8],
-) -> Vec<u8> {
-    let debug = DEBUG_AUDIO.load(Ordering::Relaxed);
-
-    if pcm_data.len() < 2 && residual.is_empty() {
-        return Vec::new();
-    }
-
-    // Convert i16 LE bytes -> f32 normalized to [-1.0, 1.0]
-    let new_samples: Vec<f32> = pcm_data
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
-        .collect();
-
-    // Only compute debug diagnostics when debug logging is active
-    let input_max_abs = if debug {
-        new_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max)
-    } else {
-        0.0
-    };
-
-    // Prepend residual from previous call
-    let residual_len = if debug { residual.len() } else { 0 };
-    let samples = if residual.is_empty() {
-        new_samples
-    } else {
-        let mut combined = std::mem::take(residual);
-        combined.extend_from_slice(&new_samples);
-        combined
-    };
-
-    let input_frames = resampler.input_frames_next();
-    if samples.len() < input_frames {
-        // Not enough for a full chunk yet — save everything as residual
-        if debug {
-            debug!("resample: {} bytes ({} odd), {} new samples, {} residual -> buffered (need {})",
-                   pcm_data.len(), pcm_data.len() % 2, samples.len(), residual_len, input_frames);
-        }
-        *residual = samples;
-        return Vec::new();
-    }
-
-    let max_out = resampler.output_frames_max();
-    let mut wave_out = vec![vec![0.0f32; max_out]; 1];
-
-    // Count how many full chunks we can process
-    let full_chunks = samples.len() / input_frames;
-    let mut all_output: Vec<f32> = Vec::with_capacity(full_chunks * max_out);
-
-    let mut pos = 0;
-    let mut chunk_num = 0;
-    while pos + input_frames <= samples.len() {
-        let chunk = [&samples[pos..pos + input_frames]];
-        match resampler.process_into_buffer(&chunk, &mut wave_out, None) {
-            Ok((_, out_len)) => {
-                if debug {
-                    let out_max = wave_out[0][..out_len]
-                        .iter()
-                        .map(|s| s.abs())
-                        .fold(0.0f32, f32::max);
-                    if out_max > 1.0 {
-                        warn!(
-                            "resample: chunk {} OUTPUT OVERFLOW! out_max={:.4}, out_len={}, input_max={:.4}, pcm_bytes={}, residual={}",
-                            chunk_num, out_max, out_len, input_max_abs, pcm_data.len(), residual_len
-                        );
-                    }
-                }
-                all_output.extend_from_slice(&wave_out[0][..out_len]);
-            }
-            Err(e) => {
-                warn!("Resampler error, dropping audio frame: {}", e);
-                // Save unprocessed samples as residual so they aren't lost
-                *residual = samples[pos..].to_vec();
-                return Vec::new();
-            }
-        }
-        pos += input_frames;
-        chunk_num += 1;
-    }
-
-    // Save any leftover samples for the next call
-    if pos < samples.len() {
-        *residual = samples[pos..].to_vec();
-    }
-    // else: residual was already cleared by std::mem::take above
-
-    if debug {
-        let output_max = all_output.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-        debug!(
-            "resample: {} pcm_bytes ({} odd), {} new_samples (max={:.4}), {} residual_in, {} chunks -> {} out_samples (max={:.4}), {} residual_out",
-            pcm_data.len(), pcm_data.len() % 2, pcm_data.len() / 2, input_max_abs,
-            residual_len, chunk_num, all_output.len(), output_max, residual.len()
-        );
-    }
-
-    // Convert f32 -> i16 LE bytes
-    let mut output = Vec::with_capacity(all_output.len() * 2);
-    for &s in &all_output {
-        let clamped = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
-        output.extend_from_slice(&clamped.to_le_bytes());
-    }
-
-    output
-}
 
 // ---------------------------------------------------------------------------
 // Twilio wire-format types
@@ -385,12 +244,6 @@ pub struct TwilioFrameSerializer {
     pub call_sid: Option<String>,
     /// The Twilio account SID, set when a "start" event is received.
     pub account_sid: Option<String>,
-    /// Output resampler: pipeline_rate -> 8kHz (for serialize).
-    /// Tuple: (current_from_rate, resampler, residual_buffer). Lazily created.
-    output_resampler: Mutex<Option<(u32, FftFixedIn<f32>, Vec<f32>)>>,
-    /// Input resampler: 8kHz -> pipeline_rate (for deserialize). Lazily created.
-    /// Tuple: (resampler, residual_buffer).
-    input_resampler: Mutex<Option<(FftFixedIn<f32>, Vec<f32>)>>,
 }
 
 impl fmt::Debug for TwilioFrameSerializer {
@@ -415,8 +268,6 @@ impl TwilioFrameSerializer {
             stream_sid: None,
             call_sid: None,
             account_sid: None,
-            output_resampler: Mutex::new(None),
-            input_resampler: Mutex::new(None),
         }
     }
 
@@ -429,8 +280,6 @@ impl TwilioFrameSerializer {
             stream_sid: Some(stream_sid),
             call_sid: None,
             account_sid: None,
-            output_resampler: Mutex::new(None),
-            input_resampler: Mutex::new(None),
         }
     }
 
@@ -468,50 +317,28 @@ impl FrameSerializer for TwilioFrameSerializer {
                 debug_audio_append("pre_resample_24k.raw", &audio_frame.audio.audio);
             }
 
-            // Resample from pipeline rate to Twilio 8kHz using rubato FFT resampler
-            let resampled;
-            let pcm_data: &[u8] = if audio_frame.audio.sample_rate != TWILIO_SAMPLE_RATE {
-                let mut guard = self.output_resampler.lock().unwrap_or_else(|e| e.into_inner());
-                let needs_new = match &*guard {
-                    Some((rate, _, _)) => *rate != audio_frame.audio.sample_rate,
-                    None => true,
-                };
-                if needs_new {
-                    if let Some(r) = create_resampler(audio_frame.audio.sample_rate, TWILIO_SAMPLE_RATE) {
-                        *guard = Some((audio_frame.audio.sample_rate, r, Vec::new()));
-                    } else {
-                        // Fallback to linear if resampler creation fails
-                        resampled = resample_linear(
-                            &audio_frame.audio.audio,
-                            audio_frame.audio.sample_rate,
-                            TWILIO_SAMPLE_RATE,
-                        );
-                        return serde_json::to_string(&TwilioMediaOut {
-                            event: "media",
-                            stream_sid,
-                            media: TwilioMediaPayloadOut {
-                                payload: encode_base64(&pcm_to_mulaw(&resampled)),
-                            },
-                        })
-                        .ok()
-                        .map(SerializedFrame::Text);
-                    }
-                }
-                let (_, ref mut resampler, ref mut residual) =
-                    guard.as_mut().expect("resampler state must be initialized after lazy init block");
-                resampled = resample_rubato(resampler, residual, &audio_frame.audio.audio);
-                &resampled
+            // Resample from pipeline rate to Twilio 8kHz using linear interpolation
+            let pcm_data = if audio_frame.audio.sample_rate != TWILIO_SAMPLE_RATE {
+                resample_linear(
+                    &audio_frame.audio.audio,
+                    audio_frame.audio.sample_rate,
+                    TWILIO_SAMPLE_RATE,
+                )
             } else {
-                &audio_frame.audio.audio
+                audio_frame.audio.audio.clone()
             };
+
+            if pcm_data.is_empty() {
+                return None;
+            }
 
             // --- Stage 2: PCM AFTER resampling to 8 kHz ---
             if debug {
-                debug_audio_append("post_resample_8k.raw", pcm_data);
+                debug_audio_append("post_resample_8k.raw", &pcm_data);
             }
 
             // Convert PCM to mu-law
-            let mulaw_data = pcm_to_mulaw(pcm_data);
+            let mulaw_data = pcm_to_mulaw(&pcm_data);
 
             // --- Stage 3: mu-law roundtrip — encode then decode back to PCM ---
             // This lets us hear exactly what Twilio will play after decoding.
@@ -600,20 +427,9 @@ impl FrameSerializer for TwilioFrameSerializer {
                 // Decode mu-law to 16-bit PCM
                 let pcm_data = mulaw_to_pcm(&mulaw_data);
 
-                // Resample from 8kHz to pipeline rate using rubato FFT resampler
+                // Resample from 8kHz to pipeline rate using linear interpolation
                 let resampled = if self.sample_rate != TWILIO_SAMPLE_RATE {
-                    let mut guard = self.input_resampler.lock().unwrap_or_else(|e| e.into_inner());
-                    if guard.is_none() {
-                        if let Some(r) = create_resampler(TWILIO_SAMPLE_RATE, self.sample_rate) {
-                            *guard = Some((r, Vec::new()));
-                        }
-                    }
-                    if let Some((ref mut resampler, ref mut residual)) = *guard {
-                        resample_rubato(resampler, residual, &pcm_data)
-                    } else {
-                        // Fallback to linear if resampler creation fails
-                        resample_linear(&pcm_data, TWILIO_SAMPLE_RATE, self.sample_rate)
-                    }
+                    resample_linear(&pcm_data, TWILIO_SAMPLE_RATE, self.sample_rate)
                 } else {
                     pcm_data
                 };
@@ -867,11 +683,13 @@ mod tests {
 
     #[test]
     fn test_resample_downsample_16k_to_8k() {
-        // Serialize path: 16kHz pipeline -> 8kHz Twilio
+        // Serialize path: 16kHz pipeline -> 8kHz Twilio.
+        // Use a larger input (40ms) to amortize the sinc resampler's
+        // initial filter latency (~sinc_len samples).
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ-test".to_string());
 
-        // 160 samples at 16kHz (10ms of audio)
-        let samples: Vec<i16> = (0..160).map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i16).collect();
+        // 640 samples at 16kHz (40ms of audio)
+        let samples: Vec<i16> = (0..640).map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i16).collect();
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
@@ -881,10 +699,10 @@ mod tests {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             let payload = parsed["media"]["payload"].as_str().unwrap();
             let mulaw = decode_base64(payload).unwrap();
-            // 160 samples at 16kHz -> ~80 mu-law bytes at 8kHz
+            // 640 samples at 16kHz -> ~320 mu-law bytes at 8kHz (minus filter latency)
             assert!(
-                (70..=90).contains(&mulaw.len()),
-                "Expected ~80 mu-law bytes, got {}",
+                (200..=330).contains(&mulaw.len()),
+                "Expected ~250-320 mu-law bytes, got {}",
                 mulaw.len()
             );
         }
@@ -922,7 +740,7 @@ mod tests {
     #[test]
     fn test_resample_upsample_8k_to_24k() {
         // Deserialize path with 24kHz pipeline rate.
-        // Need at least RESAMPLE_CHUNK_SIZE (160) samples for the FFT resampler.
+        // Need enough samples to fill the sinc resampler's kernel.
         let serializer = TwilioFrameSerializer::new(24000);
 
         // 320 mu-law samples at 8kHz (40ms — 2 full chunks)
@@ -948,12 +766,12 @@ mod tests {
 
     #[test]
     fn test_resample_empty_input_serialize() {
-        // Empty audio frame should still serialize (produces empty mu-law)
+        // Empty audio frame returns None (nothing to resample)
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ-test".to_string());
         let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(vec![], 16000, 1));
 
         let result = serializer.serialize(frame);
-        assert!(result.is_some());
+        assert!(result.is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1241,8 +1059,10 @@ mod tests {
     fn test_serialize_output_audio_frame() {
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ123".to_string());
 
-        // Create a simple audio frame with some PCM data (2 samples at 16kHz)
-        let pcm_data = vec![0x00, 0x00, 0xE8, 0x03]; // samples: 0, 1000
+        // Send enough audio for the sinc resampler to produce output.
+        // At 16kHz with chunk_size=160, we need at least 160 samples (320 bytes).
+        let samples: Vec<i16> = (0..320).map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i16).collect();
+        let pcm_data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 16000, 1));
 
         let result = serializer.serialize(frame);
