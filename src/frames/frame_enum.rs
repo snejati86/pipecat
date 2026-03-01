@@ -25,6 +25,37 @@ pub struct ExtensionFrame {
     pub data: Box<dyn std::any::Any + Send + Sync>,
     /// A static name for the extension frame type.
     pub type_name: &'static str,
+    /// The frame kind classification (default: `FrameKind::Control`).
+    pub kind: FrameKind,
+    /// Whether this frame survives interruptions (default: `false`).
+    pub uninterruptible: bool,
+}
+
+impl ExtensionFrame {
+    /// Create a new extension frame with the given data and type name.
+    ///
+    /// Defaults to `FrameKind::Control` and interruptible (`uninterruptible = false`).
+    pub fn new(data: Box<dyn std::any::Any + Send + Sync>, type_name: &'static str) -> Self {
+        Self {
+            fields: FrameFields::new(),
+            data,
+            type_name,
+            kind: FrameKind::Control,
+            uninterruptible: false,
+        }
+    }
+
+    /// Set the frame kind classification.
+    pub fn with_kind(mut self, kind: FrameKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set whether this frame should survive interruptions.
+    pub fn with_uninterruptible(mut self, uninterruptible: bool) -> Self {
+        self.uninterruptible = uninterruptible;
+        self
+    }
 }
 
 impl fmt::Debug for ExtensionFrame {
@@ -32,6 +63,8 @@ impl fmt::Debug for ExtensionFrame {
         f.debug_struct("ExtensionFrame")
             .field("type_name", &self.type_name)
             .field("id", &self.fields.id)
+            .field("kind", &self.kind)
+            .field("uninterruptible", &self.uninterruptible)
             .finish_non_exhaustive()
     }
 }
@@ -215,163 +248,107 @@ pub enum FrameEnum {
     Extension(ExtensionFrame),
 }
 
+/// Dispatch macro that generates an exhaustive match over all FrameEnum variants.
+///
+/// Each variant binds the inner frame to `$f` and evaluates `$body`.
+/// This avoids repeating 73 match arms every time a uniform operation is needed.
+///
+/// **Do not** use this for methods with non-uniform arms (e.g. `name()`, `kind()`,
+/// `is_uninterruptible()`) — those require variant-specific logic.
+macro_rules! frame_enum_dispatch {
+    ($self:expr, $f:ident => $body:expr) => {
+        match $self {
+            // System frames
+            Self::Start($f) => $body,
+            Self::Cancel($f) => $body,
+            Self::Error($f) => $body,
+            Self::FatalError($f) => $body,
+            Self::Interruption($f) => $body,
+            Self::UserStartedSpeaking($f) => $body,
+            Self::UserStoppedSpeaking($f) => $body,
+            Self::UserSpeaking($f) => $body,
+            Self::BotStartedSpeaking($f) => $body,
+            Self::BotStoppedSpeaking($f) => $body,
+            Self::BotSpeaking($f) => $body,
+            Self::UserMuteStarted($f) => $body,
+            Self::UserMuteStopped($f) => $body,
+            Self::Metrics($f) => $body,
+            Self::STTMute($f) => $body,
+            Self::InputAudioRaw($f) => $body,
+            Self::InputImageRaw($f) => $body,
+            Self::InputTextRaw($f) => $body,
+            Self::VADUserStartedSpeaking($f) => $body,
+            Self::VADUserStoppedSpeaking($f) => $body,
+            Self::FunctionCallsStarted($f) => $body,
+            Self::FunctionCallCancel($f) => $body,
+            Self::InputTransportMessage($f) => $body,
+            Self::OutputTransportMessageUrgent($f) => $body,
+            Self::UserImageRequest($f) => $body,
+            Self::ServiceMetadata($f) => $body,
+            Self::STTMetadata($f) => $body,
+            Self::SpeechControlParams($f) => $body,
+            Self::Task($f) => $body,
+            Self::EndTask($f) => $body,
+            Self::CancelTask($f) => $body,
+            Self::StopTask($f) => $body,
+            Self::InterruptionTask($f) => $body,
+            // Data frames
+            Self::Text($f) => $body,
+            Self::LLMText($f) => $body,
+            Self::OutputAudioRaw($f) => $body,
+            Self::TTSAudioRaw($f) => $body,
+            Self::OutputImageRaw($f) => $body,
+            Self::Transcription($f) => $body,
+            Self::InterimTranscription($f) => $body,
+            Self::FunctionCallResult($f) => $body,
+            Self::TTSSpeak($f) => $body,
+            Self::OutputTransportMessage($f) => $body,
+            Self::LLMMessagesAppend($f) => $body,
+            Self::LLMMessagesUpdate($f) => $body,
+            Self::LLMSetTools($f) => $body,
+            Self::LLMRun($f) => $body,
+            Self::LLMConfigureOutput($f) => $body,
+            Self::LLMEnablePromptCaching($f) => $body,
+            Self::OutputDTMF($f) => $body,
+            Self::Sprite($f) => $body,
+            // Control frames
+            Self::End($f) => $body,
+            Self::Stop($f) => $body,
+            Self::Heartbeat($f) => $body,
+            Self::LLMFullResponseStart($f) => $body,
+            Self::LLMFullResponseEnd($f) => $body,
+            Self::TTSStarted($f) => $body,
+            Self::TTSStopped($f) => $body,
+            Self::LLMUpdateSettings($f) => $body,
+            Self::TTSUpdateSettings($f) => $body,
+            Self::STTUpdateSettings($f) => $body,
+            Self::VADParamsUpdate($f) => $body,
+            Self::FilterControl($f) => $body,
+            Self::FilterEnable($f) => $body,
+            Self::MixerControl($f) => $body,
+            Self::MixerEnable($f) => $body,
+            Self::OutputTransportReady($f) => $body,
+            Self::LLMContextSummaryRequest($f) => $body,
+            Self::LLMContextSummaryResult($f) => $body,
+            Self::FunctionCallInProgress($f) => $body,
+            Self::ServiceSwitcher($f) => $body,
+            // Test frames
+            Self::Sleep($f) => $body,
+            // Extension
+            Self::Extension($f) => $body,
+        }
+    };
+}
+
 impl FrameEnum {
     /// Get a reference to the common fields.
     pub fn fields(&self) -> &FrameFields {
-        match self {
-            Self::Start(f) => &f.fields,
-            Self::Cancel(f) => &f.fields,
-            Self::Error(f) => &f.fields,
-            Self::FatalError(f) => &f.fields,
-            Self::Interruption(f) => &f.fields,
-            Self::UserStartedSpeaking(f) => &f.fields,
-            Self::UserStoppedSpeaking(f) => &f.fields,
-            Self::UserSpeaking(f) => &f.fields,
-            Self::BotStartedSpeaking(f) => &f.fields,
-            Self::BotStoppedSpeaking(f) => &f.fields,
-            Self::BotSpeaking(f) => &f.fields,
-            Self::UserMuteStarted(f) => &f.fields,
-            Self::UserMuteStopped(f) => &f.fields,
-            Self::Metrics(f) => &f.fields,
-            Self::STTMute(f) => &f.fields,
-            Self::InputAudioRaw(f) => &f.fields,
-            Self::InputImageRaw(f) => &f.fields,
-            Self::InputTextRaw(f) => &f.fields,
-            Self::VADUserStartedSpeaking(f) => &f.fields,
-            Self::VADUserStoppedSpeaking(f) => &f.fields,
-            Self::FunctionCallsStarted(f) => &f.fields,
-            Self::FunctionCallCancel(f) => &f.fields,
-            Self::InputTransportMessage(f) => &f.fields,
-            Self::OutputTransportMessageUrgent(f) => &f.fields,
-            Self::UserImageRequest(f) => &f.fields,
-            Self::ServiceMetadata(f) => &f.fields,
-            Self::STTMetadata(f) => &f.fields,
-            Self::SpeechControlParams(f) => &f.fields,
-            Self::Task(f) => &f.fields,
-            Self::EndTask(f) => &f.fields,
-            Self::CancelTask(f) => &f.fields,
-            Self::StopTask(f) => &f.fields,
-            Self::InterruptionTask(f) => &f.fields,
-            Self::Text(f) => &f.fields,
-            Self::LLMText(f) => &f.fields,
-            Self::OutputAudioRaw(f) => &f.fields,
-            Self::TTSAudioRaw(f) => &f.fields,
-            Self::OutputImageRaw(f) => &f.fields,
-            Self::Transcription(f) => &f.fields,
-            Self::InterimTranscription(f) => &f.fields,
-            Self::FunctionCallResult(f) => &f.fields,
-            Self::TTSSpeak(f) => &f.fields,
-            Self::OutputTransportMessage(f) => &f.fields,
-            Self::LLMMessagesAppend(f) => &f.fields,
-            Self::LLMMessagesUpdate(f) => &f.fields,
-            Self::LLMSetTools(f) => &f.fields,
-            Self::LLMRun(f) => &f.fields,
-            Self::LLMConfigureOutput(f) => &f.fields,
-            Self::LLMEnablePromptCaching(f) => &f.fields,
-            Self::OutputDTMF(f) => &f.fields,
-            Self::Sprite(f) => &f.fields,
-            Self::End(f) => &f.fields,
-            Self::Stop(f) => &f.fields,
-            Self::Heartbeat(f) => &f.fields,
-            Self::LLMFullResponseStart(f) => &f.fields,
-            Self::LLMFullResponseEnd(f) => &f.fields,
-            Self::TTSStarted(f) => &f.fields,
-            Self::TTSStopped(f) => &f.fields,
-            Self::LLMUpdateSettings(f) => &f.fields,
-            Self::TTSUpdateSettings(f) => &f.fields,
-            Self::STTUpdateSettings(f) => &f.fields,
-            Self::VADParamsUpdate(f) => &f.fields,
-            Self::FilterControl(f) => &f.fields,
-            Self::FilterEnable(f) => &f.fields,
-            Self::MixerControl(f) => &f.fields,
-            Self::MixerEnable(f) => &f.fields,
-            Self::OutputTransportReady(f) => &f.fields,
-            Self::LLMContextSummaryRequest(f) => &f.fields,
-            Self::LLMContextSummaryResult(f) => &f.fields,
-            Self::FunctionCallInProgress(f) => &f.fields,
-            Self::ServiceSwitcher(f) => &f.fields,
-            Self::Sleep(f) => &f.fields,
-            Self::Extension(f) => &f.fields,
-        }
+        frame_enum_dispatch!(self, f => &f.fields)
     }
 
     /// Get a mutable reference to the common fields.
     pub fn fields_mut(&mut self) -> &mut FrameFields {
-        match self {
-            Self::Start(f) => &mut f.fields,
-            Self::Cancel(f) => &mut f.fields,
-            Self::Error(f) => &mut f.fields,
-            Self::FatalError(f) => &mut f.fields,
-            Self::Interruption(f) => &mut f.fields,
-            Self::UserStartedSpeaking(f) => &mut f.fields,
-            Self::UserStoppedSpeaking(f) => &mut f.fields,
-            Self::UserSpeaking(f) => &mut f.fields,
-            Self::BotStartedSpeaking(f) => &mut f.fields,
-            Self::BotStoppedSpeaking(f) => &mut f.fields,
-            Self::BotSpeaking(f) => &mut f.fields,
-            Self::UserMuteStarted(f) => &mut f.fields,
-            Self::UserMuteStopped(f) => &mut f.fields,
-            Self::Metrics(f) => &mut f.fields,
-            Self::STTMute(f) => &mut f.fields,
-            Self::InputAudioRaw(f) => &mut f.fields,
-            Self::InputImageRaw(f) => &mut f.fields,
-            Self::InputTextRaw(f) => &mut f.fields,
-            Self::VADUserStartedSpeaking(f) => &mut f.fields,
-            Self::VADUserStoppedSpeaking(f) => &mut f.fields,
-            Self::FunctionCallsStarted(f) => &mut f.fields,
-            Self::FunctionCallCancel(f) => &mut f.fields,
-            Self::InputTransportMessage(f) => &mut f.fields,
-            Self::OutputTransportMessageUrgent(f) => &mut f.fields,
-            Self::UserImageRequest(f) => &mut f.fields,
-            Self::ServiceMetadata(f) => &mut f.fields,
-            Self::STTMetadata(f) => &mut f.fields,
-            Self::SpeechControlParams(f) => &mut f.fields,
-            Self::Task(f) => &mut f.fields,
-            Self::EndTask(f) => &mut f.fields,
-            Self::CancelTask(f) => &mut f.fields,
-            Self::StopTask(f) => &mut f.fields,
-            Self::InterruptionTask(f) => &mut f.fields,
-            Self::Text(f) => &mut f.fields,
-            Self::LLMText(f) => &mut f.fields,
-            Self::OutputAudioRaw(f) => &mut f.fields,
-            Self::TTSAudioRaw(f) => &mut f.fields,
-            Self::OutputImageRaw(f) => &mut f.fields,
-            Self::Transcription(f) => &mut f.fields,
-            Self::InterimTranscription(f) => &mut f.fields,
-            Self::FunctionCallResult(f) => &mut f.fields,
-            Self::TTSSpeak(f) => &mut f.fields,
-            Self::OutputTransportMessage(f) => &mut f.fields,
-            Self::LLMMessagesAppend(f) => &mut f.fields,
-            Self::LLMMessagesUpdate(f) => &mut f.fields,
-            Self::LLMSetTools(f) => &mut f.fields,
-            Self::LLMRun(f) => &mut f.fields,
-            Self::LLMConfigureOutput(f) => &mut f.fields,
-            Self::LLMEnablePromptCaching(f) => &mut f.fields,
-            Self::OutputDTMF(f) => &mut f.fields,
-            Self::Sprite(f) => &mut f.fields,
-            Self::End(f) => &mut f.fields,
-            Self::Stop(f) => &mut f.fields,
-            Self::Heartbeat(f) => &mut f.fields,
-            Self::LLMFullResponseStart(f) => &mut f.fields,
-            Self::LLMFullResponseEnd(f) => &mut f.fields,
-            Self::TTSStarted(f) => &mut f.fields,
-            Self::TTSStopped(f) => &mut f.fields,
-            Self::LLMUpdateSettings(f) => &mut f.fields,
-            Self::TTSUpdateSettings(f) => &mut f.fields,
-            Self::STTUpdateSettings(f) => &mut f.fields,
-            Self::VADParamsUpdate(f) => &mut f.fields,
-            Self::FilterControl(f) => &mut f.fields,
-            Self::FilterEnable(f) => &mut f.fields,
-            Self::MixerControl(f) => &mut f.fields,
-            Self::MixerEnable(f) => &mut f.fields,
-            Self::OutputTransportReady(f) => &mut f.fields,
-            Self::LLMContextSummaryRequest(f) => &mut f.fields,
-            Self::LLMContextSummaryResult(f) => &mut f.fields,
-            Self::FunctionCallInProgress(f) => &mut f.fields,
-            Self::ServiceSwitcher(f) => &mut f.fields,
-            Self::Sleep(f) => &mut f.fields,
-            Self::Extension(f) => &mut f.fields,
-        }
+        frame_enum_dispatch!(self, f => &mut f.fields)
     }
 
     /// Unique frame ID.
@@ -503,27 +480,28 @@ impl FrameEnum {
             | Self::LLMContextSummaryResult(_) | Self::FunctionCallInProgress(_)
             | Self::ServiceSwitcher(_) => FrameKind::Control,
 
-            // Extension defaults to Control
-            Self::Extension(_) => FrameKind::Control,
+            // Extension uses its own kind field
+            Self::Extension(f) => f.kind,
         }
     }
 
     /// Returns true if this frame should not be discarded during interruptions.
     pub fn is_uninterruptible(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Start(_)
-                | Self::End(_)
-                | Self::Stop(_)
-                | Self::Error(_)
-                | Self::FatalError(_)
-                | Self::FunctionCallResult(_)
-                | Self::LLMUpdateSettings(_)
-                | Self::TTSUpdateSettings(_)
-                | Self::STTUpdateSettings(_)
-                | Self::LLMContextSummaryResult(_)
-                | Self::FunctionCallInProgress(_)
-        )
+            | Self::End(_)
+            | Self::Stop(_)
+            | Self::Error(_)
+            | Self::FatalError(_)
+            | Self::FunctionCallResult(_)
+            | Self::LLMUpdateSettings(_)
+            | Self::TTSUpdateSettings(_)
+            | Self::STTUpdateSettings(_)
+            | Self::LLMContextSummaryResult(_)
+            | Self::FunctionCallInProgress(_) => true,
+            Self::Extension(f) => f.uninterruptible,
+            _ => false,
+        }
     }
 
     /// Returns true if this is a system frame.
@@ -544,82 +522,7 @@ impl FrameEnum {
 
 impl fmt::Display for FrameEnum {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Delegate to each variant's Display impl
-        match self {
-            Self::Start(inner) => inner.fmt(f),
-            Self::Cancel(inner) => inner.fmt(f),
-            Self::Error(inner) => inner.fmt(f),
-            Self::FatalError(inner) => inner.fmt(f),
-            Self::Interruption(inner) => inner.fmt(f),
-            Self::UserStartedSpeaking(inner) => inner.fmt(f),
-            Self::UserStoppedSpeaking(inner) => inner.fmt(f),
-            Self::UserSpeaking(inner) => inner.fmt(f),
-            Self::BotStartedSpeaking(inner) => inner.fmt(f),
-            Self::BotStoppedSpeaking(inner) => inner.fmt(f),
-            Self::BotSpeaking(inner) => inner.fmt(f),
-            Self::UserMuteStarted(inner) => inner.fmt(f),
-            Self::UserMuteStopped(inner) => inner.fmt(f),
-            Self::Metrics(inner) => inner.fmt(f),
-            Self::STTMute(inner) => inner.fmt(f),
-            Self::InputAudioRaw(inner) => inner.fmt(f),
-            Self::InputImageRaw(inner) => inner.fmt(f),
-            Self::InputTextRaw(inner) => inner.fmt(f),
-            Self::VADUserStartedSpeaking(inner) => inner.fmt(f),
-            Self::VADUserStoppedSpeaking(inner) => inner.fmt(f),
-            Self::FunctionCallsStarted(inner) => inner.fmt(f),
-            Self::FunctionCallCancel(inner) => inner.fmt(f),
-            Self::InputTransportMessage(inner) => inner.fmt(f),
-            Self::OutputTransportMessageUrgent(inner) => inner.fmt(f),
-            Self::UserImageRequest(inner) => inner.fmt(f),
-            Self::ServiceMetadata(inner) => inner.fmt(f),
-            Self::STTMetadata(inner) => inner.fmt(f),
-            Self::SpeechControlParams(inner) => inner.fmt(f),
-            Self::Task(inner) => inner.fmt(f),
-            Self::EndTask(inner) => inner.fmt(f),
-            Self::CancelTask(inner) => inner.fmt(f),
-            Self::StopTask(inner) => inner.fmt(f),
-            Self::InterruptionTask(inner) => inner.fmt(f),
-            Self::Text(inner) => inner.fmt(f),
-            Self::LLMText(inner) => inner.fmt(f),
-            Self::OutputAudioRaw(inner) => inner.fmt(f),
-            Self::TTSAudioRaw(inner) => inner.fmt(f),
-            Self::OutputImageRaw(inner) => inner.fmt(f),
-            Self::Transcription(inner) => inner.fmt(f),
-            Self::InterimTranscription(inner) => inner.fmt(f),
-            Self::FunctionCallResult(inner) => inner.fmt(f),
-            Self::TTSSpeak(inner) => inner.fmt(f),
-            Self::OutputTransportMessage(inner) => inner.fmt(f),
-            Self::LLMMessagesAppend(inner) => inner.fmt(f),
-            Self::LLMMessagesUpdate(inner) => inner.fmt(f),
-            Self::LLMSetTools(inner) => inner.fmt(f),
-            Self::LLMRun(inner) => inner.fmt(f),
-            Self::LLMConfigureOutput(inner) => inner.fmt(f),
-            Self::LLMEnablePromptCaching(inner) => inner.fmt(f),
-            Self::OutputDTMF(inner) => inner.fmt(f),
-            Self::Sprite(inner) => inner.fmt(f),
-            Self::End(inner) => inner.fmt(f),
-            Self::Stop(inner) => inner.fmt(f),
-            Self::Heartbeat(inner) => inner.fmt(f),
-            Self::LLMFullResponseStart(inner) => inner.fmt(f),
-            Self::LLMFullResponseEnd(inner) => inner.fmt(f),
-            Self::TTSStarted(inner) => inner.fmt(f),
-            Self::TTSStopped(inner) => inner.fmt(f),
-            Self::LLMUpdateSettings(inner) => inner.fmt(f),
-            Self::TTSUpdateSettings(inner) => inner.fmt(f),
-            Self::STTUpdateSettings(inner) => inner.fmt(f),
-            Self::VADParamsUpdate(inner) => inner.fmt(f),
-            Self::FilterControl(inner) => inner.fmt(f),
-            Self::FilterEnable(inner) => inner.fmt(f),
-            Self::MixerControl(inner) => inner.fmt(f),
-            Self::MixerEnable(inner) => inner.fmt(f),
-            Self::OutputTransportReady(inner) => inner.fmt(f),
-            Self::LLMContextSummaryRequest(inner) => inner.fmt(f),
-            Self::LLMContextSummaryResult(inner) => inner.fmt(f),
-            Self::FunctionCallInProgress(inner) => inner.fmt(f),
-            Self::ServiceSwitcher(inner) => inner.fmt(f),
-            Self::Sleep(inner) => inner.fmt(f),
-            Self::Extension(inner) => inner.fmt(f),
-        }
+        frame_enum_dispatch!(self, inner => write!(f, "{inner}"))
     }
 }
 
@@ -1022,11 +925,7 @@ mod tests {
 
     #[test]
     fn test_frame_enum_extension() {
-        let ext = ExtensionFrame {
-            fields: FrameFields::new(),
-            data: Box::new(42u32),
-            type_name: "MyCustomFrame",
-        };
+        let ext = ExtensionFrame::new(Box::new(42u32), "MyCustomFrame");
         let frame = FrameEnum::from(ext);
         assert_eq!(frame.name(), "MyCustomFrame");
         assert!(frame.is_control_frame()); // extension defaults to control
@@ -1187,11 +1086,7 @@ mod tests {
 
     #[test]
     fn test_extension_frame_downcast_wrong_type() {
-        let ext = ExtensionFrame {
-            fields: FrameFields::new(),
-            data: Box::new(42u32),
-            type_name: "MyFrame",
-        };
+        let ext = ExtensionFrame::new(Box::new(42u32), "MyFrame");
         let frame = FrameEnum::from(ext);
         if let FrameEnum::Extension(ref e) = frame {
             assert!(e.data.downcast_ref::<String>().is_none());
@@ -1203,14 +1098,59 @@ mod tests {
 
     #[test]
     fn test_extension_frame_display() {
-        let ext = ExtensionFrame {
-            fields: FrameFields::new(),
-            data: Box::new("hello"),
-            type_name: "CustomFrame",
-        };
+        let ext = ExtensionFrame::new(Box::new("hello"), "CustomFrame");
         let frame = FrameEnum::from(ext);
         assert_eq!(format!("{}", frame), "ExtensionFrame(CustomFrame)");
         assert_eq!(frame.kind(), FrameKind::Control);
+    }
+
+    #[test]
+    fn test_extension_frame_constructor_and_builders() {
+        // Default constructor: Control kind, interruptible
+        let ext = ExtensionFrame::new(Box::new(99u64), "DefaultExt");
+        assert_eq!(ext.type_name, "DefaultExt");
+        assert_eq!(ext.kind, FrameKind::Control);
+        assert!(!ext.uninterruptible);
+        assert_eq!(*ext.data.downcast_ref::<u64>().unwrap(), 99);
+
+        // Builder: set kind to Data
+        let ext_data = ExtensionFrame::new(Box::new("payload"), "DataExt")
+            .with_kind(FrameKind::Data);
+        let frame = FrameEnum::from(ext_data);
+        assert!(frame.is_data_frame());
+        assert!(!frame.is_uninterruptible());
+
+        // Builder: set kind to System
+        let ext_sys = ExtensionFrame::new(Box::new(true), "SysExt")
+            .with_kind(FrameKind::System);
+        let frame = FrameEnum::from(ext_sys);
+        assert!(frame.is_system_frame());
+
+        // Builder: set uninterruptible
+        let ext_unint = ExtensionFrame::new(Box::new(0u8), "UnintExt")
+            .with_uninterruptible(true);
+        let frame = FrameEnum::from(ext_unint);
+        assert!(frame.is_uninterruptible());
+        assert!(frame.is_control_frame()); // kind still defaults to Control
+
+        // Builder: chain both
+        let ext_both = ExtensionFrame::new(Box::new(vec![1, 2, 3]), "BothExt")
+            .with_kind(FrameKind::Data)
+            .with_uninterruptible(true);
+        let frame = FrameEnum::from(ext_both);
+        assert!(frame.is_data_frame());
+        assert!(frame.is_uninterruptible());
+    }
+
+    #[test]
+    fn test_extension_frame_debug_includes_new_fields() {
+        let ext = ExtensionFrame::new(Box::new(42u32), "DebugTest")
+            .with_kind(FrameKind::Data)
+            .with_uninterruptible(true);
+        let debug = format!("{:?}", ext);
+        assert!(debug.contains("DebugTest"));
+        assert!(debug.contains("Data"));
+        assert!(debug.contains("uninterruptible"));
     }
 
     #[test]
@@ -1259,11 +1199,7 @@ mod tests {
 
     #[test]
     fn test_into_arc_frame_extension() {
-        let ext = ExtensionFrame {
-            fields: FrameFields::new(),
-            data: Box::new(42u32),
-            type_name: "TestExt",
-        };
+        let ext = ExtensionFrame::new(Box::new(42u32), "TestExt");
         let frame_enum = FrameEnum::from(ext);
         let arc_frame = frame_enum.into_arc_frame();
         // Extension wraps as FrameEnum
