@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod dtmf;
+pub mod resampler;
 pub mod utils;
 pub mod vad;
 
