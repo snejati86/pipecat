@@ -221,4 +221,22 @@ mod tests {
         assert_eq!(cloned.processor_id, 1);
         assert_eq!(cloned.frame_name, "AudioFrame");
     }
+
+    #[test]
+    fn test_frame_pushed_clone() {
+        let data = FramePushed {
+            source_id: 1,
+            source_name: "src".to_string(),
+            destination_id: 2,
+            destination_name: "dst".to_string(),
+            frame_id: 42,
+            frame_name: "TextFrame".to_string(),
+            direction: FrameDirection::Downstream,
+            timestamp: 999,
+            frame_kind: FrameKind::Data,
+        };
+        let cloned = data.clone();
+        assert_eq!(cloned.source_id, 1);
+        assert_eq!(cloned.frame_kind, FrameKind::Data);
+    }
 }
