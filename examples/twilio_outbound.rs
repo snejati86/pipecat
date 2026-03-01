@@ -298,7 +298,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
                 WsMsg::Text(text) => {
                     if let Some(frame) = serializer_for_read.deserialize(text.as_bytes()) {
                         // Check for EndFrame from deserializer
-                        if frame.downcast_ref::<EndFrame>().is_some() {
+                        if matches!(&frame, FrameEnum::End(_)) {
                             pipeline_input_for_reader
                                 .send(
                                     FrameEnum::End(EndFrame::new()),
@@ -307,12 +307,10 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
                                 .await;
                             break;
                         }
-                        // Convert Arc<dyn Frame> -> FrameEnum and send to pipeline
-                        if let Some(fe) = FrameEnum::try_from_arc(frame) {
-                            pipeline_input_for_reader
-                                .send(fe, FrameDirection::Downstream)
-                                .await;
-                        }
+                        // Send FrameEnum directly to pipeline
+                        pipeline_input_for_reader
+                            .send(frame, FrameDirection::Downstream)
+                            .await;
                     } else {
                         // Check if it's a stop event
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {

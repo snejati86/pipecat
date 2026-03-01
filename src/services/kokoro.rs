@@ -39,9 +39,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
-use crate::audio::codec::strip_wav_header;
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
+    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame,
     OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
 use crate::impl_base_display;
@@ -107,6 +106,20 @@ pub struct SpeechRequest {
     pub speed: f64,
     /// Output sample rate in Hertz.
     pub sample_rate: u32,
+}
+
+/// Standard WAV header size in bytes.
+pub const WAV_HEADER_SIZE: usize = 44;
+
+/// Strip the 44-byte WAV header from audio data.
+///
+/// If the data is shorter than `WAV_HEADER_SIZE`, returns an empty slice.
+pub fn strip_wav_header(data: &[u8]) -> &[u8] {
+    if data.len() > WAV_HEADER_SIZE {
+        &data[WAV_HEADER_SIZE..]
+    } else {
+        &[]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,9 +294,9 @@ impl KokoroTTSService {
     }
 
     /// Perform a TTS request via the Kokoro HTTP API and return frames.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = self.build_request(text);
         let url = self.build_url();
@@ -296,7 +309,9 @@ impl KokoroTTSService {
         );
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let request_builder = self.client.post(&url).json(&request_body);
         let request_builder = self.apply_auth(request_builder);
@@ -305,11 +320,13 @@ impl KokoroTTSService {
             Ok(resp) => resp,
             Err(e) => {
                 error!(error = %e, "Kokoro TTS HTTP request failed");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Kokoro TTS request failed: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -318,11 +335,13 @@ impl KokoroTTSService {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
             error!(status = %status, body = %error_body, "Kokoro TTS API error");
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Kokoro TTS API error (HTTP {status}): {error_body}"),
                 false,
             )));
-            frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+            frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                context_id,
+            ))));
             return frames;
         }
 
@@ -331,11 +350,13 @@ impl KokoroTTSService {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
                 error!(error = %e, "Failed to read Kokoro TTS response body");
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to read response body: {e}"),
                     false,
                 )));
-                frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+                frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                    context_id,
+                ))));
                 return frames;
             }
         };
@@ -349,7 +370,7 @@ impl KokoroTTSService {
                 format = %self.response_format,
                 "Received Kokoro TTS audio"
             );
-            frames.push(Arc::new(OutputAudioRawFrame::new(
+            frames.push(FrameEnum::OutputAudioRaw(OutputAudioRawFrame::new(
                 audio_data,
                 self.sample_rate,
                 1, // mono
@@ -357,7 +378,9 @@ impl KokoroTTSService {
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -569,7 +592,7 @@ impl TTSService for KokoroTTSService {
     ///
     /// Returns `TTSStartedFrame`, zero or one `OutputAudioRawFrame`, and
     /// a `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         debug!(
             voice = %self.voice,
             text = %text,
@@ -956,52 +979,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WAV header stripping tests (delegates to crate::audio::codec)
+    // WAV header stripping tests
     // -----------------------------------------------------------------------
-
-    /// Build a minimal valid 44-byte WAV header followed by `pcm` data.
-    fn make_wav(pcm: &[u8]) -> Vec<u8> {
-        let data_size = pcm.len() as u32;
-        let mut wav = Vec::with_capacity(44 + pcm.len());
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-        wav.extend_from_slice(&24000u32.to_le_bytes());
-        wav.extend_from_slice(&48000u32.to_le_bytes());
-        wav.extend_from_slice(&2u16.to_le_bytes());
-        wav.extend_from_slice(&16u16.to_le_bytes());
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm);
-        wav
-    }
 
     #[test]
     fn test_strip_wav_header_normal() {
-        let data = make_wav(&[1, 2, 3, 4]);
+        let mut data = vec![0u8; WAV_HEADER_SIZE]; // 44-byte header
+        data.extend_from_slice(&[1, 2, 3, 4]); // PCM audio data
         let stripped = strip_wav_header(&data);
         assert_eq!(stripped, &[1, 2, 3, 4]);
     }
 
     #[test]
     fn test_strip_wav_header_exact_header_size() {
-        let data = make_wav(&[]);
+        let data = vec![0u8; WAV_HEADER_SIZE];
         let stripped = strip_wav_header(&data);
-        // Exactly 44 bytes with valid RIFF/WAVE but no data beyond header,
-        // shared implementation returns empty slice (no PCM data).
-        assert_eq!(stripped.len(), 0);
+        assert!(stripped.is_empty());
     }
 
     #[test]
     fn test_strip_wav_header_shorter_than_header() {
         let data = vec![0u8; 20];
         let stripped = strip_wav_header(&data);
-        // Not a valid WAV, returned unchanged.
-        assert_eq!(stripped.len(), 20);
+        assert!(stripped.is_empty());
     }
 
     #[test]
@@ -1014,8 +1014,9 @@ mod tests {
     #[test]
     fn test_strip_wav_header_large_audio() {
         // Simulate 1 second of 24kHz 16-bit mono (48000 bytes) with WAV header.
+        let mut data = vec![0u8; WAV_HEADER_SIZE];
         let pcm_data = vec![0xABu8; 48000];
-        let data = make_wav(&pcm_data);
+        data.extend_from_slice(&pcm_data);
         let stripped = strip_wav_header(&data);
         assert_eq!(stripped.len(), 48000);
         assert!(stripped.iter().all(|&b| b == 0xAB));
@@ -1036,7 +1037,8 @@ mod tests {
     #[test]
     fn test_extract_audio_wav_strips_header() {
         let service = KokoroTTSService::new().with_response_format(AudioFormat::Wav);
-        let data = make_wav(&[10, 20, 30]);
+        let mut data = vec![0u8; WAV_HEADER_SIZE];
+        data.extend_from_slice(&[10, 20, 30]);
         let result = service.extract_audio(data);
         assert_eq!(result, vec![10, 20, 30]);
     }
@@ -1046,8 +1048,7 @@ mod tests {
         let service = KokoroTTSService::new().with_response_format(AudioFormat::Wav);
         let data = vec![0u8; 10];
         let result = service.extract_audio(data);
-        // Not a valid WAV, returned unchanged.
-        assert_eq!(result.len(), 10);
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1330,18 +1331,12 @@ mod tests {
 
         // Should contain TTSStartedFrame, ErrorFrame, TTSStoppedFrame.
         assert!(!frames.is_empty());
-        let has_error = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<ErrorFrame>().is_some());
+        let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(has_error, "Expected an ErrorFrame on connection failure");
 
         // Should still have started and stopped frames.
-        let has_started = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStartedFrame>().is_some());
-        let has_stopped = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<TTSStoppedFrame>().is_some());
+        let has_started = frames.iter().any(|f| matches!(f, FrameEnum::TTSStarted(_)));
+        let has_stopped = frames.iter().any(|f| matches!(f, FrameEnum::TTSStopped(_)));
         assert!(has_started, "Expected TTSStartedFrame even on error");
         assert!(has_stopped, "Expected TTSStoppedFrame even on error");
     }
@@ -1353,7 +1348,13 @@ mod tests {
 
         let error_frame = frames
             .iter()
-            .find_map(|f| f.as_any().downcast_ref::<ErrorFrame>())
+            .find_map(|f| {
+                if let FrameEnum::Error(inner) = f {
+                    Some(inner)
+                } else {
+                    None
+                }
+            })
             .expect("Expected an ErrorFrame");
         assert!(
             error_frame.error.contains("Kokoro TTS request failed"),
@@ -1499,4 +1500,12 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // WAV_HEADER_SIZE constant test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wav_header_size_constant() {
+        assert_eq!(WAV_HEADER_SIZE, 44);
+    }
 }

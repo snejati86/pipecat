@@ -49,7 +49,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -60,8 +60,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
 use crate::frames::{
-    ErrorFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, TTSAudioRawFrame,
-    TTSStartedFrame, TTSStoppedFrame, TextFrame,
+    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+    TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
@@ -405,9 +405,9 @@ impl ElevenLabsTTSService {
     /// 1. Send initial message with text, voice settings, and API key
     /// 2. Send flush message `{"text": ""}` to signal end of input
     /// 3. Read audio chunks until `isFinal: true` is received
-    async fn run_tts_ws(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_ws(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         // Build the initial request with text, voice settings, and API key.
         let request = ElevenLabsWsRequest {
@@ -419,7 +419,7 @@ impl ElevenLabsTTSService {
         let request_json = match serde_json::to_string(&request) {
             Ok(json) => json,
             Err(e) => {
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("Failed to serialize ElevenLabs request: {e}"),
                     false,
                 )));
@@ -429,14 +429,13 @@ impl ElevenLabsTTSService {
 
         let ttfb_start = Instant::now();
         let mut got_first_audio = false;
-        let mut actual_ttfb = Duration::ZERO;
 
         // Send the request and receive responses under the lock.
         let mut ws_guard = self.ws.lock().await;
         let ws = match ws_guard.as_mut() {
             Some(ws) => ws,
             None => {
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     "WebSocket not connected. Call connect() first.".to_string(),
                     false,
                 )));
@@ -445,8 +444,7 @@ impl ElevenLabsTTSService {
         };
 
         if let Err(e) = ws.send(WsMessage::Text(request_json)).await {
-            *ws_guard = None; // Invalidate broken connection for reconnection
-            frames.push(Arc::new(ErrorFrame::new(
+            frames.push(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
             )));
@@ -467,7 +465,9 @@ impl ElevenLabsTTSService {
         }
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         tracing::debug!(
             service = %self.base.name(),
@@ -477,13 +477,11 @@ impl ElevenLabsTTSService {
         );
 
         // Read messages until we get a final message or error.
-        let mut ws_broken = false;
         loop {
             let msg = match ws.next().await {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
-                    ws_broken = true;
-                    frames.push(Arc::new(ErrorFrame::new(
+                    frames.push(FrameEnum::Error(ErrorFrame::new(
                         format!("WebSocket receive error: {e}"),
                         false,
                     )));
@@ -491,8 +489,7 @@ impl ElevenLabsTTSService {
                 }
                 None => {
                     // Connection closed unexpectedly.
-                    ws_broken = true;
-                    frames.push(Arc::new(ErrorFrame::new(
+                    frames.push(FrameEnum::Error(ErrorFrame::new(
                         "WebSocket connection closed unexpectedly".to_string(),
                         false,
                     )));
@@ -503,7 +500,6 @@ impl ElevenLabsTTSService {
             let text_data = match msg {
                 WsMessage::Text(t) => t.to_string(),
                 WsMessage::Close(_) => {
-                    ws_broken = true;
                     tracing::debug!(
                         service = %self.base.name(),
                         "WebSocket closed by server"
@@ -532,7 +528,7 @@ impl ElevenLabsTTSService {
                     error = %error,
                     "ElevenLabs WebSocket error"
                 );
-                frames.push(Arc::new(ErrorFrame::new(
+                frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("ElevenLabs error: {error}"),
                     false,
                 )));
@@ -547,17 +543,17 @@ impl ElevenLabsTTSService {
                             if !audio_bytes.is_empty() {
                                 if !got_first_audio {
                                     got_first_audio = true;
-                                    actual_ttfb = ttfb_start.elapsed();
+                                    let ttfb = ttfb_start.elapsed();
                                     tracing::debug!(
                                         service = %self.base.name(),
-                                        ttfb_ms = %actual_ttfb.as_millis(),
+                                        ttfb_ms = %ttfb.as_millis(),
                                         "Time to first byte"
                                     );
                                 }
                                 let mut audio_frame =
                                     TTSAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
                                 audio_frame.context_id = Some(context_id.clone());
-                                frames.push(Arc::new(audio_frame));
+                                frames.push(audio_frame.into());
                             }
                         }
                         Err(e) => {
@@ -565,10 +561,6 @@ impl ElevenLabsTTSService {
                                 service = %self.base.name(),
                                 "Failed to decode base64 audio chunk: {e}"
                             );
-                            frames.push(Arc::new(ErrorFrame::new(
-                                format!("{}: base64 decode failed: {e}", self.base.name()),
-                                false,
-                            )));
                         }
                     }
                 }
@@ -585,19 +577,17 @@ impl ElevenLabsTTSService {
             }
         }
 
-        // Invalidate broken connection so connect() can reconnect.
-        if ws_broken {
-            *ws_guard = None;
-        }
-
-        // Record metrics using the actual time-to-first-byte, not total time.
+        // Record metrics.
+        let ttfb = ttfb_start.elapsed();
         self.last_metrics = Some(TTSMetrics {
-            ttfb_ms: actual_ttfb.as_secs_f64() * 1000.0,
+            ttfb_ms: ttfb.as_secs_f64() * 1000.0,
             character_count: text.len(),
         });
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -643,7 +633,7 @@ impl FrameProcessor for ElevenLabsTTSService {
             );
             let result_frames = self.run_tts(&text_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
             || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
@@ -654,10 +644,6 @@ impl FrameProcessor for ElevenLabsTTSService {
             // Pass all other frames through in their original direction.
             self.push_frame(frame, direction).await;
         }
-    }
-
-    async fn cleanup(&mut self) {
-        self.disconnect().await;
     }
 }
 
@@ -684,7 +670,7 @@ impl TTSService for ElevenLabsTTSService {
     /// calling this method. Returns `TTSStartedFrame`, zero or more
     /// `TTSAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
     /// `ErrorFrame` is included in the returned vector.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (WebSocket)");
         self.run_tts_ws(text).await
     }
@@ -836,9 +822,9 @@ impl ElevenLabsHttpTTSService {
     }
 
     /// Perform a TTS request via the HTTP API.
-    async fn run_tts_http(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts_http(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
-        let mut frames: Vec<Arc<dyn Frame>> = Vec::new();
+        let mut frames: Vec<FrameEnum> = Vec::new();
 
         let request_body = ElevenLabsHttpRequest {
             text: text.to_string(),
@@ -858,7 +844,9 @@ impl ElevenLabsHttpTTSService {
         let ttfb_start = Instant::now();
 
         // Push TTSStartedFrame.
-        frames.push(Arc::new(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let response = self
             .client
@@ -885,7 +873,7 @@ impl ElevenLabsHttpTTSService {
                     let error_msg =
                         format!("ElevenLabs API returned status {status}: {error_text}");
                     tracing::error!(service = %self.base.name(), "{}", error_msg);
-                    frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                    frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                 } else {
                     match resp.bytes().await {
                         Ok(audio_data) => {
@@ -903,12 +891,12 @@ impl ElevenLabsHttpTTSService {
                             let mut audio_frame =
                                 TTSAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
                             audio_frame.context_id = Some(context_id.clone());
-                            frames.push(Arc::new(audio_frame));
+                            frames.push(audio_frame.into());
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
                             tracing::error!(service = %self.base.name(), "{}", error_msg);
-                            frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                            frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                         }
                     }
                 }
@@ -916,12 +904,14 @@ impl ElevenLabsHttpTTSService {
             Err(e) => {
                 let error_msg = format!("HTTP request to ElevenLabs failed: {e}");
                 tracing::error!(service = %self.base.name(), "{}", error_msg);
-                frames.push(Arc::new(ErrorFrame::new(error_msg, false)));
+                frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
             }
         }
 
         // Push TTSStoppedFrame.
-        frames.push(Arc::new(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }
@@ -968,7 +958,7 @@ impl FrameProcessor for ElevenLabsHttpTTSService {
             );
             let result_frames = self.run_tts(&text_frame.text).await;
             for f in result_frames {
-                self.push_frame(f, FrameDirection::Downstream).await;
+                self.push_frame(f.into(), FrameDirection::Downstream).await;
             }
         } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
             || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
@@ -996,7 +986,7 @@ impl TTSService for ElevenLabsHttpTTSService {
     /// Makes a `POST` request to `/v1/text-to-speech/{voice_id}/stream` and returns
     /// the complete audio as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame`
     /// and `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
-    async fn run_tts(&mut self, text: &str) -> Vec<Arc<dyn Frame>> {
+    async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (HTTP)");
         self.run_tts_http(text).await
     }
@@ -1657,9 +1647,7 @@ mod tests {
 
         // Should get an error frame because WebSocket is not connected.
         assert!(!frames.is_empty());
-        let has_error = frames
-            .iter()
-            .any(|f| f.as_any().downcast_ref::<ErrorFrame>().is_some());
+        let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(
             has_error,
             "Expected ErrorFrame when WebSocket not connected"
@@ -1668,7 +1656,13 @@ mod tests {
         // Check the error message.
         let error_frame = frames
             .iter()
-            .find_map(|f| f.as_any().downcast_ref::<ErrorFrame>())
+            .find_map(|f| {
+                if let FrameEnum::Error(inner) = f {
+                    Some(inner)
+                } else {
+                    None
+                }
+            })
             .unwrap();
         assert!(error_frame.error.contains("WebSocket not connected"));
     }

@@ -167,7 +167,7 @@ impl FrameSerializer for JsonFrameSerializer {
         Some(SerializedFrame::Text(json_str))
     }
 
-    fn deserialize(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
         let text = std::str::from_utf8(data).ok()?;
         deserialize_frame_from_json(text)
     }
@@ -305,25 +305,25 @@ fn serialize_frame_to_json(frame: &dyn Frame) -> Option<String> {
 /// Deserialize a JSON string to a pipeline frame.
 ///
 /// Returns `None` if the JSON is malformed or the frame type is unknown.
-fn deserialize_frame_from_json(text: &str) -> Option<Arc<dyn Frame>> {
+fn deserialize_frame_from_json(text: &str) -> Option<FrameEnum> {
     let wire: WireFrameIn = serde_json::from_str(text).ok()?;
 
     match wire.frame_type.as_str() {
         "text" => {
             // Text payload is just {"text": "..."}, parse inline.
             let text_val = wire.payload.get("text")?.as_str()?;
-            Some(Arc::new(TextFrame::new(text_val.to_owned())))
+            Some(FrameEnum::Text(TextFrame::new(text_val.to_owned())))
         }
         "transcription" => {
             let w: WireTranscriptionIn = serde_json::from_value(wire.payload).ok()?;
             let mut frame = TranscriptionFrame::new(w.text, w.user_id, w.timestamp);
             frame.language = w.language;
-            Some(Arc::new(frame))
+            Some(FrameEnum::Transcription(frame))
         }
         "audio_input" => {
             let w: WireAudioIn = serde_json::from_value(wire.payload).ok()?;
             let audio = decode_base64(&w.audio)?;
-            Some(Arc::new(InputAudioRawFrame::new(
+            Some(FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
                 audio,
                 w.sample_rate,
                 w.num_channels,
@@ -332,7 +332,7 @@ fn deserialize_frame_from_json(text: &str) -> Option<Arc<dyn Frame>> {
         "audio_output" => {
             let w: WireAudioIn = serde_json::from_value(wire.payload).ok()?;
             let audio = decode_base64(&w.audio)?;
-            Some(Arc::new(OutputAudioRawFrame::new(
+            Some(FrameEnum::OutputAudioRaw(OutputAudioRawFrame::new(
                 audio,
                 w.sample_rate,
                 w.num_channels,
@@ -340,29 +340,33 @@ fn deserialize_frame_from_json(text: &str) -> Option<Arc<dyn Frame>> {
         }
         "message_input" => {
             let w: WireMessageIn = serde_json::from_value(wire.payload).ok()?;
-            Some(Arc::new(InputTransportMessageFrame::new(w.message)))
+            Some(FrameEnum::InputTransportMessage(
+                InputTransportMessageFrame::new(w.message),
+            ))
         }
         "message_output" => {
             let w: WireMessageIn = serde_json::from_value(wire.payload).ok()?;
-            Some(Arc::new(OutputTransportMessageFrame::new(w.message)))
+            Some(FrameEnum::OutputTransportMessage(
+                OutputTransportMessageFrame::new(w.message),
+            ))
         }
         "start" => {
             let w: WireStartIn = serde_json::from_value(wire.payload).ok()?;
-            Some(Arc::new(StartFrame::new(
+            Some(FrameEnum::Start(StartFrame::new(
                 w.audio_in_sample_rate,
                 w.audio_out_sample_rate,
                 w.allow_interruptions,
                 w.enable_metrics,
             )))
         }
-        "end" => Some(Arc::new(EndFrame::new())),
+        "end" => Some(FrameEnum::End(EndFrame::new())),
         "cancel" => {
             let w: WireCancelIn = serde_json::from_value(wire.payload).ok()?;
-            Some(Arc::new(CancelFrame::new(w.reason)))
+            Some(FrameEnum::Cancel(CancelFrame::new(w.reason)))
         }
         "error" => {
             let w: WireErrorIn = serde_json::from_value(wire.payload).ok()?;
-            Some(Arc::new(ErrorFrame::new(w.error, w.fatal)))
+            Some(FrameEnum::Error(ErrorFrame::new(w.error, w.fatal)))
         }
         other => {
             warn!("JsonFrameSerializer: unknown frame type '{}'", other);
@@ -380,7 +384,7 @@ mod tests {
     use super::*;
 
     /// Helper to serialize and then deserialize a frame through the serializer.
-    fn roundtrip(serializer: &JsonFrameSerializer, frame: Arc<dyn Frame>) -> Arc<dyn Frame> {
+    fn roundtrip(serializer: &JsonFrameSerializer, frame: Arc<dyn Frame>) -> FrameEnum {
         let serialized = serializer.serialize(frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Text(t) => t.as_bytes(),
@@ -395,8 +399,10 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello world".to_string()));
 
         let deserialized = roundtrip(&serializer, frame);
-        let tf = deserialized.downcast_ref::<TextFrame>().unwrap();
-        assert_eq!(tf.text, "hello world");
+        match &deserialized {
+            FrameEnum::Text(tf) => assert_eq!(tf.text, "hello world"),
+            other => panic!("expected TextFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -409,10 +415,14 @@ mod tests {
         ));
 
         let deserialized = roundtrip(&serializer, frame);
-        let tf = deserialized.downcast_ref::<TranscriptionFrame>().unwrap();
-        assert_eq!(tf.text, "testing");
-        assert_eq!(tf.user_id, "user-1");
-        assert_eq!(tf.timestamp, "2024-01-01T00:00:00Z");
+        match &deserialized {
+            FrameEnum::Transcription(tf) => {
+                assert_eq!(tf.text, "testing");
+                assert_eq!(tf.user_id, "user-1");
+                assert_eq!(tf.timestamp, "2024-01-01T00:00:00Z");
+            }
+            other => panic!("expected TranscriptionFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -427,9 +437,13 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(frame);
 
         let deserialized = roundtrip(&serializer, frame);
-        let tf = deserialized.downcast_ref::<TranscriptionFrame>().unwrap();
-        assert_eq!(tf.text, "hola");
-        assert_eq!(tf.language, Some("es".to_string()));
+        match &deserialized {
+            FrameEnum::Transcription(tf) => {
+                assert_eq!(tf.text, "hola");
+                assert_eq!(tf.language, Some("es".to_string()));
+            }
+            other => panic!("expected TranscriptionFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -439,10 +453,14 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
 
         let deserialized = roundtrip(&serializer, frame);
-        let af = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
-        assert_eq!(af.audio.audio, audio_data);
-        assert_eq!(af.audio.sample_rate, 16000);
-        assert_eq!(af.audio.num_channels, 1);
+        match &deserialized {
+            FrameEnum::InputAudioRaw(af) => {
+                assert_eq!(af.audio.audio, audio_data);
+                assert_eq!(af.audio.sample_rate, 16000);
+                assert_eq!(af.audio.num_channels, 1);
+            }
+            other => panic!("expected InputAudioRawFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -453,10 +471,14 @@ mod tests {
             Arc::new(OutputAudioRawFrame::new(audio_data.clone(), 24000, 2));
 
         let deserialized = roundtrip(&serializer, frame);
-        let af = deserialized.downcast_ref::<OutputAudioRawFrame>().unwrap();
-        assert_eq!(af.audio.audio, audio_data);
-        assert_eq!(af.audio.sample_rate, 24000);
-        assert_eq!(af.audio.num_channels, 2);
+        match &deserialized {
+            FrameEnum::OutputAudioRaw(af) => {
+                assert_eq!(af.audio.audio, audio_data);
+                assert_eq!(af.audio.sample_rate, 24000);
+                assert_eq!(af.audio.num_channels, 2);
+            }
+            other => panic!("expected OutputAudioRawFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -467,18 +489,18 @@ mod tests {
         let msg = serde_json::json!({"key": "value", "count": 42});
         let frame: Arc<dyn Frame> = Arc::new(OutputTransportMessageFrame::new(msg.clone()));
         let deserialized = roundtrip(&serializer, frame);
-        let mf = deserialized
-            .downcast_ref::<OutputTransportMessageFrame>()
-            .unwrap();
-        assert_eq!(mf.message, msg);
+        match &deserialized {
+            FrameEnum::OutputTransportMessage(mf) => assert_eq!(mf.message, msg),
+            other => panic!("expected OutputTransportMessageFrame, got {}", other),
+        }
 
         // Input message
         let frame2: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(msg.clone()));
         let deserialized2 = roundtrip(&serializer, frame2);
-        let mf2 = deserialized2
-            .downcast_ref::<InputTransportMessageFrame>()
-            .unwrap();
-        assert_eq!(mf2.message, msg);
+        match &deserialized2 {
+            FrameEnum::InputTransportMessage(mf2) => assert_eq!(mf2.message, msg),
+            other => panic!("expected InputTransportMessageFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -487,11 +509,15 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(StartFrame::new(16000, 24000, true, true));
 
         let deserialized = roundtrip(&serializer, frame);
-        let sf = deserialized.downcast_ref::<StartFrame>().unwrap();
-        assert_eq!(sf.audio_in_sample_rate, 16000);
-        assert_eq!(sf.audio_out_sample_rate, 24000);
-        assert!(sf.allow_interruptions);
-        assert!(sf.enable_metrics);
+        match &deserialized {
+            FrameEnum::Start(sf) => {
+                assert_eq!(sf.audio_in_sample_rate, 16000);
+                assert_eq!(sf.audio_out_sample_rate, 24000);
+                assert!(sf.allow_interruptions);
+                assert!(sf.enable_metrics);
+            }
+            other => panic!("expected StartFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -500,7 +526,7 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(EndFrame::new());
 
         let deserialized = roundtrip(&serializer, frame);
-        assert!(deserialized.downcast_ref::<EndFrame>().is_some());
+        assert!(matches!(deserialized, FrameEnum::End(_)));
     }
 
     #[test]
@@ -509,8 +535,10 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(Some("test reason".to_string())));
 
         let deserialized = roundtrip(&serializer, frame);
-        let cf = deserialized.downcast_ref::<CancelFrame>().unwrap();
-        assert_eq!(cf.reason, Some("test reason".to_string()));
+        match &deserialized {
+            FrameEnum::Cancel(cf) => assert_eq!(cf.reason, Some("test reason".to_string())),
+            other => panic!("expected CancelFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -519,8 +547,10 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(None));
 
         let deserialized = roundtrip(&serializer, frame);
-        let cf = deserialized.downcast_ref::<CancelFrame>().unwrap();
-        assert_eq!(cf.reason, None);
+        match &deserialized {
+            FrameEnum::Cancel(cf) => assert_eq!(cf.reason, None),
+            other => panic!("expected CancelFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -530,9 +560,13 @@ mod tests {
             Arc::new(ErrorFrame::new("something went wrong".to_string(), false));
 
         let deserialized = roundtrip(&serializer, frame);
-        let ef = deserialized.downcast_ref::<ErrorFrame>().unwrap();
-        assert_eq!(ef.error, "something went wrong");
-        assert!(!ef.fatal);
+        match &deserialized {
+            FrameEnum::Error(ef) => {
+                assert_eq!(ef.error, "something went wrong");
+                assert!(!ef.fatal);
+            }
+            other => panic!("expected ErrorFrame, got {}", other),
+        }
     }
 
     #[test]
@@ -541,9 +575,13 @@ mod tests {
         let frame: Arc<dyn Frame> = Arc::new(ErrorFrame::new("fatal error".to_string(), true));
 
         let deserialized = roundtrip(&serializer, frame);
-        let ef = deserialized.downcast_ref::<ErrorFrame>().unwrap();
-        assert_eq!(ef.error, "fatal error");
-        assert!(ef.fatal);
+        match &deserialized {
+            FrameEnum::Error(ef) => {
+                assert_eq!(ef.error, "fatal error");
+                assert!(ef.fatal);
+            }
+            other => panic!("expected ErrorFrame, got {}", other),
+        }
     }
 
     #[test]

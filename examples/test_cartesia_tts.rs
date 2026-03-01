@@ -3,6 +3,7 @@
 //!
 //! Usage: cargo run --example test_cartesia_tts
 
+use pipecat::frames::FrameEnum;
 use pipecat::services::cartesia::CartesiaTTSService;
 use pipecat::services::TTSService;
 
@@ -42,10 +43,7 @@ async fn main() {
     let mut total_audio_bytes = 0usize;
     for (i, frame) in frames.iter().enumerate() {
         let name = frame.name();
-        if let Some(audio) = frame
-            .as_any()
-            .downcast_ref::<pipecat::frames::OutputAudioRawFrame>()
-        {
+        if let FrameEnum::OutputAudioRaw(audio) = frame {
             total_audio_bytes += audio.audio.audio.len();
             println!(
                 "   Frame {i}: {name} — {} bytes, {}Hz, {} ch",
@@ -69,10 +67,7 @@ async fn main() {
         let path = "/tmp/cartesia_test_output.raw";
         let mut all_audio = Vec::with_capacity(total_audio_bytes);
         for frame in &frames {
-            if let Some(audio) = frame
-                .as_any()
-                .downcast_ref::<pipecat::frames::OutputAudioRawFrame>()
-            {
+            if let FrameEnum::OutputAudioRaw(audio) = frame {
                 all_audio.extend_from_slice(&audio.audio.audio);
             }
         }

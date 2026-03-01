@@ -14,7 +14,7 @@ pub mod vonage;
 
 use std::sync::Arc;
 
-use crate::frames::Frame;
+use crate::frames::{Frame, FrameEnum};
 
 /// Serialized frame data - either text or binary.
 pub enum SerializedFrame {
@@ -23,6 +23,15 @@ pub enum SerializedFrame {
 }
 
 /// Base trait for frame serializers.
+///
+/// `serialize` and `should_ignore_frame` accept `&dyn Frame` because the
+/// pipeline transport layer already holds frames as `Arc<dyn Frame>` and the
+/// serializer only needs to inspect the frame (via `downcast_ref`).
+///
+/// `deserialize` returns `FrameEnum` because the serializer creates new frame
+/// values from wire data and `FrameEnum` avoids an unnecessary heap allocation
+/// through `Arc`.  The caller converts to `Arc<dyn Frame>` via `.into()` when
+/// feeding the result back into the pipeline.
 pub trait FrameSerializer: Send + Sync {
     /// Check if a frame should be ignored during serialization.
     fn should_ignore_frame(&self, _frame: &dyn Frame) -> bool {
@@ -36,5 +45,5 @@ pub trait FrameSerializer: Send + Sync {
     fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame>;
 
     /// Deserialize wire data to a frame.
-    fn deserialize(&self, data: &[u8]) -> Option<Arc<dyn Frame>>;
+    fn deserialize(&self, data: &[u8]) -> Option<FrameEnum>;
 }

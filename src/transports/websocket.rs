@@ -53,7 +53,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::frames::{
-    CancelFrame, EndFrame, Frame, InputAudioRawFrame, InterruptionFrame, OutputAudioRawFrame,
+    CancelFrame, EndFrame, Frame, InterruptionFrame, OutputAudioRawFrame,
     OutputTransportMessageFrame,
 };
 use crate::impl_base_debug_display;
@@ -475,7 +475,7 @@ impl WebSocketTransport {
         input: &Arc<Mutex<WebSocketInputProcessor>>,
         params: &TransportParams,
     ) {
-        let frame = match serializer.deserialize(data) {
+        let frame_enum = match serializer.deserialize(data) {
             Some(f) => f,
             None => {
                 tracing::debug!("WebSocketTransport: deserialization returned None, dropping message");
@@ -485,14 +485,14 @@ impl WebSocketTransport {
 
         // If the frame is an InputAudioRawFrame, check whether audio input
         // is enabled.
-        if frame
-            .as_any()
-            .downcast_ref::<InputAudioRawFrame>()
-            .is_some()
+        if matches!(frame_enum, crate::frames::FrameEnum::InputAudioRaw(_))
             && !params.audio_in_enabled
         {
             return;
         }
+
+        // Convert FrameEnum to Arc<dyn Frame> for the pipeline.
+        let frame: Arc<dyn Frame> = frame_enum.into();
 
         // Push the frame downstream through the input processor.
         let mut proc = input.lock().await;

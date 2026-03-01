@@ -36,7 +36,7 @@ use tracing;
 
 use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
-    ErrorFrame, Frame, InterimTranscriptionFrame, TranscriptionFrame,
+    ErrorFrame, InterimTranscriptionFrame, TranscriptionFrame,
     UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
@@ -201,9 +201,9 @@ pub struct DeepgramSTTService {
     /// Handle for the background task that reads WebSocket messages.
     ws_reader_task: Option<JoinHandle<()>>,
     /// Channel used by the reader task to push frames back into the processor.
-    frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+    frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
     /// Receiving end -- drained in `process` to push frames downstream.
-    frame_rx: tokio::sync::mpsc::Receiver<Arc<dyn Frame>>,
+    frame_rx: tokio::sync::mpsc::Receiver<FrameEnum>,
 }
 
 impl DeepgramSTTService {
@@ -412,7 +412,7 @@ impl DeepgramSTTService {
     /// converts them into pipeline frames sent via `frame_tx`.
     async fn ws_reader_loop(
         mut stream: WsStream,
-        frame_tx: tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: String,
         vad_events: bool,
     ) {
@@ -450,7 +450,7 @@ impl DeepgramSTTService {
     /// Parse a text message from Deepgram and push the appropriate frame(s).
     fn handle_ws_text_message(
         text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: &str,
         vad_events: bool,
     ) {
@@ -489,7 +489,7 @@ impl DeepgramSTTService {
             "SpeechStarted" => {
                 if vad_events {
                     tracing::debug!("DeepgramSTTService: speech started event");
-                    let frame = Arc::new(UserStartedSpeakingFrame::new());
+                    let frame = FrameEnum::UserStartedSpeaking(UserStartedSpeakingFrame::new());
                     if let Err(e) = frame_tx.try_send(frame) {
                         tracing::warn!(
                             "DeepgramSTTService: failed to send SpeechStarted frame: {}",
@@ -501,7 +501,7 @@ impl DeepgramSTTService {
             "UtteranceEnd" => {
                 if vad_events {
                     tracing::debug!("DeepgramSTTService: utterance end event");
-                    let frame = Arc::new(UserStoppedSpeakingFrame::new());
+                    let frame = FrameEnum::UserStoppedSpeaking(UserStoppedSpeakingFrame::new());
                     if let Err(e) = frame_tx.try_send(frame) {
                         tracing::warn!(
                             "DeepgramSTTService: failed to send UtteranceEnd frame: {}",
@@ -522,7 +522,7 @@ impl DeepgramSTTService {
                             .unwrap_or_else(|| "Unknown Deepgram error".to_string());
                         tracing::error!("DeepgramSTTService: error from server: {}", description);
                         // Push an ErrorFrame upstream.
-                        let error_frame = Arc::new(crate::frames::ErrorFrame::new(
+                        let error_frame = FrameEnum::Error(crate::frames::ErrorFrame::new(
                             format!("Deepgram error: {}", description),
                             false,
                         ));
@@ -549,7 +549,7 @@ impl DeepgramSTTService {
     fn handle_transcription_result(
         result: DgResult,
         original_text: &str,
-        frame_tx: &tokio::sync::mpsc::Sender<Arc<dyn Frame>>,
+        frame_tx: &tokio::sync::mpsc::Sender<FrameEnum>,
         user_id: &str,
     ) {
         let channel = match &result.channel {
@@ -585,7 +585,7 @@ impl DeepgramSTTService {
                 TranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
             frame.result = raw_result;
-            if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+            if let Err(e) = frame_tx.try_send(FrameEnum::Transcription(frame)) {
                 tracing::warn!(
                     "DeepgramSTTService: failed to send transcription frame: {}",
                     e
@@ -597,7 +597,7 @@ impl DeepgramSTTService {
                 InterimTranscriptionFrame::new(transcript.clone(), user_id.to_string(), timestamp);
             frame.language = language;
             frame.result = raw_result;
-            if let Err(e) = frame_tx.try_send(Arc::new(frame)) {
+            if let Err(e) = frame_tx.try_send(FrameEnum::InterimTranscription(frame)) {
                 tracing::warn!(
                     "DeepgramSTTService: failed to send interim transcription frame: {}",
                     e
@@ -650,11 +650,9 @@ impl DeepgramSTTService {
     /// are integrated into the normal pipeline flow.
     fn drain_reader_frames(&mut self, ctx: &ProcessorContext) {
         while let Ok(frame) = self.frame_rx.try_recv() {
-            if let Some(fe) = FrameEnum::try_from_arc(frame) {
-                match &fe {
-                    FrameEnum::Error(_) => ctx.send_upstream(fe),
-                    _ => ctx.send_downstream(fe),
-                }
+            match &frame {
+                FrameEnum::Error(_) => ctx.send_upstream(frame),
+                _ => ctx.send_downstream(frame),
             }
         }
     }
@@ -981,11 +979,10 @@ mod tests {
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user-1", false);
 
         let frame = rx.try_recv().unwrap();
-        let transcription = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .expect("Expected TranscriptionFrame");
+        let transcription = match &frame {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("Expected TranscriptionFrame"),
+        };
         assert_eq!(transcription.text, "hello world");
         assert_eq!(transcription.user_id, "user-1");
         assert_eq!(transcription.language, Some("en".to_string()));
@@ -1012,11 +1009,10 @@ mod tests {
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user-2", false);
 
         let frame = rx.try_recv().unwrap();
-        let interim = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<InterimTranscriptionFrame>()
-            .expect("Expected InterimTranscriptionFrame");
+        let interim = match &frame {
+            FrameEnum::InterimTranscription(f) => f,
+            _ => panic!("Expected InterimTranscriptionFrame"),
+        };
         assert_eq!(interim.text, "hel");
         assert_eq!(interim.user_id, "user-2");
     }
@@ -1029,11 +1025,7 @@ mod tests {
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user", true);
 
         let frame = rx.try_recv().unwrap();
-        assert!(frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<UserStartedSpeakingFrame>()
-            .is_some());
+        assert!(matches!(&frame, FrameEnum::UserStartedSpeaking(_)));
     }
 
     #[test]
@@ -1083,11 +1075,10 @@ mod tests {
         DeepgramSTTService::handle_ws_text_message(json, &tx, "user", false);
 
         let frame = rx.try_recv().unwrap();
-        let error = frame
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::ErrorFrame>()
-            .expect("Expected ErrorFrame");
+        let error = match &frame {
+            FrameEnum::Error(f) => f,
+            _ => panic!("Expected ErrorFrame"),
+        };
         assert!(error.error.contains("Rate limit exceeded"));
         assert!(!error.fatal);
     }

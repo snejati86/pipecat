@@ -385,7 +385,7 @@ impl FrameSerializer for TwilioFrameSerializer {
         None
     }
 
-    fn deserialize(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
         let text = std::str::from_utf8(data).ok()?;
         let msg: TwilioMessage = serde_json::from_str(text).ok()?;
 
@@ -397,7 +397,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                 let json = serde_json::json!({
                     "type": "twilio_connected",
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)))
             }
             "start" => {
                 if let Some(start) = &msg.start {
@@ -408,7 +408,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                         "call_sid": start.call_sid,
                         "account_sid": start.account_sid,
                     });
-                    Some(Arc::new(InputTransportMessageFrame::new(json)))
+                    Some(FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)))
                 } else {
                     warn!("Twilio: start event missing start payload");
                     None
@@ -434,7 +434,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                     pcm_data
                 };
 
-                Some(Arc::new(InputAudioRawFrame::new(
+                Some(FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
                     resampled,
                     self.sample_rate,
                     1, // Twilio is always mono
@@ -445,7 +445,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                 let json = serde_json::json!({
                     "type": "twilio_stop",
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)))
             }
             "mark" => {
                 if let Some(mark) = &msg.mark {
@@ -454,7 +454,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                         "type": "twilio_mark",
                         "name": mark.name,
                     });
-                    Some(Arc::new(InputTransportMessageFrame::new(json)))
+                    Some(FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)))
                 } else {
                     warn!("Twilio: mark event missing mark payload");
                     None
@@ -464,7 +464,7 @@ impl FrameSerializer for TwilioFrameSerializer {
                 if let Some(dtmf) = &msg.dtmf {
                     debug!("Twilio: DTMF digit={}", dtmf.digit);
                     if let Some(entry) = Self::parse_dtmf_digit(&dtmf.digit) {
-                        Some(Arc::new(OutputDTMFFrame::new(entry)))
+                        Some(FrameEnum::OutputDTMF(OutputDTMFFrame::new(entry)))
                     } else {
                         warn!("Twilio: unknown DTMF digit '{}'", dtmf.digit);
                         None
@@ -669,7 +669,7 @@ mod tests {
         );
 
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
         assert_eq!(audio.audio.sample_rate, 16000);
 
         // 320 samples at 8kHz -> ~640 samples at 16kHz (minus filter latency)
@@ -752,7 +752,7 @@ mod tests {
         );
 
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
         assert_eq!(audio.audio.sample_rate, 24000);
 
         // 320 samples at 8kHz -> ~960 samples at 24kHz (minus filter latency)
@@ -787,7 +787,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame { FrameEnum::InputTransportMessage(f) => f, _ => panic!("Expected InputTransportMessageFrame") };
         assert_eq!(msg.message["type"], "twilio_connected");
     }
 
@@ -813,7 +813,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame { FrameEnum::InputTransportMessage(f) => f, _ => panic!("Expected InputTransportMessageFrame") };
         assert_eq!(msg.message["type"], "twilio_start");
         assert_eq!(
             msg.message["stream_sid"],
@@ -859,7 +859,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
         assert_eq!(audio.audio.sample_rate, 16000); // Resampled to pipeline rate
         assert_eq!(audio.audio.num_channels, 1);
         // 160 samples at 8kHz → ~320 samples at 16kHz (minus filter latency)
@@ -887,7 +887,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
         assert_eq!(audio.audio.sample_rate, 8000); // No resampling needed
         assert_eq!(audio.audio.num_channels, 1);
         // 5 mu-law bytes -> 5 PCM samples -> 10 bytes
@@ -917,7 +917,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame { FrameEnum::InputTransportMessage(f) => f, _ => panic!("Expected InputTransportMessageFrame") };
         assert_eq!(msg.message["type"], "twilio_stop");
     }
 
@@ -936,7 +936,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame { FrameEnum::InputTransportMessage(f) => f, _ => panic!("Expected InputTransportMessageFrame") };
         assert_eq!(msg.message["type"], "twilio_mark");
         assert_eq!(msg.message["name"], "my-mark-1");
     }
@@ -965,7 +965,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame { FrameEnum::OutputDTMF(f) => f, _ => panic!("Expected OutputDTMFFrame") };
         assert_eq!(dtmf.button, KeypadEntry::Five);
     }
 
@@ -983,7 +983,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame { FrameEnum::OutputDTMF(f) => f, _ => panic!("Expected OutputDTMFFrame") };
         assert_eq!(dtmf.button, KeypadEntry::Star);
     }
 
@@ -1001,7 +1001,7 @@ mod tests {
         assert!(frame.is_some());
 
         let frame = frame.unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame { FrameEnum::OutputDTMF(f) => f, _ => panic!("Expected OutputDTMFFrame") };
         assert_eq!(dtmf.button, KeypadEntry::Pound);
     }
 
@@ -1210,7 +1210,7 @@ mod tests {
 
             // Deserialize (Twilio media JSON -> input audio)
             let in_frame = serializer.deserialize(incoming_str.as_bytes()).unwrap();
-            let audio = in_frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+            let audio = match &in_frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
 
             assert_eq!(audio.audio.sample_rate, 16000);
             assert_eq!(audio.audio.num_channels, 1);
@@ -1253,7 +1253,7 @@ mod tests {
             let incoming_str = serde_json::to_string(&incoming_json).unwrap();
 
             let in_frame = serializer.deserialize(incoming_str.as_bytes()).unwrap();
-            let audio = in_frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+            let audio = match &in_frame { FrameEnum::InputAudioRaw(f) => f, _ => panic!("Expected InputAudioRawFrame") };
 
             // No resampling, so exact same number of samples
             assert_eq!(audio.audio.audio.len(), pcm_bytes.len());

@@ -39,7 +39,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::audio::codec::resample_linear;
 use crate::frames::*;
 use crate::serializers::{FrameSerializer, SerializedFrame};
 
@@ -49,6 +48,58 @@ use crate::serializers::{FrameSerializer, SerializedFrame};
 
 /// Protocol version for the Genesys AudioHook protocol.
 const PROTOCOL_VERSION: &str = "2";
+
+// ---------------------------------------------------------------------------
+// Linear interpolation resampler
+// ---------------------------------------------------------------------------
+
+/// Resample 16-bit PCM audio using linear interpolation.
+///
+/// Converts audio from `from_rate` Hz to `to_rate` Hz. If the rates are
+/// equal, the input is returned unchanged.
+fn resample_linear(pcm: &[u8], from_rate: u32, to_rate: u32) -> Vec<u8> {
+    if from_rate == to_rate || pcm.len() < 4 {
+        // Need at least 2 samples (4 bytes) for interpolation.
+        return pcm.to_vec();
+    }
+
+    // Parse input samples.
+    let samples: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let in_len = samples.len();
+    let out_len = ((in_len as u64) * (to_rate as u64) / (from_rate as u64)) as usize;
+    if out_len == 0 {
+        return Vec::new();
+    }
+
+    let ratio = (in_len as f64 - 1.0) / (out_len as f64 - 1.0).max(1.0);
+    let mut output = Vec::with_capacity(out_len * 2);
+
+    for i in 0..out_len {
+        let pos = i as f64 * ratio;
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
+
+        let sample = if idx + 1 < in_len {
+            let s0 = samples[idx] as f64;
+            let s1 = samples[idx + 1] as f64;
+            (s0 + frac * (s1 - s0)) as i16
+        } else {
+            samples[in_len - 1]
+        };
+
+        output.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    output
+}
 
 // ---------------------------------------------------------------------------
 // Genesys wire-format types (deserialization)
@@ -361,7 +412,7 @@ impl GenesysFrameSerializer {
                         })
                     }),
                 });
-                let frame: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(json));
+                let frame = FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json));
 
                 let mut outputs = vec![DeserializedOutput::Frame(frame)];
 
@@ -388,7 +439,7 @@ impl GenesysFrameSerializer {
                     "session_id": session_id,
                     "reason": message.parameters.as_ref().and_then(|p| p.reason.clone()),
                 });
-                let frame: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(json));
+                let frame = FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json));
 
                 let mut outputs = vec![DeserializedOutput::Frame(frame)];
 
@@ -422,7 +473,7 @@ impl GenesysFrameSerializer {
                         if let Some(digit_str) = &dtmf.digit {
                             debug!("Genesys: DTMF digit={}", digit_str);
                             if let Some(entry) = Self::parse_dtmf_digit(digit_str) {
-                                return Some(vec![DeserializedOutput::Frame(Arc::new(
+                                return Some(vec![DeserializedOutput::Frame(FrameEnum::OutputDTMF(
                                     OutputDTMFFrame::new(entry),
                                 ))]);
                             } else {
@@ -437,7 +488,7 @@ impl GenesysFrameSerializer {
                     "type": "genesys_update",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(Arc::new(
+                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
                     InputTransportMessageFrame::new(json),
                 ))])
             }
@@ -447,7 +498,7 @@ impl GenesysFrameSerializer {
                     "type": "genesys_pause",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(Arc::new(
+                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
                     InputTransportMessageFrame::new(json),
                 ))])
             }
@@ -457,7 +508,7 @@ impl GenesysFrameSerializer {
                     "type": "genesys_resume",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(Arc::new(
+                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
                     InputTransportMessageFrame::new(json),
                 ))])
             }
@@ -467,7 +518,7 @@ impl GenesysFrameSerializer {
                     "type": "genesys_disconnect",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(Arc::new(
+                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
                     InputTransportMessageFrame::new(json),
                 ))])
             }
@@ -481,7 +532,7 @@ impl GenesysFrameSerializer {
     }
 
     /// Attempt to deserialize a binary (audio) WebSocket message from Genesys.
-    fn deserialize_binary(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize_binary(&self, data: &[u8]) -> Option<FrameEnum> {
         if data.is_empty() {
             return None;
         }
@@ -497,7 +548,7 @@ impl GenesysFrameSerializer {
             return None;
         }
 
-        Some(Arc::new(InputAudioRawFrame::new(
+        Some(FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
             resampled,
             self.params.sample_rate,
             1, // Genesys AudioHook sends mono audio
@@ -519,7 +570,7 @@ impl Default for GenesysFrameSerializer {
 /// protocol response to send back over the WebSocket.
 enum DeserializedOutput {
     /// A frame to deliver to the pipeline.
-    Frame(Arc<dyn Frame>),
+    Frame(FrameEnum),
     /// A response message to send back to Genesys.
     Response(SerializedFrame),
 }
@@ -582,7 +633,7 @@ impl FrameSerializer for GenesysFrameSerializer {
         None
     }
 
-    fn deserialize(&self, data: &[u8]) -> Option<Arc<dyn Frame>> {
+    fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
         // The FrameSerializer trait returns a single frame. For the Genesys
         // protocol, some events (open, close, ping) require sending a response
         // back. Since the trait only returns frames for the pipeline, protocol
@@ -614,12 +665,12 @@ impl GenesysFrameSerializer {
     /// and protocol response messages that should be sent back to Genesys.
     ///
     /// Returns a tuple of:
-    /// - `Vec<Arc<dyn Frame>>`: Frames to push into the pipeline.
+    /// - `Vec<FrameEnum>`: Frames to push into the pipeline.
     /// - `Vec<SerializedFrame>`: Protocol responses to send back over WebSocket.
     pub fn deserialize_with_responses(
         &mut self,
         data: &[u8],
-    ) -> (Vec<Arc<dyn Frame>>, Vec<SerializedFrame>) {
+    ) -> (Vec<FrameEnum>, Vec<SerializedFrame>) {
         // Try text (JSON) first.
         if let Ok(text) = std::str::from_utf8(data) {
             if serde_json::from_str::<serde_json::Value>(text).is_ok() {
@@ -650,7 +701,7 @@ impl GenesysFrameSerializer {
     ///
     /// Parses JSON events and returns frames without mutating session state
     /// or generating protocol responses.
-    fn deserialize_text_immutable(&self, text: &str) -> Option<Arc<dyn Frame>> {
+    fn deserialize_text_immutable(&self, text: &str) -> Option<FrameEnum> {
         let message: GenesysMessageIn = serde_json::from_str(text).ok()?;
         let msg_type = message.msg_type.as_deref().unwrap_or("");
 
@@ -669,7 +720,9 @@ impl GenesysFrameSerializer {
                         })
                     }),
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             "close" => {
                 let session_id = message
@@ -684,7 +737,9 @@ impl GenesysFrameSerializer {
                     "session_id": session_id,
                     "reason": message.parameters.as_ref().and_then(|p| p.reason.clone()),
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             "ping" => {
                 debug!("Genesys: ping received (trait path, no pong sent)");
@@ -696,7 +751,7 @@ impl GenesysFrameSerializer {
                         if let Some(digit_str) = &dtmf.digit {
                             debug!("Genesys: DTMF digit={}", digit_str);
                             if let Some(entry) = Self::parse_dtmf_digit(digit_str) {
-                                return Some(Arc::new(OutputDTMFFrame::new(entry)));
+                                return Some(FrameEnum::OutputDTMF(OutputDTMFFrame::new(entry)));
                             } else {
                                 warn!("Genesys: unknown DTMF digit '{}'", digit_str);
                                 return None;
@@ -709,7 +764,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_update",
                     "session_id": self.session_id,
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             "pause" => {
                 debug!("Genesys: pause event received");
@@ -717,7 +774,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_pause",
                     "session_id": self.session_id,
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             "resume" => {
                 debug!("Genesys: resume event received");
@@ -725,7 +784,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_resume",
                     "session_id": self.session_id,
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             "disconnect" => {
                 debug!("Genesys: disconnect event received");
@@ -733,7 +794,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_disconnect",
                     "session_id": self.session_id,
                 });
-                Some(Arc::new(InputTransportMessageFrame::new(json)))
+                Some(FrameEnum::InputTransportMessage(
+                    InputTransportMessageFrame::new(json),
+                ))
             }
             other => {
                 if !other.is_empty() {
@@ -823,8 +886,10 @@ mod tests {
 
         assert_eq!(out_samples.len(), 4);
         assert_eq!(out_samples[0], 0);
-        // Middle sample should be interpolated between 0 and 1000.
-        assert!(out_samples[1] > 0 && out_samples[1] <= 1000);
+        assert_eq!(out_samples[3], 1000);
+        // Middle samples should be interpolated.
+        assert!(out_samples[1] > 0 && out_samples[1] < 1000);
+        assert!(out_samples[2] > 0 && out_samples[2] < 1000);
     }
 
     #[test]
@@ -841,8 +906,7 @@ mod tests {
 
         assert_eq!(out_samples.len(), 2);
         assert_eq!(out_samples[0], 0);
-        // Second sample is interpolated from the downsampled position.
-        assert!(out_samples[1] >= 500 && out_samples[1] <= 1500);
+        assert_eq!(out_samples[1], 1500);
     }
 
     #[test]
@@ -890,7 +954,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"version":"2","id":"session-abc","type":"open","position":"start","parameters":{"organizationId":"org-1","conversationId":"conv-1","participant":{"id":"part-1"},"media":[{"type":"audio","format":"PCMU","channels":["external"],"rate":8000}]}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_open");
         assert_eq!(msg.message["session_id"], "session-abc");
     }
@@ -906,9 +973,10 @@ mod tests {
         assert_eq!(responses.len(), 1);
 
         // Verify the frame.
-        let msg = frames[0]
-            .downcast_ref::<InputTransportMessageFrame>()
-            .unwrap();
+        let msg = match &frames[0] {
+            FrameEnum::InputTransportMessage(f) => f,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_open");
 
         // Verify the "opened" response.
@@ -935,9 +1003,10 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(responses.len(), 1);
 
-        let msg = frames[0]
-            .downcast_ref::<InputTransportMessageFrame>()
-            .unwrap();
+        let msg = match &frames[0] {
+            FrameEnum::InputTransportMessage(f) => f,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_open");
     }
 
@@ -951,7 +1020,10 @@ mod tests {
         let json =
             r#"{"version":"2","id":"session-xyz","type":"close","parameters":{"reason":"end"}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_close");
         assert_eq!(msg.message["session_id"], "session-xyz");
         assert_eq!(msg.message["reason"], "end");
@@ -969,9 +1041,10 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(responses.len(), 1);
 
-        let msg = frames[0]
-            .downcast_ref::<InputTransportMessageFrame>()
-            .unwrap();
+        let msg = match &frames[0] {
+            FrameEnum::InputTransportMessage(f) => f,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_close");
         assert_eq!(msg.message["reason"], "end");
 
@@ -990,7 +1063,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"version":"2","id":"s1","type":"close","parameters":{}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_close");
         assert!(msg.message["reason"].is_null());
     }
@@ -1039,7 +1115,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"version":"2","id":"s1","type":"update","parameters":{"dtmf":{"digit":"5","durationMs":250}}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frame {
+            FrameEnum::OutputDTMF(inner) => inner,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Five);
     }
 
@@ -1067,7 +1146,10 @@ mod tests {
                 digit
             );
             let frame = serializer.deserialize(json.as_bytes()).unwrap();
-            let dtmf = frame.downcast_ref::<OutputDTMFFrame>().unwrap();
+            let dtmf = match &frame {
+                FrameEnum::OutputDTMF(inner) => inner,
+                other => panic!("expected OutputDTMFFrame, got {other}"),
+            };
             assert_eq!(dtmf.button, *expected, "Failed for digit '{}'", digit);
         }
     }
@@ -1087,7 +1169,10 @@ mod tests {
         let json = r#"{"version":"2","id":"s1","type":"update","parameters":{"dtmf":{}}}"#;
         // No digit field -- falls through to non-DTMF update.
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_update");
     }
 
@@ -1099,7 +1184,10 @@ mod tests {
 
         assert_eq!(frames.len(), 1);
         assert!(responses.is_empty());
-        let dtmf = frames[0].downcast_ref::<OutputDTMFFrame>().unwrap();
+        let dtmf = match &frames[0] {
+            FrameEnum::OutputDTMF(f) => f,
+            other => panic!("expected OutputDTMFFrame, got {other}"),
+        };
         assert_eq!(dtmf.button, KeypadEntry::Nine);
     }
 
@@ -1112,7 +1200,10 @@ mod tests {
         let serializer = make_serializer_with_session("s1");
         let json = r#"{"version":"2","id":"s1","type":"pause"}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_pause");
     }
 
@@ -1121,7 +1212,10 @@ mod tests {
         let serializer = make_serializer_with_session("s1");
         let json = r#"{"version":"2","id":"s1","type":"resume"}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_resume");
     }
 
@@ -1130,7 +1224,10 @@ mod tests {
         let serializer = make_serializer_with_session("s1");
         let json = r#"{"version":"2","id":"s1","type":"disconnect"}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_disconnect");
     }
 
@@ -1147,7 +1244,10 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let frame = serializer.deserialize(&pcm_bytes).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
         assert_eq!(audio.audio.audio.len(), pcm_bytes.len());
@@ -1164,7 +1264,10 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         let frame = serializer.deserialize(&pcm_bytes).unwrap();
-        let audio = frame.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frame {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
         // 80 samples at 8kHz -> 160 samples at 16kHz -> 320 bytes.
@@ -1197,10 +1300,7 @@ mod tests {
         let result = serializer.deserialize(b"not json at all");
         // "not json at all" is 15 bytes, which is valid binary data.
         assert!(result.is_some());
-        assert!(result
-            .unwrap()
-            .downcast_ref::<InputAudioRawFrame>()
-            .is_some());
+        assert!(matches!(&result.unwrap(), FrameEnum::InputAudioRaw(_)));
     }
 
     #[test]
@@ -1343,7 +1443,10 @@ mod tests {
 
         // Deserialize.
         let deserialized = serializer.deserialize(bytes).unwrap();
-        let audio = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &deserialized {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
 
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
@@ -1383,7 +1486,10 @@ mod tests {
 
         // Deserialize.
         let deserialized = serializer.deserialize(&bytes).unwrap();
-        let audio = deserialized.downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &deserialized {
+            FrameEnum::InputAudioRaw(inner) => inner,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
 
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.num_channels, 1);
@@ -1573,10 +1679,7 @@ mod tests {
         let pcm_data: Vec<u8> = vec![0x00, 0x01, 0xFF, 0x7F]; // two 16-bit samples
         let result = serializer.deserialize(&pcm_data);
         assert!(result.is_some());
-        assert!(result
-            .unwrap()
-            .downcast_ref::<InputAudioRawFrame>()
-            .is_some());
+        assert!(matches!(&result.unwrap(), FrameEnum::InputAudioRaw(_)));
     }
 
     #[test]
@@ -1607,7 +1710,10 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(responses.is_empty());
 
-        let audio = frames[0].downcast_ref::<InputAudioRawFrame>().unwrap();
+        let audio = match &frames[0] {
+            FrameEnum::InputAudioRaw(f) => f,
+            other => panic!("expected InputAudioRawFrame, got {other}"),
+        };
         assert_eq!(audio.audio.sample_rate, 16000);
         assert_eq!(audio.audio.audio, pcm_bytes);
     }
@@ -1634,7 +1740,10 @@ mod tests {
         let serializer = make_serializer();
         let json = r#"{"version":"2","id":"s1","type":"update","parameters":{}}"#;
         let frame = serializer.deserialize(json.as_bytes()).unwrap();
-        let msg = frame.downcast_ref::<InputTransportMessageFrame>().unwrap();
+        let msg = match &frame {
+            FrameEnum::InputTransportMessage(inner) => inner,
+            other => panic!("expected InputTransportMessageFrame, got {other}"),
+        };
         assert_eq!(msg.message["type"], "genesys_update");
     }
 

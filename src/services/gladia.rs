@@ -26,12 +26,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::frames::{
-    CancelFrame, EndFrame, Frame, InputAudioRawFrame, StartFrame, TranscriptionFrame,
+    CancelFrame, EndFrame, Frame, FrameEnum, InputAudioRawFrame, StartFrame, TranscriptionFrame,
     UserStoppedSpeakingFrame,
 };
 use crate::impl_base_display;
 use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
-use crate::services::shared::wav_multipart::{encode_pcm_to_wav, MultipartForm};
 use crate::services::{AIService, STTService};
 
 // ---------------------------------------------------------------------------
@@ -134,6 +133,111 @@ impl GladiaLanguageBehaviour {
 impl fmt::Display for GladiaLanguageBehaviour {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WAV encoding
+// ---------------------------------------------------------------------------
+
+/// Encode raw PCM data (16-bit signed little-endian) into a WAV container.
+///
+/// The resulting `Vec<u8>` contains a valid WAV file that can be sent directly
+/// to the Gladia API.
+pub fn encode_pcm_to_wav(pcm: &[u8], sample_rate: u32, num_channels: u16) -> Vec<u8> {
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * u32::from(num_channels) * u32::from(bits_per_sample) / 8;
+    let block_align = num_channels * bits_per_sample / 8;
+    let data_size = pcm.len() as u32;
+    // RIFF header (12 bytes) + fmt chunk (24 bytes) + data header (8 bytes) = 44 bytes header.
+    let file_size = 36 + data_size;
+
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&file_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+
+    // fmt sub-chunk
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // Sub-chunk size (16 for PCM)
+    wav.extend_from_slice(&1u16.to_le_bytes()); // Audio format: 1 = PCM
+    wav.extend_from_slice(&num_channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+
+    // data sub-chunk
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(pcm);
+
+    wav
+}
+
+// ---------------------------------------------------------------------------
+// Multipart form builder (manual, no reqwest multipart feature needed)
+// ---------------------------------------------------------------------------
+
+/// A simple multipart/form-data builder that constructs the body and
+/// content-type header without requiring the `reqwest` multipart feature.
+struct MultipartForm {
+    boundary: String,
+    body: Vec<u8>,
+}
+
+impl MultipartForm {
+    fn new() -> Self {
+        // Use a deterministic-looking but unique boundary.
+        let boundary = format!(
+            "----PipecatGladiaBoundary{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        Self {
+            boundary,
+            body: Vec::new(),
+        }
+    }
+
+    /// Add a simple text field.
+    fn add_text(&mut self, name: &str, value: &str) {
+        self.body
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        self.body.extend_from_slice(value.as_bytes());
+        self.body.extend_from_slice(b"\r\n");
+    }
+
+    /// Add a file field with the given bytes, filename, and content type.
+    fn add_file(&mut self, name: &str, filename: &str, content_type: &str, data: &[u8]) {
+        self.body
+            .extend_from_slice(format!("--{}\r\n", self.boundary).as_bytes());
+        self.body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                name, filename
+            )
+            .as_bytes(),
+        );
+        self.body
+            .extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
+        self.body.extend_from_slice(data);
+        self.body.extend_from_slice(b"\r\n");
+    }
+
+    /// Finalize the form body and return `(content_type_header, body_bytes)`.
+    fn finish(mut self) -> (String, Vec<u8>) {
+        self.body
+            .extend_from_slice(format!("--{}--\r\n", self.boundary).as_bytes());
+        let content_type = format!("multipart/form-data; boundary={}", self.boundary);
+        (content_type, self.body)
     }
 }
 
@@ -383,7 +487,7 @@ impl GladiaSTTService {
     ///
     /// Returns `(content_type_header_value, body_bytes)`.
     fn build_request_body(&self, wav_data: &[u8]) -> (String, Vec<u8>) {
-        let mut form = MultipartForm::new("Gladia");
+        let mut form = MultipartForm::new();
 
         form.add_file("audio", "audio.wav", "audio/wav", wav_data);
 
@@ -422,7 +526,7 @@ impl GladiaSTTService {
     ///
     /// If the buffer is too short (below `min_audio_duration_secs`), the audio
     /// is discarded and no frames are returned.
-    async fn flush_and_transcribe(&mut self) -> Vec<Arc<dyn Frame>> {
+    async fn flush_and_transcribe(&mut self) -> Vec<FrameEnum> {
         let pcm = self.take_buffer();
         if pcm.is_empty() {
             return vec![];
@@ -442,13 +546,13 @@ impl GladiaSTTService {
     }
 
     /// Encode PCM data to WAV and send it to the Gladia API.
-    async fn transcribe_pcm(&self, pcm: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn transcribe_pcm(&self, pcm: &[u8]) -> Vec<FrameEnum> {
         let wav_data = encode_pcm_to_wav(pcm, self.sample_rate, self.num_channels);
         self.send_transcription_request(&wav_data).await
     }
 
     /// Send a WAV file to the Gladia API and parse the response into frames.
-    async fn send_transcription_request(&self, wav_data: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn send_transcription_request(&self, wav_data: &[u8]) -> Vec<FrameEnum> {
         let url = self.api_url();
         let (content_type, body) = self.build_request_body(wav_data);
 
@@ -470,7 +574,7 @@ impl GladiaSTTService {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::error!("GladiaSTTService: HTTP request failed: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Gladia API request failed: {}", e),
                     false,
                 ))];
@@ -482,7 +586,7 @@ impl GladiaSTTService {
             Ok(text) => text,
             Err(e) => {
                 tracing::error!("GladiaSTTService: failed to read response body: {}", e);
-                return vec![Arc::new(crate::frames::ErrorFrame::new(
+                return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Failed to read Gladia API response: {}", e),
                     false,
                 ))];
@@ -499,7 +603,7 @@ impl GladiaSTTService {
                 Err(_) => response_text.clone(),
             };
             tracing::error!("GladiaSTTService: API error ({}): {}", status, error_msg);
-            return vec![Arc::new(crate::frames::ErrorFrame::new(
+            return vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                 format!("Gladia API error ({}): {}", status, error_msg),
                 false,
             ))];
@@ -509,7 +613,7 @@ impl GladiaSTTService {
     }
 
     /// Parse the Gladia API response text into transcription frames.
-    fn parse_transcription_response(&self, response_text: &str) -> Vec<Arc<dyn Frame>> {
+    fn parse_transcription_response(&self, response_text: &str) -> Vec<FrameEnum> {
         let timestamp = crate::utils::helpers::now_iso8601();
 
         match serde_json::from_str::<GladiaResponse>(response_text) {
@@ -535,7 +639,7 @@ impl GladiaSTTService {
                 );
                 frame.language = detected_language;
                 frame.result = serde_json::from_str::<serde_json::Value>(response_text).ok();
-                vec![Arc::new(frame)]
+                vec![frame.into()]
             }
             Err(e) => {
                 tracing::error!(
@@ -543,7 +647,7 @@ impl GladiaSTTService {
                     e,
                     response_text,
                 );
-                vec![Arc::new(crate::frames::ErrorFrame::new(
+                vec![FrameEnum::Error(crate::frames::ErrorFrame::new(
                     format!("Failed to parse Gladia response: {}", e),
                     false,
                 ))]
@@ -611,16 +715,14 @@ impl FrameProcessor for GladiaSTTService {
             if self.should_flush() {
                 let frames = self.flush_and_transcribe().await;
                 for f in frames {
-                    if f.as_ref()
-                        .as_any()
-                        .downcast_ref::<crate::frames::ErrorFrame>()
-                        .is_some()
-                    {
-                        self.base.pending_frames.push((f, FrameDirection::Upstream));
+                    if matches!(&f, FrameEnum::Error(_)) {
+                        self.base
+                            .pending_frames
+                            .push((f.into(), FrameDirection::Upstream));
                     } else {
                         self.base
                             .pending_frames
-                            .push((f, FrameDirection::Downstream));
+                            .push((f.into(), FrameDirection::Downstream));
                     }
                 }
             }
@@ -637,16 +739,14 @@ impl FrameProcessor for GladiaSTTService {
         {
             let frames = self.flush_and_transcribe().await;
             for f in frames {
-                if f.as_ref()
-                    .as_any()
-                    .downcast_ref::<crate::frames::ErrorFrame>()
-                    .is_some()
-                {
-                    self.base.pending_frames.push((f, FrameDirection::Upstream));
+                if matches!(&f, FrameEnum::Error(_)) {
+                    self.base
+                        .pending_frames
+                        .push((f.into(), FrameDirection::Upstream));
                 } else {
                     self.base
                         .pending_frames
-                        .push((f, FrameDirection::Downstream));
+                        .push((f.into(), FrameDirection::Downstream));
                 }
             }
             // Pass the UserStoppedSpeakingFrame downstream.
@@ -658,16 +758,14 @@ impl FrameProcessor for GladiaSTTService {
         if frame.as_ref().as_any().downcast_ref::<EndFrame>().is_some() {
             let frames = self.flush_and_transcribe().await;
             for f in frames {
-                if f.as_ref()
-                    .as_any()
-                    .downcast_ref::<crate::frames::ErrorFrame>()
-                    .is_some()
-                {
-                    self.base.pending_frames.push((f, FrameDirection::Upstream));
+                if matches!(&f, FrameEnum::Error(_)) {
+                    self.base
+                        .pending_frames
+                        .push((f.into(), FrameDirection::Upstream));
                 } else {
                     self.base
                         .pending_frames
-                        .push((f, FrameDirection::Downstream));
+                        .push((f.into(), FrameDirection::Downstream));
                 }
             }
             self.started = false;
@@ -723,7 +821,7 @@ impl STTService for GladiaSTTService {
     /// This sends the given raw PCM audio directly to the Gladia API (after
     /// encoding to WAV), bypassing the internal buffer. Useful for one-shot
     /// transcription outside of the pipeline.
-    async fn run_stt(&mut self, audio: &[u8]) -> Vec<Arc<dyn Frame>> {
+    async fn run_stt(&mut self, audio: &[u8]) -> Vec<FrameEnum> {
         self.transcribe_pcm(audio).await
     }
 }
@@ -1102,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_multipart_form_text_field() {
-        let mut form = MultipartForm::new("Gladia");
+        let mut form = MultipartForm::new();
         form.add_text("language", "en");
         let (ct, body) = form.finish();
 
@@ -1114,7 +1212,7 @@ mod tests {
 
     #[test]
     fn test_multipart_form_file_field() {
-        let mut form = MultipartForm::new("Gladia");
+        let mut form = MultipartForm::new();
         form.add_file("audio", "audio.wav", "audio/wav", b"RIFF data here");
         let (ct, body) = form.finish();
 
@@ -1128,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_multipart_form_boundary_present() {
-        let mut form = MultipartForm::new("Gladia");
+        let mut form = MultipartForm::new();
         form.add_text("key", "value");
         let (ct, body) = form.finish();
 
@@ -1144,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_multipart_form_multiple_fields() {
-        let mut form = MultipartForm::new("Gladia");
+        let mut form = MultipartForm::new();
         form.add_text("language", "en");
         form.add_text("language_behaviour", "manual");
         form.add_file("audio", "audio.wav", "audio/wav", b"wav data");
@@ -1340,11 +1438,10 @@ mod tests {
         let frames = stt.parse_transcription_response(response);
 
         assert_eq!(frames.len(), 1);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .expect("Expected TranscriptionFrame");
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("Expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "Hello, how are you?");
         assert_eq!(frame.user_id, "user-1");
         assert_eq!(frame.language, Some("en".to_string()));
@@ -1397,11 +1494,10 @@ mod tests {
         }"#;
         let frames = stt.parse_transcription_response(response);
         assert_eq!(frames.len(), 1);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "hello world");
     }
 
@@ -1411,11 +1507,10 @@ mod tests {
         let response = "not valid json";
         let frames = stt.parse_transcription_response(response);
         assert_eq!(frames.len(), 1);
-        let error = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<crate::frames::ErrorFrame>()
-            .expect("Expected ErrorFrame");
+        let error = match &frames[0] {
+            FrameEnum::Error(f) => f,
+            _ => panic!("Expected ErrorFrame"),
+        };
         assert!(error.error.contains("Failed to parse Gladia response"));
         assert!(!error.fatal);
     }
@@ -1433,11 +1528,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         let raw = frame.result.as_ref().unwrap();
         assert!(raw["result"]["transcription"]["full_transcript"]
             .as_str()
@@ -1479,11 +1573,10 @@ mod tests {
         }"#;
         let frames = stt.parse_transcription_response(response);
         assert_eq!(frames.len(), 1);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.text, "Hello world. How are you?");
         assert_eq!(frame.user_id, "speaker-1");
     }
@@ -1505,11 +1598,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         // The detected language "fr" should take precedence.
         assert_eq!(frame.language, Some("fr".to_string()));
     }
@@ -1527,11 +1619,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.language, Some("de".to_string()));
     }
 
@@ -1548,11 +1639,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert!(frame.language.is_none());
     }
 
@@ -1569,11 +1659,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         // Uses the first detected language.
         assert_eq!(frame.language, Some("fr".to_string()));
     }
@@ -1607,11 +1696,10 @@ mod tests {
             }
         }"#;
         let frames = stt.parse_transcription_response(response);
-        let frame = frames[0]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<TranscriptionFrame>()
-            .unwrap();
+        let frame = match &frames[0] {
+            FrameEnum::Transcription(f) => f,
+            _ => panic!("expected TranscriptionFrame"),
+        };
         assert_eq!(frame.language, Some("ko".to_string()));
     }
 
