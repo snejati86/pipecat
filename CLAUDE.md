@@ -32,7 +32,7 @@ cargo clippy
 
 ### Frame-Based Pipeline Processing
 
-All data flows as **Frame** objects through a pipeline of **FrameProcessors**:
+All data flows as **Frame** objects through a pipeline of **Processors**:
 
 ```
 [Processor1] → [Processor2] → ... → [ProcessorN]
@@ -40,40 +40,40 @@ All data flows as **Frame** objects through a pipeline of **FrameProcessors**:
 
 **Key components:**
 
-- **Frames** (`src/frames/mod.rs`): Data units (audio, text, video) and control signals. 70+ types organized as System, Data, and Control frames. Flow DOWNSTREAM (input→output) or UPSTREAM (acknowledgments/errors).
+- **Frames** (`src/frames/mod.rs`): Data units (audio, text, video) and control signals. 70+ types organized as System, Data, and Control frames. Flow DOWNSTREAM (input→output) or UPSTREAM (acknowledgments/errors). `FrameEnum` provides exhaustive pattern matching over all frame types.
 
-- **FrameProcessor** (`src/processors/mod.rs`): Base processing unit. Each processor receives frames, processes them, and pushes results downstream. Implement `base()`, `base_mut()`, and `process_frame()`.
+- **Processor** (`src/processors/processor.rs`): Core processing trait. Each processor receives `FrameEnum` frames, processes them, and sends results via `ProcessorContext` channels. Implement `name()`, `id()`, and `process()`.
 
-- **Pipeline** (`src/pipeline/mod.rs`): Chains processors together. Use `Pipeline::builder()` or the `pipeline!` macro.
+- **ProcessorContext** (`src/processors/processor.rs`): Carries channel senders (`send_downstream()`, `send_upstream()`, `send()`), cancellation/interruption tokens, and generation ID. Passed to `process()` by reference.
 
-- **PipelineTask** (`src/pipeline/mod.rs`): Manages lifecycle (start, run, stop) of a pipeline. Use `PipelineTask::builder(pipeline)`.
+- **ProcessorWeight** (`src/processors/processor.rs`): Categorizes processor cost — `Light` (< 1ms), `Standard` (1-10ms), `Heavy` (> 10ms, network-bound). Used by the pipeline scheduler for interruption handling.
 
-- **PipelineRunner** (`src/pipeline/mod.rs`): Top-level entry point: `PipelineRunner::new().run(&task).await`.
+- **ChannelPipeline** (`src/pipeline/channel.rs`): Chains processors together with priority channels. Each processor runs in its own tokio task. `ChannelPipeline::new(vec![box1, box2, ...])`.
 
-- **Services** (`src/services/`): AI provider integrations (OpenAI LLM/TTS, Deepgram STT, Cartesia TTS). All use builder pattern: `.with_model()`, `.with_language()`, etc.
+- **Services** (`src/services/`): AI provider integrations (OpenAI LLM/TTS, Deepgram STT, Cartesia TTS). Service traits (`LLMService`, `STTService`, `TTSService`) return `Vec<FrameEnum>`. All use builder pattern: `.with_model()`, `.with_language()`, etc.
 
 - **Transports** (`src/transports/`): WebSocket transport for external I/O. `WebSocketTransport::new(params, serializer)`.
 
-- **Serializers** (`src/serializers/`): Convert frames to/from wire formats. `JsonFrameSerializer` for JSON-over-WebSocket.
+- **Serializers** (`src/serializers/`): Convert frames to/from wire formats. `FrameSerializer::deserialize()` returns `Option<FrameEnum>`. `JsonFrameSerializer` for JSON-over-WebSocket.
 
-- **Observers** (`src/observers/`): Monitor frame flow without modifying the pipeline. Implement `Observer` trait with `on_process_frame()` / `on_push_frame()`.
+- **Observers** (`src/observers/`): Monitor frame flow without modifying the pipeline. Implement `Observer` trait with `on_process_frame()` / `on_push_frame()`. Observers receive `FrameKind` (not `Arc<dyn Frame>`).
 
 ### Important Patterns
 
-- **Frame downcasting**: Use `frame.downcast_ref::<TextFrame>()` to check frame types
-- **Prelude**: `use pipecat::prelude::*` for common re-exports
-- **Helper functions**: `frame(TextFrame::new("hi"))` wraps in Arc, `processor(p)` wraps in Arc<Mutex<>>
-- **Debug/Display macros**: `impl_base_debug_display!(MyProcessor)` generates required trait impls
-- **Builder pattern**: Services, Pipeline, PipelineTask all use builders
+- **Frame pattern matching**: Use `match frame { FrameEnum::Text(t) => ..., other => ctx.send(other, dir) }` for exhaustive handling
+- **Prelude**: `use pipecat::prelude::*` for common re-exports (Processor, ProcessorContext, ProcessorWeight, FrameEnum, FrameDirection, frame types, macros)
+- **impl_processor! macro**: `impl_processor!(MyProcessor)` generates `Debug` and `Display` impls from `id` and `name` fields
+- **Builder pattern**: Services use builder pattern: `.with_model()`, `.with_language()`, etc.
 - **Async task management**: Use `tokio` async runtime with `async_trait`
-- **Error handling**: Use `self.push_error(msg, fatal).await` to push errors upstream
+- **Context-based frame delivery**: Use `ctx.send_downstream()`, `ctx.send_upstream()`, or `ctx.send(frame, direction)` — no `push_frame()` method
+- **Interruption handling**: Heavy processors should check `ctx.interruption_token()` in `tokio::select!` loops to break out early
 
 ### Key Directories
 
 | Directory | Purpose |
 |-----------|---------|
 | `src/frames/` | Frame definitions (70+ types) |
-| `src/processors/` | FrameProcessor base + aggregators, filters |
+| `src/processors/` | Processor trait + aggregators, filters |
 | `src/pipeline/` | Pipeline orchestration |
 | `src/services/` | AI service integrations (OpenAI, Deepgram, Cartesia) |
 | `src/transports/` | Transport layer (WebSocket) |
@@ -96,33 +96,32 @@ All data flows as **Frame** objects through a pipeline of **FrameProcessors**:
 
 ```rust
 use pipecat::prelude::*;
-use pipecat::impl_base_debug_display;
 
 struct MyProcessor {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
 }
 
 impl MyProcessor {
     fn new() -> Self {
-        Self { base: BaseProcessor::new(Some("MyProcessor".into()), false) }
+        Self { id: obj_id(), name: "MyProcessor".into() }
     }
 }
 
-impl_base_debug_display!(MyProcessor);
+impl_processor!(MyProcessor);
 
-#[async_trait::async_trait]
-impl FrameProcessor for MyProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+#[async_trait]
+impl Processor for MyProcessor {
+    fn name(&self) -> &str { &self.name }
+    fn id(&self) -> u64 { self.id }
 
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        // Process specific frame types
-        if let Some(text) = frame.downcast_ref::<TextFrame>() {
-            // Transform and push
-            self.push_frame(Arc::new(TextFrame::new(text.text.to_uppercase())), direction).await;
-        } else {
-            // Pass all other frames through
-            self.push_frame(frame, direction).await;
+    async fn process(&mut self, frame: FrameEnum, direction: FrameDirection, ctx: &ProcessorContext) {
+        match frame {
+            FrameEnum::Text(mut text) => {
+                text.text = text.text.to_uppercase();
+                ctx.send(FrameEnum::Text(text), direction);
+            }
+            other => ctx.send(other, direction),
         }
     }
 }
