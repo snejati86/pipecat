@@ -50,7 +50,7 @@ All data flows as **Frame** objects through a pipeline of **Processors**:
 
 - **ChannelPipeline** (`src/pipeline/channel.rs`): Chains processors together with priority channels. Each processor runs in its own tokio task. `ChannelPipeline::new(vec![box1, box2, ...])`.
 
-- **Services** (`src/services/`): AI provider integrations (OpenAI LLM/TTS, Deepgram STT, Cartesia TTS). Service traits (`LLMService`, `STTService`, `TTSService`) return `Vec<FrameEnum>`. All use builder pattern: `.with_model()`, `.with_language()`, etc.
+- **Services** (`src/services/`): AI provider integrations (OpenAI LLM/TTS, Deepgram STT, Cartesia TTS). Service traits return `Vec<FrameEnum>` (`STTService`, `TTSService`) or `Option<String>` (`LLMService`). All use builder pattern: `.with_model()`, `.with_language()`, etc.
 
 - **Transports** (`src/transports/`): WebSocket transport for external I/O. `WebSocketTransport::new(params, serializer)`.
 
