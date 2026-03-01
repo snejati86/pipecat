@@ -48,6 +48,43 @@ macro_rules! impl_base_debug_display {
     };
 }
 
+/// Implement `Debug` and `Display` for a processor struct with `id: u64` and `name: String` fields.
+///
+/// Unlike [`impl_base_debug_display!`], which requires a `base: BaseProcessor` field, this macro
+/// works with any struct that has `id` and `name` fields directly. The `Debug` output uses
+/// `debug_struct` with `..` non-exhaustive notation; the `Display` output prints just the name.
+///
+/// # Examples
+///
+/// ```ignore
+/// struct MyProcessor {
+///     id: u64,
+///     name: String,
+///     // ... other fields
+/// }
+///
+/// impl_processor!(MyProcessor);
+/// ```
+#[macro_export]
+macro_rules! impl_processor {
+    ($ty:ident) => {
+        impl ::std::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.debug_struct(stringify!($ty))
+                    .field("id", &self.id)
+                    .field("name", &self.name)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl ::std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, "{}", self.name)
+            }
+        }
+    };
+}
+
 /// Implement only `Display` for a type that contains a `base: BaseProcessor` field.
 ///
 /// Use this when the type needs a custom `Debug` implementation (e.g. to show
@@ -329,5 +366,42 @@ impl FrameProcessor for PassthroughProcessor {
 
     async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
         self.push_frame(frame, direction).await;
+    }
+}
+
+#[cfg(test)]
+mod macro_tests {
+    /// Minimal struct with `id` and `name` fields for testing `impl_processor!`.
+    struct TestProc {
+        id: u64,
+        name: String,
+    }
+
+    impl_processor!(TestProc);
+
+    #[test]
+    fn debug_contains_struct_name_and_id() {
+        let p = TestProc {
+            id: 42,
+            name: "my-proc".to_string(),
+        };
+        let debug = format!("{:?}", p);
+        assert!(
+            debug.contains("TestProc"),
+            "Debug output should contain struct name, got: {debug}"
+        );
+        assert!(
+            debug.contains("42"),
+            "Debug output should contain the id, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn display_equals_name() {
+        let p = TestProc {
+            id: 1,
+            name: "hello-world".to_string(),
+        };
+        assert_eq!(format!("{}", p), "hello-world");
     }
 }
