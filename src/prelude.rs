@@ -9,19 +9,22 @@
 
 pub use std::sync::Arc;
 
+pub use async_trait::async_trait;
+
 pub use crate::frames::{
-    AudioRawData, CancelFrame, EndFrame, ErrorFrame, Frame, InputAudioRawFrame,
+    AudioRawData, CancelFrame, EndFrame, ErrorFrame, Frame, FrameFields, InputAudioRawFrame,
     InterimTranscriptionFrame, InterruptionFrame, LLMFullResponseEndFrame,
     LLMFullResponseStartFrame, LLMMessagesAppendFrame, LLMTextFrame, MetricsFrame,
     OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
     TextFrame, TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
-
+pub use crate::impl_processor;
 pub use crate::observers::Observer;
 pub use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
 pub use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor, FrameProcessorSetup};
 pub use crate::serializers::FrameSerializer;
 pub use crate::services::{AIService, LLMService, STTService, TTSService};
+pub use crate::utils::base_object::obj_id;
 
 /// Type alias for a reference-counted frame.
 pub type FrameRef = Arc<dyn Frame>;
