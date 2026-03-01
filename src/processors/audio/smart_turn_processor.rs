@@ -15,10 +15,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use rubato::Resampler;
 
+use crate::audio::resampler::{pcm16_to_f32, AudioResampler, TARGET_SAMPLE_RATE};
 use crate::audio::smart_turn::SmartTurn;
-use crate::audio::vad::silero::SILERO_SAMPLE_RATE;
 use crate::frames::frame_enum::FrameEnum;
 use crate::frames::UserStoppedSpeakingFrame;
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
@@ -53,18 +52,11 @@ pub struct SmartTurnProcessor {
     completion_threshold: f32,
     /// Hard timeout after which the stop frame is released regardless
     hard_timeout: Duration,
-    /// Resampler for 8kHz -> 16kHz input
-    resampler: Option<rubato::SincFixedIn<f32>>,
-    resample_input_buffer: Vec<f32>,
+    /// Resampler for converting input sample rate to 16kHz
+    resampler: Option<AudioResampler>,
     input_sample_rate: u32,
     initialized: bool,
 }
-
-// SAFETY: SmartTurnProcessor is only accessed via `&mut self` in the Processor
-// trait methods, which guarantees exclusive access. The `SincFixedIn<f32>` field
-// is not `Sync` because it contains a `Box<dyn SincInterpolator<f32>>` without a
-// `Sync` bound, but we never share references across threads.
-unsafe impl Sync for SmartTurnProcessor {}
 
 impl SmartTurnProcessor {
     /// Create a new SmartTurnProcessor.
@@ -85,7 +77,6 @@ impl SmartTurnProcessor {
             completion_threshold: DEFAULT_THRESHOLD,
             hard_timeout: DEFAULT_HARD_TIMEOUT,
             resampler: None,
-            resample_input_buffer: Vec::new(),
             input_sample_rate: 0,
             initialized: false,
         }
@@ -103,81 +94,16 @@ impl SmartTurnProcessor {
         self
     }
 
-    /// Convert PCM16 LE bytes to f32 samples normalized to [-1.0, 1.0].
-    fn pcm16_to_f32(audio: &[u8]) -> Vec<f32> {
-        let num_samples = audio.len() / 2;
-        let mut samples = Vec::with_capacity(num_samples);
-        for i in 0..num_samples {
-            let offset = i * 2;
-            if offset + 1 < audio.len() {
-                let sample = i16::from_le_bytes([audio[offset], audio[offset + 1]]);
-                samples.push(sample as f32 / 32768.0);
-            }
-        }
-        samples
-    }
-
-    /// Resample f32 samples to 16kHz if needed.
-    fn resample(&mut self, samples: &[f32]) -> Vec<f32> {
-        if self.input_sample_rate == SILERO_SAMPLE_RATE {
-            return samples.to_vec();
-        }
-
-        let resampler = match self.resampler.as_mut() {
-            Some(r) => r,
-            None => return samples.to_vec(),
-        };
-
-        self.resample_input_buffer.extend_from_slice(samples);
-
-        let chunk_size = resampler.input_frames_next();
-        let mut output: Vec<f32> = Vec::new();
-
-        while self.resample_input_buffer.len() >= chunk_size {
-            let input_chunk: Vec<f32> = self.resample_input_buffer.drain(..chunk_size).collect();
-            match resampler.process(&[&input_chunk], None) {
-                Ok(resampled) => {
-                    if let Some(channel) = resampled.first() {
-                        output.extend_from_slice(channel);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("SmartTurn: resampling error: {}", e);
-                }
-            }
-        }
-
-        output
-    }
-
     fn init_resampler(&mut self, input_sample_rate: u32) {
         self.input_sample_rate = input_sample_rate;
 
-        if input_sample_rate != SILERO_SAMPLE_RATE {
-            let ratio = SILERO_SAMPLE_RATE as f64 / input_sample_rate as f64;
-            match rubato::SincFixedIn::<f32>::new(
-                ratio,
-                2.0,
-                rubato::SincInterpolationParameters {
-                    sinc_len: 256,
-                    f_cutoff: 0.95,
-                    interpolation: rubato::SincInterpolationType::Linear,
-                    oversampling_factor: 256,
-                    window: rubato::WindowFunction::BlackmanHarris2,
-                },
-                input_sample_rate as usize / 100,
-                1,
-            ) {
-                Ok(r) => {
-                    self.resampler = Some(r);
-                    tracing::info!(
-                        "SmartTurn: resampler {}Hz -> {}Hz",
-                        input_sample_rate,
-                        SILERO_SAMPLE_RATE
-                    );
-                }
-                Err(e) => tracing::error!("SmartTurn: resampler init failed: {}", e),
-            }
+        if AudioResampler::needs_resampling(input_sample_rate) {
+            self.resampler = Some(AudioResampler::new(input_sample_rate));
+            tracing::info!(
+                "SmartTurn: resampler {}Hz -> {}Hz",
+                input_sample_rate,
+                TARGET_SAMPLE_RATE
+            );
         }
     }
 
@@ -211,7 +137,10 @@ impl SmartTurnProcessor {
     }
 
     /// Check hard timeout and run inference if pending.
-    fn check_pending(&mut self, ctx: &ProcessorContext) {
+    ///
+    /// Uses `spawn_blocking` for ONNX inference to avoid blocking the
+    /// tokio runtime thread.
+    async fn check_pending(&mut self, ctx: &ProcessorContext) {
         if self.pending_stop.is_none() {
             return;
         }
@@ -226,22 +155,33 @@ impl SmartTurnProcessor {
         }
 
         // Run inference
-        if let Some(smart_turn) = self.smart_turn.as_mut() {
-            let audio: Vec<f32> = self.audio_buffer.iter().copied().collect();
+        if self.smart_turn.is_some() {
+            let audio: Vec<f32> = self.audio_buffer.make_contiguous().to_vec();
             if !audio.is_empty() {
-                match smart_turn.predict(&audio) {
-                    Ok(prob) => {
+                // Take the model temporarily to move it into spawn_blocking
+                let mut model = self.smart_turn.take().unwrap();
+                let result = tokio::task::spawn_blocking(move || {
+                    let r = model.predict(&audio);
+                    (model, r)
+                })
+                .await;
+
+                match result {
+                    Ok((model, Ok(prob))) => {
+                        self.smart_turn = Some(model);
                         tracing::debug!("SmartTurn: turn completion probability = {:.3}", prob);
                         if prob >= self.completion_threshold {
                             tracing::debug!("SmartTurn: turn complete, releasing stop frame");
                             self.release_pending(ctx);
                         }
                     }
+                    Ok((model, Err(e))) => {
+                        self.smart_turn = Some(model);
+                        tracing::warn!("SmartTurn: inference error: {e}, releasing stop frame");
+                        self.release_pending(ctx);
+                    }
                     Err(e) => {
-                        tracing::warn!(
-                            "SmartTurn: inference error: {}, releasing stop frame",
-                            e
-                        );
+                        tracing::error!("SmartTurn: spawn_blocking panicked: {e}");
                         self.release_pending(ctx);
                     }
                 }
@@ -331,15 +271,19 @@ impl Processor for SmartTurnProcessor {
                 }
 
                 // Convert and buffer audio
-                let f32_samples = Self::pcm16_to_f32(&af.audio.audio);
-                let resampled = self.resample(&f32_samples);
+                let f32_samples = pcm16_to_f32(&af.audio.audio);
+                let resampled = if let Some(ref mut r) = self.resampler {
+                    r.resample(&f32_samples)
+                } else {
+                    f32_samples
+                };
                 self.append_audio(&resampled);
 
                 if self.pending_stop.is_some() {
                     // Audio arriving while we're holding a stop frame
                     // Hold it and run inference
                     self.held_frames.push(frame);
-                    self.check_pending(ctx);
+                    self.check_pending(ctx).await;
                 } else {
                     ctx.send_downstream(frame);
                 }
@@ -353,7 +297,7 @@ impl Processor for SmartTurnProcessor {
                     tracing::debug!(audio_samples = self.audio_buffer.len(), "SmartTurn: holding UserStoppedSpeaking");
 
                     // Run immediate inference on current audio buffer
-                    self.check_pending(ctx);
+                    self.check_pending(ctx).await;
                 } else {
                     // No model, pass through
                     tracing::debug!("SmartTurn: no model, passing UserStoppedSpeaking through");
