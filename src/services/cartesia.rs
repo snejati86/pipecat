@@ -913,7 +913,7 @@ impl CartesiaTTSService {
 
         if let Err(e) = send_result {
             tracing::error!(service = %self.name, "Failed to send TTS request: {e}");
-            self.connection = CartesiaConnection::Disconnected;
+            self.disconnect().await;
             ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(
                 format!("Failed to send TTS request over WebSocket: {e}"),
                 false,
@@ -1162,7 +1162,7 @@ impl TTSService for CartesiaTTSService {
             sink.send(WsMessage::Text(request_json)).await
         };
         if let Err(e) = send_result {
-            self.connection = CartesiaConnection::Disconnected;
+            self.disconnect().await;
             return vec![
                 FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))),
                 FrameEnum::Error(ErrorFrame::new(
