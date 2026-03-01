@@ -18,6 +18,7 @@ pub use crate::frames::{
     OutputAudioRawFrame, StartFrame, StopFrame, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
     TextFrame, TranscriptionFrame, UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
 };
+pub use crate::impl_base_debug_display;
 pub use crate::impl_processor;
 pub use crate::observers::Observer;
 pub use crate::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};

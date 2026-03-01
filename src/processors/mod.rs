@@ -65,6 +65,9 @@ macro_rules! impl_base_debug_display {
 ///
 /// impl_processor!(MyProcessor);
 /// ```
+///
+/// **Note:** This macro only supports non-generic structs. For generic
+/// structs, implement `Debug` and `Display` manually.
 #[macro_export]
 macro_rules! impl_processor {
     ($ty:ident) => {
