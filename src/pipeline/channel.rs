@@ -19,10 +19,12 @@
 //!   for clean shutdown.
 //! - **CancellationToken**: Cooperative cancellation per generation.
 
+use std::panic::AssertUnwindSafe;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -362,18 +364,32 @@ impl ChannelPipeline {
                             Completed,
                             Interrupted(DirectedFrame),
                             Cancelled,
+                            Panicked(String),
                         }
 
                         let result = {
                             let mut process_fut = pin!(
-                                processor.process(directed.frame, directed.direction, &ctx)
+                                AssertUnwindSafe(
+                                    processor.process(directed.frame, directed.direction, &ctx)
+                                )
+                                .catch_unwind()
                             );
 
                             loop {
                                 tokio::select! {
                                     biased;
                                     _ = token.cancelled() => break MonitorResult::Cancelled,
-                                    () = &mut process_fut => {
+                                    panic_result = &mut process_fut => {
+                                        if let Err(panic_info) = panic_result {
+                                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                                s.to_string()
+                                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                                s.clone()
+                                            } else {
+                                                "unknown panic".to_string()
+                                            };
+                                            break MonitorResult::Panicked(msg);
+                                        }
                                         break MonitorResult::Completed;
                                     }
                                     Some(pf) = down_rx.recv_priority() => {
@@ -387,7 +403,8 @@ impl ChannelPipeline {
                                             interrupt_token.cancel();
 
                                             // Wait for process() to finish cooperatively
-                                            process_fut.await;
+                                            // (catch_unwind wraps this too)
+                                            let _ = process_fut.await;
 
                                             break MonitorResult::Interrupted(pf);
                                         } else {
@@ -402,6 +419,23 @@ impl ChannelPipeline {
 
                         match result {
                             MonitorResult::Cancelled => break 'outer,
+                            MonitorResult::Panicked(msg) => {
+                                tracing::error!(
+                                    processor = %proc_name,
+                                    "Processor panicked: {msg}"
+                                );
+                                // Send directly to downstream priority channel (not
+                                // through ctx) because we're about to break out of the
+                                // loop and the context drain won't run.
+                                downstream_tx.send(
+                                    FrameEnum::Error(crate::frames::ErrorFrame::new(
+                                        format!("Processor {proc_name} panicked: {msg}"),
+                                        true,
+                                    )),
+                                    FrameDirection::Downstream,
+                                ).await;
+                                break 'outer;
+                            }
                             MonitorResult::Interrupted(int_frame) => {
                                 // Activate flush: any background tasks pushing
                                 // data frames through this sender will have them
@@ -509,7 +543,36 @@ impl ChannelPipeline {
                         }
                     } else {
                         // --- Light/Standard: simple direct call ---
-                        processor.process(directed.frame, directed.direction, &ctx).await;
+                        let result = AssertUnwindSafe(
+                            processor.process(directed.frame, directed.direction, &ctx),
+                        )
+                        .catch_unwind()
+                        .await;
+
+                        if let Err(panic_info) = result {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::error!(
+                                processor = %processor,
+                                "Processor panicked: {msg}"
+                            );
+                            // Send directly to downstream priority channel (not
+                            // through ctx) because we're about to break out of the
+                            // loop and the context drain won't run.
+                            downstream_tx.send(
+                                FrameEnum::Error(crate::frames::ErrorFrame::new(
+                                    format!("Processor {} panicked: {msg}", processor.name()),
+                                    true,
+                                )),
+                                FrameDirection::Downstream,
+                            ).await;
+                            break;
+                        }
                     }
 
                     // Drain all context output into priority channels before
@@ -577,7 +640,11 @@ impl ChannelPipeline {
         // Drop input sender to prevent new frames from entering
         drop(self.input_tx);
         self.cancel_token.cancel();
-        while self.join_set.join_next().await.is_some() {}
+        while let Some(result) = self.join_set.join_next().await {
+            if let Err(e) = result {
+                tracing::error!("ChannelPipeline: processor task panicked during shutdown: {e}");
+            }
+        }
     }
 }
 
@@ -1357,5 +1424,132 @@ mod tests {
         ).await;
         assert!(result.is_ok(), "Control frame should pass through during flush");
         assert!(matches!(result.unwrap().unwrap().frame, FrameEnum::End(_)));
+    }
+
+    // -- Panic detection tests ------------------------------------------------
+
+    /// A processor that panics when it receives a TextFrame.
+    struct PanickingProc {
+        weight: ProcessorWeight,
+    }
+
+    impl PanickingProc {
+        fn new(weight: ProcessorWeight) -> Self {
+            Self { weight }
+        }
+    }
+
+    impl std::fmt::Debug for PanickingProc {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PanickingProc")
+        }
+    }
+    impl std::fmt::Display for PanickingProc {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Panicking")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Processor for PanickingProc {
+        fn name(&self) -> &str {
+            "Panicking"
+        }
+        fn id(&self) -> u64 {
+            99
+        }
+        fn weight(&self) -> ProcessorWeight {
+            self.weight
+        }
+
+        async fn process(
+            &mut self,
+            frame: FrameEnum,
+            _direction: FrameDirection,
+            ctx: &ProcessorContext,
+        ) {
+            match frame {
+                FrameEnum::Text(_) => {
+                    panic!("processor intentionally panicked");
+                }
+                other => ctx.send_downstream(other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_light_processor_panic_produces_fatal_error() {
+        let procs: Vec<Box<dyn Processor>> =
+            vec![Box::new(PanickingProc::new(ProcessorWeight::Light))];
+        let mut pipeline = ChannelPipeline::new(procs);
+        let mut output = pipeline.take_output().unwrap();
+
+        // Send a TextFrame to trigger the panic
+        pipeline.send(FrameEnum::Text(TextFrame::new("boom"))).await;
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            output.recv(),
+        )
+        .await
+        .expect("timeout waiting for error frame")
+        .expect("channel closed unexpectedly");
+
+        match received.frame {
+            FrameEnum::Error(err) => {
+                assert!(err.fatal, "Error should be fatal");
+                assert!(
+                    err.error.contains("panicked"),
+                    "Error message should mention panic, got: {}",
+                    err.error,
+                );
+                assert!(
+                    err.error.contains("intentionally panicked"),
+                    "Error message should contain the panic message, got: {}",
+                    err.error,
+                );
+            }
+            other => panic!("Expected ErrorFrame, got {}", other.name()),
+        }
+
+        pipeline.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_heavy_processor_panic_produces_fatal_error() {
+        let procs: Vec<Box<dyn Processor>> =
+            vec![Box::new(PanickingProc::new(ProcessorWeight::Heavy))];
+        let mut pipeline = ChannelPipeline::new(procs);
+        let mut output = pipeline.take_output().unwrap();
+
+        // Send a TextFrame to trigger the panic
+        pipeline.send(FrameEnum::Text(TextFrame::new("boom"))).await;
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            output.recv(),
+        )
+        .await
+        .expect("timeout waiting for error frame")
+        .expect("channel closed unexpectedly");
+
+        match received.frame {
+            FrameEnum::Error(err) => {
+                assert!(err.fatal, "Error should be fatal");
+                assert!(
+                    err.error.contains("panicked"),
+                    "Error message should mention panic, got: {}",
+                    err.error,
+                );
+                assert!(
+                    err.error.contains("intentionally panicked"),
+                    "Error message should contain the panic message, got: {}",
+                    err.error,
+                );
+            }
+            other => panic!("Expected ErrorFrame, got {}", other.name()),
+        }
+
+        pipeline.shutdown().await;
     }
 }
