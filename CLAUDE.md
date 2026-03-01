@@ -129,18 +129,44 @@ impl Processor for MyProcessor {
 
 ## Testing
 
-Test utilities live in `src/tests/mod.rs`. Use `run_test()` to send frames through a pipeline and assert expected output frames in each direction.
+Test processors by creating a `ProcessorContext` with channel receivers and calling `process()` directly:
 
 ```rust
-use pipecat::tests::run_test;
+use tokio::sync::mpsc;
+use pipecat::prelude::*;
+use pipecat::processors::processor::ProcessorContext;
+use tokio_util::sync::CancellationToken;
 
-run_test(
-    processor,
-    frames_to_send,
-    Some(vec!["TextFrame"]),  // expected downstream
-    None,                     // expected upstream
-    true,                     // send EndFrame after
-    vec![],                   // observers
-    None,                     // pipeline params
-).await;
+#[tokio::test]
+async fn test_my_processor() {
+    let (dtx, mut drx) = mpsc::unbounded_channel();
+    let (utx, mut _urx) = mpsc::unbounded_channel();
+    let ctx = ProcessorContext::new(dtx, utx, CancellationToken::new(), 1);
+
+    let mut proc = MyProcessor::new();
+    proc.process(
+        FrameEnum::Text(TextFrame::new("hello")),
+        FrameDirection::Downstream,
+        &ctx,
+    ).await;
+
+    let output = drx.recv().await.unwrap();
+    assert!(matches!(output, FrameEnum::Text(t) if t.text == "HELLO"));
+}
+```
+
+For integration tests with multi-processor pipelines, use `ChannelPipeline`:
+
+```rust
+use pipecat::pipeline::ChannelPipeline;
+
+let mut pipeline = ChannelPipeline::new(vec![Box::new(MyProcessor::new())]);
+let mut output = pipeline.take_output().unwrap();
+
+pipeline.send(FrameEnum::Text(TextFrame::new("hello"))).await;
+
+let received = output.recv().await.unwrap();
+assert!(matches!(received.frame, FrameEnum::Text(t) if t.text == "HELLO"));
+
+pipeline.shutdown().await;
 ```
