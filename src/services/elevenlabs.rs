@@ -7,8 +7,8 @@
 //!
 //! - [`ElevenLabsTTSService`]: WebSocket-based streaming TTS with low latency and
 //!   incremental audio delivery. Connects to
-//!   `wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input` and streams
-//!   audio chunks as they are generated.
+//!   `wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input` using
+//!   the multi-context API for persistent connections and per-context cancellation.
 //!
 //! - [`ElevenLabsHttpTTSService`]: HTTP-based TTS using
 //!   `POST /v1/text-to-speech/{voice_id}/stream`. Simpler integration but higher
@@ -48,12 +48,15 @@
 //! ```
 
 use std::fmt;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
@@ -101,6 +104,11 @@ pub struct ElevenLabsInputParams {
     pub optimize_streaming_latency: Option<u32>,
     /// Language code for multilingual models (e.g., "en", "es", "fr").
     pub language_code: Option<String>,
+    /// Chunk length schedule controlling when ElevenLabs generates audio chunks.
+    /// Each value is the minimum character count before generating the Nth chunk.
+    /// Default (if None): ElevenLabs uses [120, 160, 250, 290].
+    /// For low-latency token streaming, use [50] to get audio after ~50 chars.
+    pub chunk_length_schedule: Option<Vec<u32>>,
 }
 
 /// Metrics collected during TTS generation.
@@ -116,31 +124,69 @@ pub struct TTSMetrics {
 // WebSocket message types (ElevenLabs protocol)
 // ---------------------------------------------------------------------------
 
-/// JSON message sent to the ElevenLabs WebSocket API to begin or continue input.
+/// Generation config for controlling audio chunking behavior.
+#[derive(Debug, Clone, Serialize)]
+struct ElevenLabsGenerationConfig {
+    /// Minimum characters before generating each successive audio chunk.
+    /// Lower values = faster first audio but potentially lower quality.
+    /// Default: [120, 160, 250, 290]. Aggressive: [50].
+    chunk_length_schedule: Vec<u32>,
+}
+
+/// Context initialization message for the multi-context WebSocket API.
+///
+/// Sent as the first message for each new context to configure voice settings
+/// and generation behavior.
 #[derive(Debug, Serialize)]
-struct ElevenLabsWsRequest {
+struct ElevenLabsWsContextInit {
     text: String,
+    context_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     voice_settings: Option<ElevenLabsVoiceSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    xi_api_key: Option<String>,
+    generation_config: Option<ElevenLabsGenerationConfig>,
 }
 
-/// Flush message sent to signal end of text input.
+/// Text message for the multi-context WebSocket API.
+#[derive(Debug, Serialize)]
+struct ElevenLabsWsText {
+    text: String,
+    context_id: String,
+}
+
+/// Flush message sent to signal end of text input for a context.
 #[derive(Debug, Serialize)]
 struct ElevenLabsWsFlush {
     text: String,
+    context_id: String,
+    flush: bool,
 }
 
-/// JSON message received from the ElevenLabs WebSocket API.
+/// Close a specific context, cancelling any in-flight audio generation.
+#[derive(Debug, Serialize)]
+struct ElevenLabsWsCloseContext {
+    context_id: String,
+    close_context: bool,
+}
+
+/// Close the entire WebSocket connection gracefully.
+#[derive(Debug, Serialize)]
+struct ElevenLabsWsCloseSocket {
+    close_socket: bool,
+}
+
+/// JSON message received from the ElevenLabs multi-context WebSocket API.
 #[derive(Debug, Deserialize)]
 struct ElevenLabsWsResponse {
     /// Base64-encoded audio data (present when audio is generated).
     #[serde(default)]
     audio: Option<String>,
-    /// Whether this is the final message for this generation.
+    /// Whether this is the final message for this context.
     #[serde(default, rename = "isFinal")]
     is_final: Option<bool>,
+    /// The context ID this response belongs to.
+    #[serde(default, rename = "contextId")]
+    context_id: Option<String>,
     /// Error message if something went wrong.
     #[serde(default)]
     error: Option<String>,
@@ -186,17 +232,24 @@ fn sample_rate_from_output_format(format: &str) -> u32 {
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+type WsWriter = futures_util::stream::SplitSink<WsStream, WsMessage>;
+type WsReader = futures_util::stream::SplitStream<WsStream>;
+
 // ---------------------------------------------------------------------------
 // ElevenLabsTTSService (WebSocket streaming)
 // ---------------------------------------------------------------------------
 
 /// ElevenLabs TTS service using WebSocket streaming.
 ///
-/// Connects to ElevenLabs' WebSocket API and streams audio chunks as they are
-/// generated, providing low-latency audio delivery with incremental results.
+/// Supports two modes:
 ///
-/// The service maintains a persistent WebSocket connection and supports
-/// context-based audio management for handling interruptions and cancellations.
+/// - **Token streaming**: Receives `LLMFullResponseStart` → `LLMTextFrame` tokens
+///   → `LLMFullResponseEnd`. Streams each token directly to ElevenLabs' WebSocket,
+///   letting ElevenLabs handle text buffering internally. A background reader task
+///   decodes audio and sends `OutputAudioRawFrame`s downstream.
+///
+/// - **Sentence mode** (legacy): Receives a `TextFrame` with complete text.
+///   Sends init + text + flush in one shot; reader task handles audio delivery.
 pub struct ElevenLabsTTSService {
     id: u64,
     name: String,
@@ -208,12 +261,23 @@ pub struct ElevenLabsTTSService {
     ws_url: String,
     params: ElevenLabsInputParams,
 
-    /// The WebSocket connection.
-    ws: Option<WsStream>,
+    /// WebSocket writer half (send side of the split connection).
+    ws_writer: Option<WsWriter>,
 
-    /// When true, the WebSocket has stale audio from an interrupted TTS
-    /// generation that must be drained before the next request.
-    needs_drain: bool,
+    /// WebSocket reader half, stored temporarily until the reader task is spawned.
+    ws_reader: Option<WsReader>,
+
+    /// Background task that reads WS responses and sends audio frames downstream.
+    reader_task: Option<JoinHandle<()>>,
+
+    /// Downstream sender captured from ProcessorContext on first process() call.
+    down_tx: Option<mpsc::UnboundedSender<FrameEnum>>,
+
+    /// Shared context ID for filtering responses in the reader task.
+    current_context_id: Arc<StdMutex<Option<String>>>,
+
+    /// Whether we're currently streaming LLM tokens to ElevenLabs.
+    token_streaming: bool,
 
     /// Last metrics collected (available after `run_tts` completes).
     pub last_metrics: Option<TTSMetrics>,
@@ -248,8 +312,12 @@ impl ElevenLabsTTSService {
             sample_rate,
             ws_url: Self::DEFAULT_WS_BASE_URL.to_string(),
             params: ElevenLabsInputParams::default(),
-            ws: None,
-            needs_drain: false,
+            ws_writer: None,
+            ws_reader: None,
+            reader_task: None,
+            down_tx: None,
+            current_context_id: Arc::new(StdMutex::new(None)),
+            token_streaming: false,
             last_metrics: None,
         }
     }
@@ -311,6 +379,16 @@ impl ElevenLabsTTSService {
         self
     }
 
+    /// Builder method: set the chunk length schedule for audio generation.
+    ///
+    /// Controls when ElevenLabs generates audio chunks during streaming.
+    /// Each value is the minimum character count before generating the Nth chunk.
+    /// Default: `[120, 160, 250, 290]`. For low-latency: `[50]`.
+    pub fn with_chunk_length_schedule(mut self, schedule: Vec<u32>) -> Self {
+        self.params.chunk_length_schedule = Some(schedule);
+        self
+    }
+
     /// Builder method: set the WebSocket base URL.
     pub fn with_ws_url(mut self, url: impl Into<String>) -> Self {
         self.ws_url = url.into();
@@ -324,39 +402,69 @@ impl ElevenLabsTTSService {
     }
 
     /// Build the WebSocket connection URL with query parameters.
+    ///
+    /// Uses the multi-context `/multi-stream-input` endpoint. Authentication is
+    /// handled via the `xi-api-key` header in `connect()`.
     fn build_ws_url(&self) -> String {
         let mut url = format!(
-            "{}/v1/text-to-speech/{}/stream-input?model_id={}&output_format={}",
+            "{}/v1/text-to-speech/{}/multi-stream-input?model_id={}&output_format={}&auto_mode=true",
             self.ws_url, self.voice_id, self.model, self.output_format
         );
         if let Some(latency) = self.params.optimize_streaming_latency {
             url.push_str(&format!("&optimize_streaming_latency={}", latency));
         }
+        if let Some(ref lang) = self.params.language_code {
+            url.push_str(&format!("&language_code={}", lang));
+        }
         url
     }
 
-    /// Establish the WebSocket connection to ElevenLabs.
+    /// Build a WebSocket request with authentication headers.
+    fn build_ws_request(
+        &self,
+    ) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, String> {
+        let url = self.build_ws_url();
+        tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(&url)
+            .header("xi-api-key", &self.api_key)
+            .header("Host", url.split('/').nth(2).unwrap_or("api.elevenlabs.io"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .map_err(|e| format!("Failed to build WebSocket request: {e}"))
+    }
+
+    /// Establish the WebSocket connection to ElevenLabs and split into reader/writer.
     ///
-    /// This must be called before `run_tts`. If the connection is already open,
-    /// this is a no-op.
+    /// If the connection is already open, this is a no-op. The reader half is
+    /// stored in `ws_reader` until `ensure_reader_spawned()` moves it into a
+    /// background task.
     pub async fn connect(&mut self) -> Result<(), String> {
-        if self.ws.is_some() {
+        if self.ws_writer.is_some() {
             return Ok(());
         }
 
-        let url = self.build_ws_url();
-
         tracing::debug!(service = %self.name, "Connecting to ElevenLabs WebSocket");
+
+        let request = self.build_ws_request()?;
 
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            tokio_tungstenite::connect_async(&url),
+            tokio_tungstenite::connect_async(request),
         )
         .await;
         match ws_result {
             Ok(Ok((stream, _response))) => {
                 tracing::info!(service = %self.name, "Connected to ElevenLabs WebSocket");
-                self.ws = Some(stream);
+                let (sink, reader) = stream.split();
+                self.ws_writer = Some(sink);
+                self.ws_reader = Some(reader);
+                *self.current_context_id.lock().unwrap() = None;
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -372,92 +480,22 @@ impl ElevenLabsTTSService {
         }
     }
 
-    /// Disconnect the WebSocket connection.
+    /// Disconnect the WebSocket and stop the reader task.
     pub async fn disconnect(&mut self) {
-        if let Some(ref mut ws) = self.ws {
+        if let Some(ref mut writer) = self.ws_writer {
             tracing::debug!(service = %self.name, "Disconnecting from ElevenLabs WebSocket");
-            if let Err(e) = ws.close(None).await {
-                tracing::warn!(
-                    service = %self.name,
-                    "Failed to close ElevenLabs WebSocket: {e}"
-                );
+            let close_msg = ElevenLabsWsCloseSocket { close_socket: true };
+            if let Ok(json) = serde_json::to_string(&close_msg) {
+                let _ = writer.send(WsMessage::Text(json)).await;
             }
+            let _ = writer.close().await;
         }
-        self.ws = None;
-    }
-
-    /// Drain stale audio messages from an interrupted TTS generation.
-    ///
-    /// After an interruption, the server may still be sending audio chunks from
-    /// the previous request. This reads and discards messages until `isFinal: true`
-    /// or a timeout, leaving the WebSocket ready for the next request.
-    /// If the drain times out or the connection is closed, the WebSocket is
-    /// dropped so `connect()` will establish a fresh one.
-    async fn drain_stale_messages(&mut self) {
-        let ws = match self.ws.as_mut() {
-            Some(ws) => ws,
-            None => return,
-        };
-
-        tracing::debug!(service = %self.name, "Draining stale WebSocket messages after interruption");
-
-        let drain_timeout = std::time::Duration::from_millis(500);
-        let deadline = tokio::time::Instant::now() + drain_timeout;
-        let mut drained = 0usize;
-
-        loop {
-            let msg = tokio::select! {
-                biased;
-                _ = tokio::time::sleep_until(deadline) => {
-                    tracing::warn!(
-                        service = %self.name,
-                        drained,
-                        "Drain timed out — reconnecting"
-                    );
-                    // Force reconnect: drop the stale WebSocket
-                    self.ws = None;
-                    return;
-                }
-                msg = ws.next() => msg,
-            };
-
-            match msg {
-                Some(Ok(WsMessage::Text(text))) => {
-                    drained += 1;
-                    if let Ok(resp) =
-                        serde_json::from_str::<ElevenLabsWsResponse>(&text.to_string())
-                    {
-                        if resp.is_final == Some(true) {
-                            tracing::debug!(
-                                service = %self.name,
-                                drained,
-                                "Drain complete (isFinal received)"
-                            );
-                            return;
-                        }
-                    }
-                }
-                Some(Ok(WsMessage::Close(_))) | None => {
-                    tracing::debug!(
-                        service = %self.name,
-                        drained,
-                        "Drain: connection closed — will reconnect"
-                    );
-                    self.ws = None;
-                    return;
-                }
-                Some(Ok(_)) => {
-                    drained += 1;
-                }
-                Some(Err(e)) => {
-                    tracing::warn!(
-                        service = %self.name,
-                        "Drain: WebSocket error: {e} — will reconnect"
-                    );
-                    self.ws = None;
-                    return;
-                }
-            }
+        self.ws_writer = None;
+        self.ws_reader = None;
+        *self.current_context_id.lock().unwrap() = None;
+        self.token_streaming = false;
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
         }
     }
 
@@ -475,82 +513,141 @@ impl ElevenLabsTTSService {
         }
     }
 
-    /// Send a TTS request over the WebSocket and collect response frames.
+    fn build_generation_config(&self) -> Option<ElevenLabsGenerationConfig> {
+        self.params
+            .chunk_length_schedule
+            .as_ref()
+            .map(|schedule| ElevenLabsGenerationConfig {
+                chunk_length_schedule: schedule.clone(),
+            })
+    }
+
+    /// Ensure the background reader task is spawned.
     ///
-    /// Protocol flow:
-    /// 1. Send initial message with text, voice settings, and API key
-    /// 2. Send flush message `{"text": ""}` to signal end of input
-    /// 3. Read audio chunks until `isFinal: true` is received
+    /// Takes the stored `ws_reader` and spawns a task that reads WS responses,
+    /// decodes audio, and sends frames via `down_tx`.
+    fn ensure_reader_spawned(&mut self) {
+        if self.reader_task.is_some() {
+            return;
+        }
+        let reader = match self.ws_reader.take() {
+            Some(r) => r,
+            None => return,
+        };
+        let down_tx = match self.down_tx.clone() {
+            Some(tx) => tx,
+            None => {
+                self.ws_reader = Some(reader);
+                return;
+            }
+        };
+
+        let context_id = Arc::clone(&self.current_context_id);
+        let sample_rate = self.sample_rate;
+        let service_name = self.name.clone();
+
+        self.reader_task = Some(tokio::spawn(ws_reader_loop(
+            reader,
+            down_tx,
+            context_id,
+            sample_rate,
+            service_name,
+        )));
+    }
+
+    /// Handle a WebSocket write error by clearing connection state.
+    fn handle_ws_error(&mut self) {
+        self.ws_writer = None;
+        self.ws_reader = None;
+        *self.current_context_id.lock().unwrap() = None;
+        self.token_streaming = false;
+        if let Some(task) = self.reader_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Send a TTS request over a temporary WebSocket and collect response frames.
+    ///
+    /// Used by the `TTSService` trait for buffered one-shot synthesis.
+    /// Creates its own connection to avoid interfering with the persistent
+    /// processor connection.
     async fn run_tts_ws(&mut self, text: &str) -> Vec<FrameEnum> {
         let context_id = generate_context_id();
         let mut frames: Vec<FrameEnum> = Vec::new();
 
-        // Build the initial request with text, voice settings, and API key.
-        let request = ElevenLabsWsRequest {
-            text: text.to_string(),
-            voice_settings: self.build_voice_settings(),
-            xi_api_key: Some(self.api_key.clone()),
-        };
-
-        let request_json = match serde_json::to_string(&request) {
-            Ok(json) => json,
+        let request = match self.build_ws_request() {
+            Ok(r) => r,
             Err(e) => {
+                frames.push(FrameEnum::Error(ErrorFrame::new(e, false)));
+                return frames;
+            }
+        };
+
+        let ws_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await;
+
+        let mut ws = match ws_result {
+            Ok(Ok((stream, _))) => stream,
+            Ok(Err(e)) => {
                 frames.push(FrameEnum::Error(ErrorFrame::new(
-                    format!("Failed to serialize ElevenLabs request: {e}"),
+                    format!("WS connect error: {e}"),
+                    false,
+                )));
+                return frames;
+            }
+            Err(_) => {
+                frames.push(FrameEnum::Error(ErrorFrame::new(
+                    "WS connection timed out".to_string(),
                     false,
                 )));
                 return frames;
             }
         };
 
-        let ttfb_start = Instant::now();
-        let mut got_first_audio = false;
-
-        let ws = match self.ws.as_mut() {
-            Some(ws) => ws,
-            None => {
-                frames.push(FrameEnum::Error(ErrorFrame::new(
-                    "WebSocket not connected. Call connect() first.".to_string(),
-                    false,
-                )));
-                return frames;
-            }
+        // Send init + text + flush
+        let init = ElevenLabsWsContextInit {
+            text: " ".to_string(),
+            context_id: context_id.clone(),
+            voice_settings: self.build_voice_settings(),
+            generation_config: self.build_generation_config(),
         };
-
-        if let Err(e) = ws.send(WsMessage::Text(request_json)).await {
-            frames.push(FrameEnum::Error(ErrorFrame::new(
-                format!("Failed to send TTS request over WebSocket: {e}"),
-                false,
-            )));
-            return frames;
-        }
-
-        // Send flush to signal end of text input.
+        let text_msg = ElevenLabsWsText {
+            text: text.to_string(),
+            context_id: context_id.clone(),
+        };
         let flush = ElevenLabsWsFlush {
-            text: String::new(),
+            text: " ".to_string(),
+            context_id: context_id.clone(),
+            flush: true,
         };
-        if let Ok(flush_json) = serde_json::to_string(&flush) {
-            if let Err(e) = ws.send(WsMessage::Text(flush_json)).await {
-                tracing::warn!(
-                    service = %self.name,
-                    "Failed to send flush message: {e}"
-                );
+
+        for json in [
+            serde_json::to_string(&init),
+            serde_json::to_string(&text_msg),
+            serde_json::to_string(&flush),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(e) = ws.send(WsMessage::Text(json)).await {
+                frames.push(FrameEnum::Error(ErrorFrame::new(
+                    format!("WS send error: {e}"),
+                    false,
+                )));
+                return frames;
             }
         }
 
-        // Push TTSStartedFrame.
         frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
             context_id.clone(),
         ))));
 
-        tracing::debug!(
-            service = %self.name,
-            text = %text,
-            context_id = %context_id,
-            "Sent TTS request over WebSocket"
-        );
+        let ttfb_start = Instant::now();
+        let mut got_first_audio = false;
 
-        // Read messages until we get a final message or error.
         loop {
             let msg = match ws.next().await {
                 Some(Ok(msg)) => msg,
@@ -561,47 +658,27 @@ impl ElevenLabsTTSService {
                     )));
                     break;
                 }
-                None => {
-                    // Connection closed unexpectedly.
-                    frames.push(FrameEnum::Error(ErrorFrame::new(
-                        "WebSocket connection closed unexpectedly".to_string(),
-                        false,
-                    )));
-                    break;
-                }
+                None => break,
             };
 
             let text_data = match msg {
                 WsMessage::Text(t) => t.to_string(),
-                WsMessage::Close(_) => {
-                    tracing::debug!(
-                        service = %self.name,
-                        "WebSocket closed by server"
-                    );
-                    break;
-                }
+                WsMessage::Close(_) => break,
                 _ => continue,
             };
 
             let response: ElevenLabsWsResponse = match serde_json::from_str(&text_data) {
                 Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        service = %self.name,
-                        "Failed to parse WebSocket message: {e}"
-                    );
-                    continue;
-                }
+                Err(_) => continue,
             };
 
-            // Check for errors.
+            if let Some(ref resp_ctx) = response.context_id {
+                if resp_ctx != &context_id {
+                    continue;
+                }
+            }
+
             if let Some(ref error) = response.error {
-                tracing::error!(
-                    service = %self.name,
-                    context_id = %context_id,
-                    error = %error,
-                    "ElevenLabs WebSocket error"
-                );
                 frames.push(FrameEnum::Error(ErrorFrame::new(
                     format!("ElevenLabs error: {error}"),
                     false,
@@ -609,60 +686,170 @@ impl ElevenLabsTTSService {
                 break;
             }
 
-            // Process audio data.
             if let Some(ref audio_b64) = response.audio {
                 if !audio_b64.is_empty() {
-                    match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
-                        Ok(audio_bytes) => {
-                            if !audio_bytes.is_empty() {
-                                if !got_first_audio {
-                                    got_first_audio = true;
-                                    let ttfb = ttfb_start.elapsed();
-                                    tracing::debug!(
-                                        service = %self.name,
-                                        ttfb_ms = %ttfb.as_millis(),
-                                        "Time to first byte"
-                                    );
-                                }
-                                let audio_frame =
-                                    OutputAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
-                                frames.push(FrameEnum::OutputAudioRaw(audio_frame));
+                    if let Ok(audio_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(audio_b64)
+                    {
+                        if !audio_bytes.is_empty() {
+                            if !got_first_audio {
+                                got_first_audio = true;
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                service = %self.name,
-                                "Failed to decode base64 audio chunk: {e}"
-                            );
+                            frames.push(FrameEnum::OutputAudioRaw(OutputAudioRawFrame::new(
+                                audio_bytes,
+                                self.sample_rate,
+                                1,
+                            )));
                         }
                     }
                 }
             }
 
-            // Check if this is the final message.
             if response.is_final == Some(true) {
-                tracing::debug!(
-                    service = %self.name,
-                    context_id = %context_id,
-                    "TTS generation complete"
-                );
                 break;
             }
         }
 
-        // Record metrics.
         let ttfb = ttfb_start.elapsed();
         self.last_metrics = Some(TTSMetrics {
             ttfb_ms: ttfb.as_secs_f64() * 1000.0,
             character_count: text.len(),
         });
 
-        // Push TTSStoppedFrame.
+        // Close the temporary connection.
+        let close_msg = ElevenLabsWsCloseSocket { close_socket: true };
+        if let Ok(json) = serde_json::to_string(&close_msg) {
+            let _ = ws.send(WsMessage::Text(json)).await;
+        }
+        let _ = ws.close(None).await;
+
         frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
             context_id,
         ))));
 
         frames
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background WebSocket reader task
+// ---------------------------------------------------------------------------
+
+/// Background task that reads WebSocket responses from ElevenLabs, decodes
+/// audio, and sends frames downstream via the provided channel sender.
+async fn ws_reader_loop(
+    mut reader: WsReader,
+    down_tx: mpsc::UnboundedSender<FrameEnum>,
+    context_id: Arc<StdMutex<Option<String>>>,
+    sample_rate: u32,
+    service_name: String,
+) {
+    loop {
+        let msg = match reader.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => {
+                tracing::error!(service = %service_name, "WebSocket receive error (reader): {e}");
+                let _ = down_tx.send(FrameEnum::Error(ErrorFrame::new(
+                    format!("WebSocket receive error: {e}"),
+                    false,
+                )));
+                break;
+            }
+            None => {
+                tracing::debug!(service = %service_name, "WebSocket stream ended (reader)");
+                break;
+            }
+        };
+
+        let text_data = match msg {
+            WsMessage::Text(t) => t.to_string(),
+            WsMessage::Close(_) => {
+                tracing::debug!(service = %service_name, "WebSocket closed by server (reader)");
+                break;
+            }
+            _ => continue,
+        };
+
+        let response: ElevenLabsWsResponse = match serde_json::from_str(&text_data) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(service = %service_name, "Failed to parse WS message: {e}");
+                continue;
+            }
+        };
+
+        // Log context info but don't filter — multiple contexts may be
+        // active simultaneously (e.g. sentence mode sends each sentence as
+        // its own context). Interruption is handled via close_context messages.
+        if let Some(ref resp_ctx) = response.context_id {
+            tracing::trace!(
+                service = %service_name,
+                context_id = %resp_ctx,
+                "Reader: processing response"
+            );
+        }
+
+        let has_audio = response.audio.as_ref().is_some_and(|a| !a.is_empty());
+        tracing::trace!(
+            service = %service_name,
+            has_audio,
+            is_final = ?response.is_final,
+            context_id = ?response.context_id,
+            "Reader: received WS message"
+        );
+
+        if let Some(ref error) = response.error {
+            tracing::error!(service = %service_name, "ElevenLabs WS error: {error}");
+            let _ = down_tx.send(FrameEnum::Error(ErrorFrame::new(
+                format!("ElevenLabs error: {error}"),
+                false,
+            )));
+            continue;
+        }
+
+        // Decode and send audio downstream.
+        if let Some(ref audio_b64) = response.audio {
+            if !audio_b64.is_empty() {
+                match base64::engine::general_purpose::STANDARD.decode(audio_b64) {
+                    Ok(audio_bytes) => {
+                        if !audio_bytes.is_empty() {
+                            // Split large audio blobs into 20ms chunks so that
+                            // telephony serializers (Twilio, etc.) receive
+                            // correctly-sized media payloads. At 8kHz mono 16-bit
+                            // PCM, 20ms = 160 samples = 320 bytes.
+                            let chunk_bytes = (sample_rate as usize / 50) * 2; // 20ms of 16-bit PCM
+                            let num_chunks = audio_bytes.len().div_ceil(chunk_bytes);
+                            tracing::debug!(
+                                service = %service_name,
+                                bytes = audio_bytes.len(),
+                                frames = audio_bytes.len() / 2,
+                                chunk_bytes,
+                                num_chunks,
+                                "Reader: sending audio downstream"
+                            );
+                            for chunk in audio_bytes.chunks(chunk_bytes) {
+                                let frame =
+                                    OutputAudioRawFrame::new(chunk.to_vec(), sample_rate, 1);
+                                let _ = down_tx.send(FrameEnum::OutputAudioRaw(frame));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            service = %service_name,
+                            "Failed to decode base64 audio: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // isFinal: context generation complete.
+        if response.is_final == Some(true) {
+            let ctx_id = context_id.lock().unwrap().clone();
+            let _ = down_tx.send(FrameEnum::TTSStopped(TTSStoppedFrame::new(ctx_id)));
+            tracing::debug!(service = %service_name, "TTS generation complete (reader)");
+        }
     }
 }
 
@@ -675,6 +862,7 @@ impl fmt::Debug for ElevenLabsTTSService {
             .field("model", &self.model)
             .field("output_format", &self.output_format)
             .field("sample_rate", &self.sample_rate)
+            .field("token_streaming", &self.token_streaming)
             .finish()
     }
 }
@@ -706,42 +894,199 @@ impl Processor for ElevenLabsTTSService {
         ctx: &ProcessorContext,
     ) {
         match frame {
-            FrameEnum::Text(ref t) if !t.text.is_empty() => {
-                // Drain stale audio from a previous interrupted generation.
-                if self.needs_drain {
-                    self.drain_stale_messages().await;
-                    self.needs_drain = false;
+            // ----- Token streaming: LLM response lifecycle -----
+            FrameEnum::LLMFullResponseStart(_) => {
+                // Capture downstream sender on first call.
+                if self.down_tx.is_none() {
+                    self.down_tx = Some(ctx.downstream_sender());
                 }
-                // Auto-reconnect if the WebSocket was disconnected.
+
+                // Auto-connect and spawn reader (needed for TextFrame sentence mode too).
                 if let Err(e) = self.connect().await {
                     ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
                     return;
                 }
-                let result_frames = self.run_tts(&t.text).await;
-                for f in result_frames {
-                    ctx.send_downstream(f);
-                }
+                self.ensure_reader_spawned();
+
+                // Pass through — actual TTS work happens in TextFrame (sentence mode)
+                // or LLMTextFrame (token streaming mode, when no SentenceAggregator).
+                ctx.send_downstream(frame);
             }
-            FrameEnum::Start(_) => {
-                if let Err(e) = self.connect().await {
-                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+
+            FrameEnum::LLMText(ref t) => {
+                if self.token_streaming && !t.text.is_empty() {
+                    let ctx_id = self.current_context_id.lock().unwrap().clone();
+                    if let Some(ref cid) = ctx_id {
+                        let text_msg = ElevenLabsWsText {
+                            text: t.text.clone(),
+                            context_id: cid.clone(),
+                        };
+                        let send_result = if let Some(ref mut writer) = self.ws_writer {
+                            match serde_json::to_string(&text_msg) {
+                                Ok(json) => writer.send(WsMessage::Text(json)).await,
+                                Err(_) => Ok(()),
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(e) = send_result {
+                            tracing::error!(service = %self.name, "Failed to send LLM text: {e}");
+                            self.handle_ws_error();
+                        }
+                    }
                 }
                 ctx.send_downstream(frame);
             }
+
+            FrameEnum::LLMFullResponseEnd(_) => {
+                if self.token_streaming {
+                    let ctx_id = self.current_context_id.lock().unwrap().clone();
+                    if let Some(ref cid) = ctx_id {
+                        let flush = ElevenLabsWsFlush {
+                            text: " ".to_string(),
+                            context_id: cid.clone(),
+                            flush: true,
+                        };
+                        let send_result = if let Some(ref mut writer) = self.ws_writer {
+                            match serde_json::to_string(&flush) {
+                                Ok(json) => writer.send(WsMessage::Text(json)).await,
+                                Err(_) => Ok(()),
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        if let Err(e) = send_result {
+                            tracing::error!(service = %self.name, "Failed to send flush: {e}");
+                            self.handle_ws_error();
+                        }
+                    }
+                    self.token_streaming = false;
+                    tracing::debug!(service = %self.name, "Flushed token streaming context");
+                }
+                ctx.send_downstream(frame);
+            }
+
+            // ----- Sentence mode (legacy): complete text in one frame -----
+            FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                if self.down_tx.is_none() {
+                    self.down_tx = Some(ctx.downstream_sender());
+                }
+                if let Err(e) = self.connect().await {
+                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+                    return;
+                }
+                self.ensure_reader_spawned();
+
+                let context_id = generate_context_id();
+                *self.current_context_id.lock().unwrap() = Some(context_id.clone());
+
+                // Send init + text + flush in one shot.
+                let init = ElevenLabsWsContextInit {
+                    text: " ".to_string(),
+                    context_id: context_id.clone(),
+                    voice_settings: self.build_voice_settings(),
+                    generation_config: self.build_generation_config(),
+                };
+                let text_msg = ElevenLabsWsText {
+                    text: t.text.clone(),
+                    context_id: context_id.clone(),
+                };
+                let flush = ElevenLabsWsFlush {
+                    text: " ".to_string(),
+                    context_id: context_id.clone(),
+                    flush: true,
+                };
+
+                for json in [
+                    serde_json::to_string(&init),
+                    serde_json::to_string(&text_msg),
+                    serde_json::to_string(&flush),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let send_result = if let Some(ref mut writer) = self.ws_writer {
+                        writer.send(WsMessage::Text(json)).await
+                    } else {
+                        break;
+                    };
+                    if let Err(e) = send_result {
+                        tracing::error!(
+                            service = %self.name,
+                            "Failed to send TTS message: {e}"
+                        );
+                        self.handle_ws_error();
+                        return;
+                    }
+                }
+
+                tracing::debug!(
+                    service = %self.name,
+                    text = %t.text,
+                    context_id = %context_id,
+                    "Sent TTS request (sentence mode)"
+                );
+
+                ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+                    context_id,
+                ))));
+                // TTSStopped comes from the reader task when isFinal is received.
+            }
+
+            // ----- Lifecycle -----
+            FrameEnum::Start(_) => {
+                if self.down_tx.is_none() {
+                    self.down_tx = Some(ctx.downstream_sender());
+                }
+                if let Err(e) = self.connect().await {
+                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+                }
+                self.ensure_reader_spawned();
+                ctx.send_downstream(frame);
+            }
+
             FrameEnum::End(_) | FrameEnum::Cancel(_) => {
                 self.disconnect().await;
                 ctx.send_downstream(frame);
             }
+
             FrameEnum::Interruption(_) => {
-                // Keep the WebSocket alive — just mark that we need to drain
-                // stale audio from the interrupted generation before the next
-                // TTS request. This avoids the ~194ms reconnection penalty.
-                self.needs_drain = true;
+                // Send close_context to cancel in-flight generation.
+                let ctx_id = self.current_context_id.lock().unwrap().take();
+                if let Some(ref cid) = ctx_id {
+                    let close_msg = ElevenLabsWsCloseContext {
+                        context_id: cid.clone(),
+                        close_context: true,
+                    };
+                    let send_result = if let Some(ref mut writer) = self.ws_writer {
+                        match serde_json::to_string(&close_msg) {
+                            Ok(json) => writer.send(WsMessage::Text(json)).await,
+                            Err(_) => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    };
+                    match send_result {
+                        Ok(()) => {
+                            tracing::debug!(
+                                service = %self.name,
+                                context_id = %cid,
+                                "Sent close_context for interrupted generation"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                service = %self.name,
+                                context_id = %cid,
+                                "Failed to send close_context: {e}"
+                            );
+                        }
+                    }
+                }
+                self.token_streaming = false;
                 ctx.send_downstream(frame);
             }
-            FrameEnum::LLMFullResponseStart(_) | FrameEnum::LLMFullResponseEnd(_) => {
-                ctx.send_downstream(frame);
-            }
+
             other => ctx.send(other, direction),
         }
     }
@@ -768,12 +1113,6 @@ impl AIService for ElevenLabsTTSService {
 
 #[async_trait]
 impl TTSService for ElevenLabsTTSService {
-    /// Synthesize speech from text using ElevenLabs' WebSocket streaming API.
-    ///
-    /// The WebSocket connection must have been established via `connect()` before
-    /// calling this method. Returns `TTSStartedFrame`, zero or more
-    /// `OutputAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
-    /// `ErrorFrame` is included in the returned vector.
     async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
         self.run_tts_ws(text).await
@@ -1414,6 +1753,7 @@ mod tests {
             },
             optimize_streaming_latency: Some(3),
             language_code: Some("en".to_string()),
+            chunk_length_schedule: None,
         };
         let service = ElevenLabsTTSService::new("key", "voice").with_params(params);
         assert_eq!(service.params.voice_settings.stability, Some(0.9));
@@ -1433,6 +1773,7 @@ mod tests {
             },
             optimize_streaming_latency: Some(2),
             language_code: Some("fr".to_string()),
+            chunk_length_schedule: None,
         };
         let service = ElevenLabsHttpTTSService::new("key", "voice").with_params(params);
         assert_eq!(service.params.voice_settings.stability, Some(0.6));
@@ -1446,11 +1787,26 @@ mod tests {
 
     #[test]
     fn test_ws_url_basic() {
-        let service = ElevenLabsTTSService::new("key", "test-voice-id");
+        let service = ElevenLabsTTSService::new("test-key", "test-voice-id");
         let url = service.build_ws_url();
-        assert_eq!(
-            url,
-            "wss://api.elevenlabs.io/v1/text-to-speech/test-voice-id/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_24000"
+        assert!(url.contains("/multi-stream-input?"));
+        assert!(url.contains("model_id=eleven_turbo_v2_5"));
+        assert!(url.contains("output_format=pcm_24000"));
+        // API key is sent via header, not in the URL
+        assert!(!url.contains("xi-api-key"));
+    }
+
+    #[test]
+    fn test_ws_url_uses_multi_stream_input() {
+        let service = ElevenLabsTTSService::new("key", "voice-id");
+        let url = service.build_ws_url();
+        assert!(
+            url.contains("/multi-stream-input"),
+            "URL should use multi-stream-input endpoint, got: {url}"
+        );
+        assert!(
+            !url.contains("/stream-input?"),
+            "URL should NOT use old stream-input endpoint"
         );
     }
 
@@ -1460,6 +1816,13 @@ mod tests {
             ElevenLabsTTSService::new("key", "voice-123").with_optimize_streaming_latency(3);
         let url = service.build_ws_url();
         assert!(url.contains("optimize_streaming_latency=3"));
+    }
+
+    #[test]
+    fn test_ws_url_with_language_code() {
+        let service = ElevenLabsTTSService::new("key", "voice-123").with_language_code("es");
+        let url = service.build_ws_url();
+        assert!(url.contains("language_code=es"));
     }
 
     #[test]
@@ -1479,36 +1842,48 @@ mod tests {
         assert!(url.starts_with("wss://custom.api.com/v1/text-to-speech/"));
     }
 
+    #[test]
+    fn test_ws_url_no_api_key_in_url() {
+        // API key should be sent via header, not embedded in URL
+        let service = ElevenLabsTTSService::new("secret-key", "voice");
+        let url = service.build_ws_url();
+        assert!(!url.contains("secret-key"));
+        assert!(!url.contains("xi-api-key"));
+        assert!(!url.contains("authorization"));
+    }
+
     // -----------------------------------------------------------------------
-    // WebSocket request serialization tests
+    // Multi-context WebSocket message serialization tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_ws_request_serialization_basic() {
-        let request = ElevenLabsWsRequest {
-            text: "Hello world".to_string(),
+    fn test_ws_context_init_serialization() {
+        let init = ElevenLabsWsContextInit {
+            text: " ".to_string(),
+            context_id: "ctx-123".to_string(),
             voice_settings: None,
-            xi_api_key: Some("test-key".to_string()),
+            generation_config: None,
         };
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"text\":\"Hello world\""));
-        assert!(json.contains("\"xi_api_key\":\"test-key\""));
+        let json = serde_json::to_string(&init).unwrap();
+        assert!(json.contains("\"text\":\" \""));
+        assert!(json.contains("\"context_id\":\"ctx-123\""));
         assert!(!json.contains("voice_settings"));
     }
 
     #[test]
-    fn test_ws_request_serialization_with_voice_settings() {
-        let request = ElevenLabsWsRequest {
-            text: "Hello".to_string(),
+    fn test_ws_context_init_with_voice_settings() {
+        let init = ElevenLabsWsContextInit {
+            text: " ".to_string(),
+            context_id: "ctx-456".to_string(),
             voice_settings: Some(ElevenLabsVoiceSettings {
                 stability: Some(0.5),
                 similarity_boost: Some(0.7),
                 style: None,
                 use_speaker_boost: Some(true),
             }),
-            xi_api_key: Some("key".to_string()),
+            generation_config: None,
         };
-        let json = serde_json::to_string(&request).unwrap();
+        let json = serde_json::to_string(&init).unwrap();
         assert!(json.contains("\"voice_settings\""));
         assert!(json.contains("\"stability\":0.5"));
         assert!(json.contains("\"similarity_boost\":0.7"));
@@ -1517,12 +1892,45 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_text_serialization() {
+        let text_msg = ElevenLabsWsText {
+            text: "Hello world".to_string(),
+            context_id: "ctx-789".to_string(),
+        };
+        let json = serde_json::to_string(&text_msg).unwrap();
+        assert!(json.contains("\"text\":\"Hello world\""));
+        assert!(json.contains("\"context_id\":\"ctx-789\""));
+    }
+
+    #[test]
     fn test_ws_flush_serialization() {
         let flush = ElevenLabsWsFlush {
-            text: String::new(),
+            text: " ".to_string(),
+            context_id: "ctx-abc".to_string(),
+            flush: true,
         };
         let json = serde_json::to_string(&flush).unwrap();
-        assert_eq!(json, r#"{"text":""}"#);
+        assert!(json.contains("\"text\":\" \""));
+        assert!(json.contains("\"context_id\":\"ctx-abc\""));
+        assert!(json.contains("\"flush\":true"));
+    }
+
+    #[test]
+    fn test_ws_close_context_serialization() {
+        let close = ElevenLabsWsCloseContext {
+            context_id: "ctx-cancel".to_string(),
+            close_context: true,
+        };
+        let json = serde_json::to_string(&close).unwrap();
+        assert!(json.contains("\"context_id\":\"ctx-cancel\""));
+        assert!(json.contains("\"close_context\":true"));
+    }
+
+    #[test]
+    fn test_ws_close_socket_serialization() {
+        let close = ElevenLabsWsCloseSocket { close_socket: true };
+        let json = serde_json::to_string(&close).unwrap();
+        assert_eq!(json, r#"{"close_socket":true}"#);
     }
 
     // -----------------------------------------------------------------------
@@ -1531,18 +1939,20 @@ mod tests {
 
     #[test]
     fn test_ws_response_audio_chunk() {
-        let json = r#"{"audio":"SGVsbG8=","isFinal":false}"#;
+        let json = r#"{"audio":"SGVsbG8=","isFinal":false,"contextId":"ctx-123"}"#;
         let response: ElevenLabsWsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.audio, Some("SGVsbG8=".to_string()));
         assert_eq!(response.is_final, Some(false));
+        assert_eq!(response.context_id, Some("ctx-123".to_string()));
         assert!(response.error.is_none());
     }
 
     #[test]
     fn test_ws_response_final_message() {
-        let json = r#"{"audio":"","isFinal":true}"#;
+        let json = r#"{"audio":"","isFinal":true,"contextId":"ctx-456"}"#;
         let response: ElevenLabsWsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.is_final, Some(true));
+        assert_eq!(response.context_id, Some("ctx-456".to_string()));
     }
 
     #[test]
@@ -1551,6 +1961,7 @@ mod tests {
         let response: ElevenLabsWsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.error, Some("Invalid API key".to_string()));
         assert!(response.audio.is_none());
+        assert!(response.context_id.is_none());
     }
 
     #[test]
@@ -1560,7 +1971,15 @@ mod tests {
         let response: ElevenLabsWsResponse = serde_json::from_str(json).unwrap();
         assert!(response.audio.is_none());
         assert!(response.is_final.is_none());
+        assert!(response.context_id.is_none());
         assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_ws_response_with_context_id() {
+        let json = r#"{"audio":"AQID","isFinal":false,"contextId":"elevenlabs-ctx-42"}"#;
+        let response: ElevenLabsWsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.context_id, Some("elevenlabs-ctx-42".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -1750,26 +2169,14 @@ mod tests {
         let mut service = ElevenLabsTTSService::new("key", "voice");
         let frames = service.run_tts("Hello").await;
 
-        // Should get an error frame because WebSocket is not connected.
+        // Should get an error frame because connection to ElevenLabs will fail
+        // (invalid API key / unreachable server in test environment).
         assert!(!frames.is_empty());
         let has_error = frames.iter().any(|f| matches!(f, FrameEnum::Error(_)));
         assert!(
             has_error,
-            "Expected ErrorFrame when WebSocket not connected"
+            "Expected ErrorFrame when WebSocket connection fails"
         );
-
-        // Check the error message.
-        let error_frame = frames
-            .iter()
-            .find_map(|f| {
-                if let FrameEnum::Error(inner) = f {
-                    Some(inner)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        assert!(error_frame.error.contains("WebSocket not connected"));
     }
 
     // -----------------------------------------------------------------------

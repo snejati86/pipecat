@@ -2,7 +2,7 @@
 //!
 //! A complete voice AI agent that makes outbound phone calls via Twilio,
 //! using OpenAI for conversation, Deepgram for speech-to-text, and
-//! Cartesia for text-to-speech.
+//! ElevenLabs for text-to-speech.
 //!
 //! ## Architecture
 //!
@@ -20,8 +20,8 @@
 //!                     Audio flows bidirectionally:
 //!
 //! [Twilio WS Input] -> [Silero VAD*] -> [Smart Turn*] -> [Deepgram STT]
-//!        -> [VAD Turn Start] -> [User Context Aggregator] -> [OpenAI LLM] -> [Sentence Aggregator]
-//!        -> [Cartesia TTS] -> [Assistant Context Aggregator] -> [Output]
+//!        -> [VAD Turn Start] -> [User Context Aggregator] -> [OpenAI LLM]
+//!        -> [ElevenLabs TTS] -> [Assistant Context Aggregator] -> [Output]
 //!
 //! * Silero VAD enabled with `--features silero-vad`
 //! * Smart Turn enabled with `--features smart-turn` (includes silero-vad)
@@ -47,9 +47,10 @@ use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
 use pipecat::prelude::*;
+use pipecat::processors::aggregators::sentence::SentenceAggregator;
 use pipecat::serializers::twilio::enable_debug_audio;
-use pipecat::services::cartesia::CartesiaTTSService;
 use pipecat::services::deepgram::DeepgramSTTService;
+use pipecat::services::elevenlabs::ElevenLabsTTSService;
 use pipecat::services::openai::OpenAILLMService;
 use serde_json::json;
 
@@ -66,7 +67,8 @@ struct AppState {
     call_to_number: String,
     openai_api_key: String,
     deepgram_api_key: String,
-    cartesia_api_key: String,
+    elevenlabs_api_key: String,
+    elevenlabs_voice_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -179,19 +181,15 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     let stt = DeepgramSTTService::new(&state.deepgram_api_key)
         .with_model("nova-2")
         .with_language("en")
-        .with_sample_rate(8000)
-        .with_vad_events(true)
-        .with_utterance_end_ms(1000);
+        .with_sample_rate(8000);
 
     let llm = OpenAILLMService::new(&state.openai_api_key, "gpt-4o-mini").with_temperature(0.7);
 
-    let tts = CartesiaTTSService::new(
-        &state.cartesia_api_key,
-        "79a125e8-cd45-4c13-8a67-188112f4dd22",
-    )
-    .with_model("sonic-3")
-    .with_sample_rate(8000)
-    .with_encoding("pcm_s16le");
+    let tts = ElevenLabsTTSService::new(&state.elevenlabs_api_key, &state.elevenlabs_voice_id)
+        .with_model("eleven_turbo_v2_5")
+        .with_output_format("pcm_8000")
+        .with_optimize_streaming_latency(3)
+        .with_chunk_length_schedule(vec![120]);
 
     let system_prompt = "You are a friendly and helpful AI phone assistant. \
         Keep your responses concise and conversational - you're on a phone call. \
@@ -206,7 +204,6 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
 
     let context = LLMContext::with_messages(initial_messages.clone());
     let pair = LLMContextAggregatorPair::new(context);
-    let sentence_aggregator = SentenceAggregator::new();
 
     // Build processor chain:
     //   [Mute*] -> [VAD*] -> [Smart Turn*] -> STT -> VAD Turn Start
@@ -239,7 +236,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     processors.push(Box::new(VADUserTurnStartStrategy::new()));
     processors.push(Box::new(pair.user_aggregator));
     processors.push(Box::new(llm));
-    processors.push(Box::new(sentence_aggregator));
+    processors.push(Box::new(SentenceAggregator::new()));
     processors.push(Box::new(tts));
     processors.push(Box::new(pair.assistant_aggregator));
 
@@ -286,7 +283,9 @@ async fn main() {
         call_to_number: env::var("CALL_TO_NUMBER").expect("CALL_TO_NUMBER must be set"),
         openai_api_key: env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set"),
         deepgram_api_key: env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY must be set"),
-        cartesia_api_key: env::var("CARTESIA_API_KEY").expect("CARTESIA_API_KEY must be set"),
+        elevenlabs_api_key: env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY must be set"),
+        elevenlabs_voice_id: env::var("ELEVENLABS_VOICE_ID")
+            .unwrap_or_else(|_| "21m00Tcm4TlvDq8ikWAM".to_string()),
     };
 
     let port: u16 = env::var("PORT")
