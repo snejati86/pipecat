@@ -25,12 +25,10 @@
 //! - `cancel` -- [`CancelFrame`](crate::frames::CancelFrame)
 //! - `error` -- [`ErrorFrame`](crate::frames::ErrorFrame)
 
-use std::sync::Arc;
-
 use prost::Message;
 use tracing::warn;
 
-use crate::frames::{self, Frame};
+use crate::frames::{self, Frame, FrameEnum};
 use crate::serializers::{FrameSerializer, SerializedFrame};
 
 /// Include the generated protobuf types from the `pipecat.frames` package.
@@ -63,8 +61,8 @@ impl Default for ProtobufFrameSerializer {
 }
 
 impl FrameSerializer for ProtobufFrameSerializer {
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
-        let proto_frame = serialize_frame_to_proto(&*frame)?;
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
+        let proto_frame = serialize_frame_to_proto(frame)?;
         let bytes = proto_frame.encode_to_vec();
         Some(SerializedFrame::Binary(bytes))
     }
@@ -78,21 +76,18 @@ impl FrameSerializer for ProtobufFrameSerializer {
 /// Serialize a pipeline frame to a protobuf `Frame` wrapper.
 ///
 /// Returns `None` if the frame type is not supported.
-fn serialize_frame_to_proto(frame: &dyn Frame) -> Option<proto::Frame> {
-    // TextFrame
-    if let Some(f) = frame.downcast_ref::<frames::TextFrame>() {
-        return Some(proto::Frame {
+fn serialize_frame_to_proto(frame: &FrameEnum) -> Option<proto::Frame> {
+    match frame {
+        // TextFrame
+        FrameEnum::Text(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::Text(proto::TextFrame {
                 id: f.id(),
                 name: f.name().to_string(),
                 text: f.text.clone(),
             })),
-        });
-    }
-
-    // TranscriptionFrame
-    if let Some(f) = frame.downcast_ref::<frames::TranscriptionFrame>() {
-        return Some(proto::Frame {
+        }),
+        // TranscriptionFrame
+        FrameEnum::Transcription(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::Transcription(
                 proto::TranscriptionFrame {
                     id: f.id(),
@@ -103,12 +98,9 @@ fn serialize_frame_to_proto(frame: &dyn Frame) -> Option<proto::Frame> {
                     language: f.language.clone(),
                 },
             )),
-        });
-    }
-
-    // InterimTranscriptionFrame
-    if let Some(f) = frame.downcast_ref::<frames::InterimTranscriptionFrame>() {
-        return Some(proto::Frame {
+        }),
+        // InterimTranscriptionFrame
+        FrameEnum::InterimTranscription(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::InterimTranscription(
                 proto::InterimTranscriptionFrame {
                     id: f.id(),
@@ -119,12 +111,9 @@ fn serialize_frame_to_proto(frame: &dyn Frame) -> Option<proto::Frame> {
                     language: f.language.clone(),
                 },
             )),
-        });
-    }
-
-    // InputAudioRawFrame
-    if let Some(f) = frame.downcast_ref::<frames::InputAudioRawFrame>() {
-        return Some(proto::Frame {
+        }),
+        // InputAudioRawFrame
+        FrameEnum::InputAudioRaw(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::AudioInput(proto::AudioRawFrame {
                 id: f.id(),
                 name: f.name().to_string(),
@@ -133,12 +122,9 @@ fn serialize_frame_to_proto(frame: &dyn Frame) -> Option<proto::Frame> {
                 num_channels: f.audio.num_channels,
                 pts: f.pts(),
             })),
-        });
-    }
-
-    // OutputAudioRawFrame
-    if let Some(f) = frame.downcast_ref::<frames::OutputAudioRawFrame>() {
-        return Some(proto::Frame {
+        }),
+        // OutputAudioRawFrame
+        FrameEnum::OutputAudioRaw(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::AudioOutput(proto::AudioRawFrame {
                 id: f.id(),
                 name: f.name().to_string(),
@@ -147,72 +133,59 @@ fn serialize_frame_to_proto(frame: &dyn Frame) -> Option<proto::Frame> {
                 num_channels: f.audio.num_channels,
                 pts: f.pts(),
             })),
-        });
-    }
-
-    // InputTransportMessageFrame
-    if let Some(f) = frame.downcast_ref::<frames::InputTransportMessageFrame>() {
-        let data = serde_json::to_string(&f.message).ok()?;
-        return Some(proto::Frame {
-            frame: Some(proto::frame::Frame::MessageInput(
-                proto::TransportMessageFrame { data },
-            )),
-        });
-    }
-
-    // OutputTransportMessageFrame
-    if let Some(f) = frame.downcast_ref::<frames::OutputTransportMessageFrame>() {
-        let data = serde_json::to_string(&f.message).ok()?;
-        return Some(proto::Frame {
-            frame: Some(proto::frame::Frame::MessageOutput(
-                proto::TransportMessageFrame { data },
-            )),
-        });
-    }
-
-    // StartFrame
-    if let Some(f) = frame.downcast_ref::<frames::StartFrame>() {
-        return Some(proto::Frame {
+        }),
+        // InputTransportMessageFrame
+        FrameEnum::InputTransportMessage(f) => {
+            let data = serde_json::to_string(&f.message).ok()?;
+            Some(proto::Frame {
+                frame: Some(proto::frame::Frame::MessageInput(
+                    proto::TransportMessageFrame { data },
+                )),
+            })
+        }
+        // OutputTransportMessageFrame
+        FrameEnum::OutputTransportMessage(f) => {
+            let data = serde_json::to_string(&f.message).ok()?;
+            Some(proto::Frame {
+                frame: Some(proto::frame::Frame::MessageOutput(
+                    proto::TransportMessageFrame { data },
+                )),
+            })
+        }
+        // StartFrame
+        FrameEnum::Start(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::Start(proto::StartFrame {
                 audio_in_sample_rate: f.audio_in_sample_rate,
                 audio_out_sample_rate: f.audio_out_sample_rate,
                 allow_interruptions: f.allow_interruptions,
                 enable_metrics: f.enable_metrics,
             })),
-        });
-    }
-
-    // EndFrame
-    if frame.downcast_ref::<frames::EndFrame>().is_some() {
-        return Some(proto::Frame {
+        }),
+        // EndFrame
+        FrameEnum::End(_) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::End(proto::EndFrame {})),
-        });
-    }
-
-    // CancelFrame
-    if let Some(f) = frame.downcast_ref::<frames::CancelFrame>() {
-        return Some(proto::Frame {
+        }),
+        // CancelFrame
+        FrameEnum::Cancel(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::Cancel(proto::CancelFrame {
                 reason: f.reason.clone(),
             })),
-        });
-    }
-
-    // ErrorFrame
-    if let Some(f) = frame.downcast_ref::<frames::ErrorFrame>() {
-        return Some(proto::Frame {
+        }),
+        // ErrorFrame
+        FrameEnum::Error(f) => Some(proto::Frame {
             frame: Some(proto::frame::Frame::Error(proto::ErrorFrame {
                 error: f.error.clone(),
                 fatal: f.fatal,
             })),
-        });
+        }),
+        _ => {
+            warn!(
+                "ProtobufFrameSerializer: unsupported frame type '{}'",
+                frame.name()
+            );
+            None
+        }
     }
-
-    warn!(
-        "ProtobufFrameSerializer: unsupported frame type '{}'",
-        frame.name()
-    );
-    None
 }
 
 /// Deserialize a protobuf `Frame` wrapper to a pipeline frame.
@@ -276,7 +249,7 @@ mod tests {
     use crate::frames::*;
 
     /// Helper to serialize and then deserialize a frame through the serializer.
-    fn roundtrip(serializer: &ProtobufFrameSerializer, frame: Arc<dyn Frame>) -> FrameEnum {
+    fn roundtrip(serializer: &ProtobufFrameSerializer, frame: &FrameEnum) -> FrameEnum {
         let serialized = serializer.serialize(frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Text(t) => t.as_bytes(),
@@ -292,9 +265,9 @@ mod tests {
     #[test]
     fn test_serializes_to_binary_format() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello"));
+        let frame = FrameEnum::from(TextFrame::new("hello"));
 
-        let serialized = serializer.serialize(frame).unwrap();
+        let serialized = serializer.serialize(&frame).unwrap();
         assert!(
             matches!(serialized, SerializedFrame::Binary(_)),
             "Protobuf serializer should produce Binary frames"
@@ -308,10 +281,10 @@ mod tests {
 
         // Create a reasonably sized audio frame
         let audio_data = vec![0xABu8; 1024];
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data, 16000, 1));
+        let frame = FrameEnum::from(InputAudioRawFrame::new(audio_data, 16000, 1));
 
-        let proto_serialized = serializer.serialize(frame.clone()).unwrap();
-        let json_serialized = json_serializer.serialize(frame).unwrap();
+        let proto_serialized = serializer.serialize(&frame).unwrap();
+        let json_serialized = json_serializer.serialize(&frame).unwrap();
 
         let proto_size = match &proto_serialized {
             SerializedFrame::Binary(b) => b.len(),
@@ -337,9 +310,9 @@ mod tests {
     #[test]
     fn test_roundtrip_text_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello world".to_string()));
+        let frame = FrameEnum::from(TextFrame::new("hello world".to_string()));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Text(tf) => assert_eq!(tf.text, "hello world"),
             other => panic!("expected TextFrame, got {}", other),
         }
@@ -348,9 +321,9 @@ mod tests {
     #[test]
     fn test_roundtrip_text_frame_empty() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new(""));
+        let frame = FrameEnum::from(TextFrame::new(""));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Text(tf) => assert_eq!(tf.text, ""),
             other => panic!("expected TextFrame, got {}", other),
         }
@@ -359,10 +332,11 @@ mod tests {
     #[test]
     fn test_roundtrip_text_frame_unicode() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("Hello, world! Привет мир! 你好世界!"));
+        let unicode_text = "Hello, world! \u{041f}\u{0440}\u{0438}\u{0432}\u{0435}\u{0442} \u{043c}\u{0438}\u{0440}! \u{4f60}\u{597d}\u{4e16}\u{754c}!";
+        let frame = FrameEnum::from(TextFrame::new(unicode_text));
 
-        match &roundtrip(&serializer, frame) {
-            FrameEnum::Text(tf) => assert_eq!(tf.text, "Hello, world! Привет мир! 你好世界!"),
+        match &roundtrip(&serializer, &frame) {
+            FrameEnum::Text(tf) => assert_eq!(tf.text, unicode_text),
             other => panic!("expected TextFrame, got {}", other),
         }
     }
@@ -370,13 +344,13 @@ mod tests {
     #[test]
     fn test_roundtrip_transcription_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(TranscriptionFrame::new(
+        let frame = FrameEnum::from(TranscriptionFrame::new(
             "testing".to_string(),
             "user-1".to_string(),
             "2024-01-01T00:00:00Z".to_string(),
         ));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Transcription(tf) => {
                 assert_eq!(tf.text, "testing");
                 assert_eq!(tf.user_id, "user-1");
@@ -390,15 +364,15 @@ mod tests {
     #[test]
     fn test_roundtrip_transcription_frame_with_language() {
         let serializer = ProtobufFrameSerializer::new();
-        let mut frame = TranscriptionFrame::new(
+        let mut tf = TranscriptionFrame::new(
             "hola".to_string(),
             "user-2".to_string(),
             "2024-01-01T00:00:00Z".to_string(),
         );
-        frame.language = Some("es".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(frame);
+        tf.language = Some("es".to_string());
+        let frame = FrameEnum::from(tf);
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Transcription(tf) => {
                 assert_eq!(tf.text, "hola");
                 assert_eq!(tf.language, Some("es".to_string()));
@@ -410,13 +384,13 @@ mod tests {
     #[test]
     fn test_roundtrip_interim_transcription_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(InterimTranscriptionFrame::new(
+        let frame = FrameEnum::from(InterimTranscriptionFrame::new(
             "partial".to_string(),
             "user-3".to_string(),
             "2024-06-15T12:00:00Z".to_string(),
         ));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InterimTranscription(tf) => {
                 assert_eq!(tf.text, "partial");
                 assert_eq!(tf.user_id, "user-3");
@@ -430,15 +404,15 @@ mod tests {
     #[test]
     fn test_roundtrip_interim_transcription_frame_with_language() {
         let serializer = ProtobufFrameSerializer::new();
-        let mut frame = InterimTranscriptionFrame::new(
+        let mut itf = InterimTranscriptionFrame::new(
             "bonjour".to_string(),
             "user-4".to_string(),
             "2024-06-15T12:00:00Z".to_string(),
         );
-        frame.language = Some("fr".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(frame);
+        itf.language = Some("fr".to_string());
+        let frame = FrameEnum::from(itf);
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InterimTranscription(tf) => {
                 assert_eq!(tf.text, "bonjour");
                 assert_eq!(tf.language, Some("fr".to_string()));
@@ -451,9 +425,9 @@ mod tests {
     fn test_roundtrip_input_audio_frame() {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
+        let frame = FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InputAudioRaw(af) => {
                 assert_eq!(af.audio.audio, audio_data);
                 assert_eq!(af.audio.sample_rate, 16000);
@@ -467,9 +441,9 @@ mod tests {
     fn test_roundtrip_input_audio_frame_stereo() {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![0u8; 16];
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data.clone(), 48000, 2));
+        let frame = FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 48000, 2));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InputAudioRaw(af) => {
                 assert_eq!(af.audio.audio, audio_data);
                 assert_eq!(af.audio.sample_rate, 48000);
@@ -483,10 +457,9 @@ mod tests {
     fn test_roundtrip_output_audio_frame() {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![10u8, 20, 30, 40];
-        let frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(audio_data.clone(), 24000, 2));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(audio_data.clone(), 24000, 2));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::OutputAudioRaw(af) => {
                 assert_eq!(af.audio.audio, audio_data);
                 assert_eq!(af.audio.sample_rate, 24000);
@@ -499,9 +472,9 @@ mod tests {
     #[test]
     fn test_roundtrip_input_audio_empty() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(vec![], 16000, 1));
+        let frame = FrameEnum::from(InputAudioRawFrame::new(vec![], 16000, 1));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InputAudioRaw(af) => {
                 assert!(af.audio.audio.is_empty());
                 assert_eq!(af.audio.sample_rate, 16000);
@@ -516,15 +489,15 @@ mod tests {
 
         // Output message
         let msg = serde_json::json!({"key": "value", "count": 42});
-        let frame: Arc<dyn Frame> = Arc::new(OutputTransportMessageFrame::new(msg.clone()));
-        match &roundtrip(&serializer, frame) {
+        let frame = FrameEnum::from(OutputTransportMessageFrame::new(msg.clone()));
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::OutputTransportMessage(mf) => assert_eq!(mf.message, msg),
             other => panic!("expected OutputTransportMessageFrame, got {}", other),
         }
 
         // Input message
-        let frame2: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(msg.clone()));
-        match &roundtrip(&serializer, frame2) {
+        let frame2 = FrameEnum::from(InputTransportMessageFrame::new(msg.clone()));
+        match &roundtrip(&serializer, &frame2) {
             FrameEnum::InputTransportMessage(mf2) => assert_eq!(mf2.message, msg),
             other => panic!("expected InputTransportMessageFrame, got {}", other),
         }
@@ -539,9 +512,9 @@ mod tests {
             "null_val": null,
             "float_val": std::f64::consts::PI
         });
-        let frame: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(msg.clone()));
+        let frame = FrameEnum::from(InputTransportMessageFrame::new(msg.clone()));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InputTransportMessage(mf) => assert_eq!(mf.message, msg),
             other => panic!("expected InputTransportMessageFrame, got {}", other),
         }
@@ -550,9 +523,9 @@ mod tests {
     #[test]
     fn test_roundtrip_start_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(StartFrame::new(16000, 24000, true, true));
+        let frame = FrameEnum::from(StartFrame::new(16000, 24000, true, true));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Start(sf) => {
                 assert_eq!(sf.audio_in_sample_rate, 16000);
                 assert_eq!(sf.audio_out_sample_rate, 24000);
@@ -566,9 +539,9 @@ mod tests {
     #[test]
     fn test_roundtrip_start_frame_defaults() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(StartFrame::new(8000, 8000, false, false));
+        let frame = FrameEnum::from(StartFrame::new(8000, 8000, false, false));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Start(sf) => {
                 assert_eq!(sf.audio_in_sample_rate, 8000);
                 assert_eq!(sf.audio_out_sample_rate, 8000);
@@ -582,16 +555,19 @@ mod tests {
     #[test]
     fn test_roundtrip_end_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(EndFrame::new());
-        assert!(matches!(roundtrip(&serializer, frame), FrameEnum::End(_)));
+        let frame = FrameEnum::from(EndFrame::new());
+        assert!(matches!(
+            roundtrip(&serializer, &frame),
+            FrameEnum::End(_)
+        ));
     }
 
     #[test]
     fn test_roundtrip_cancel_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(Some("test reason".to_string())));
+        let frame = FrameEnum::from(CancelFrame::new(Some("test reason".to_string())));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Cancel(cf) => assert_eq!(cf.reason, Some("test reason".to_string())),
             other => panic!("expected CancelFrame, got {}", other),
         }
@@ -600,9 +576,9 @@ mod tests {
     #[test]
     fn test_roundtrip_cancel_frame_no_reason() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(None));
+        let frame = FrameEnum::from(CancelFrame::new(None));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Cancel(cf) => assert_eq!(cf.reason, None),
             other => panic!("expected CancelFrame, got {}", other),
         }
@@ -611,10 +587,10 @@ mod tests {
     #[test]
     fn test_roundtrip_error_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> =
-            Arc::new(ErrorFrame::new("something went wrong".to_string(), false));
+        let frame =
+            FrameEnum::from(ErrorFrame::new("something went wrong".to_string(), false));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Error(ef) => {
                 assert_eq!(ef.error, "something went wrong");
                 assert!(!ef.fatal);
@@ -626,9 +602,9 @@ mod tests {
     #[test]
     fn test_roundtrip_error_frame_fatal() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame: Arc<dyn Frame> = Arc::new(ErrorFrame::new("fatal error".to_string(), true));
+        let frame = FrameEnum::from(ErrorFrame::new("fatal error".to_string(), true));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Error(ef) => {
                 assert_eq!(ef.error, "fatal error");
                 assert!(ef.fatal);
@@ -659,8 +635,8 @@ mod tests {
     fn test_unsupported_frame_type_returns_none() {
         let serializer = ProtobufFrameSerializer::new();
         // LLMTextFrame is not supported by the serializer
-        let frame: Arc<dyn Frame> = Arc::new(crate::frames::LLMTextFrame::new("hello".to_string()));
-        assert!(serializer.serialize(frame).is_none());
+        let frame = FrameEnum::from(crate::frames::LLMTextFrame::new("hello".to_string()));
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -671,9 +647,9 @@ mod tests {
     fn test_roundtrip_large_audio_frame() {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![0xABu8; 32000];
-        let frame: Arc<dyn Frame> = Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
+        let frame = FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::InputAudioRaw(af) => assert_eq!(af.audio.audio, audio_data),
             other => panic!("expected InputAudioRawFrame, got {}", other),
         }
@@ -683,9 +659,9 @@ mod tests {
     fn test_roundtrip_large_text_frame() {
         let serializer = ProtobufFrameSerializer::new();
         let long_text = "x".repeat(100_000);
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new(long_text.clone()));
+        let frame = FrameEnum::from(TextFrame::new(long_text.clone()));
 
-        match &roundtrip(&serializer, frame) {
+        match &roundtrip(&serializer, &frame) {
             FrameEnum::Text(tf) => assert_eq!(tf.text, long_text),
             other => panic!("expected TextFrame, got {}", other),
         }
@@ -710,12 +686,12 @@ mod tests {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![1u8, 2, 3, 4];
 
-        let input_frame: Arc<dyn Frame> =
-            Arc::new(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
-        let input_deserialized = roundtrip(&serializer, input_frame);
+        let input_frame =
+            FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
+        let input_deserialized = roundtrip(&serializer, &input_frame);
 
-        let output_frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(audio_data, 16000, 1));
-        let output_deserialized = roundtrip(&serializer, output_frame);
+        let output_frame = FrameEnum::from(OutputAudioRawFrame::new(audio_data, 16000, 1));
+        let output_deserialized = roundtrip(&serializer, &output_frame);
 
         assert!(matches!(input_deserialized, FrameEnum::InputAudioRaw(_)));
         assert!(!matches!(input_deserialized, FrameEnum::OutputAudioRaw(_)));
@@ -729,11 +705,11 @@ mod tests {
         let serializer = ProtobufFrameSerializer::new();
         let msg = serde_json::json!({"direction": "test"});
 
-        let input_frame: Arc<dyn Frame> = Arc::new(InputTransportMessageFrame::new(msg.clone()));
-        let input_deserialized = roundtrip(&serializer, input_frame);
+        let input_frame = FrameEnum::from(InputTransportMessageFrame::new(msg.clone()));
+        let input_deserialized = roundtrip(&serializer, &input_frame);
 
-        let output_frame: Arc<dyn Frame> = Arc::new(OutputTransportMessageFrame::new(msg));
-        let output_deserialized = roundtrip(&serializer, output_frame);
+        let output_frame = FrameEnum::from(OutputTransportMessageFrame::new(msg));
+        let output_deserialized = roundtrip(&serializer, &output_frame);
 
         assert!(matches!(
             input_deserialized,
@@ -762,19 +738,19 @@ mod tests {
     fn test_transcription_and_interim_are_distinct() {
         let serializer = ProtobufFrameSerializer::new();
 
-        let final_frame: Arc<dyn Frame> = Arc::new(TranscriptionFrame::new(
+        let final_frame = FrameEnum::from(TranscriptionFrame::new(
             "final".to_string(),
             "user-1".to_string(),
             "ts".to_string(),
         ));
-        let interim_frame: Arc<dyn Frame> = Arc::new(InterimTranscriptionFrame::new(
+        let interim_frame = FrameEnum::from(InterimTranscriptionFrame::new(
             "interim".to_string(),
             "user-1".to_string(),
             "ts".to_string(),
         ));
 
-        let final_deserialized = roundtrip(&serializer, final_frame);
-        let interim_deserialized = roundtrip(&serializer, interim_frame);
+        let final_deserialized = roundtrip(&serializer, &final_frame);
+        let interim_deserialized = roundtrip(&serializer, &interim_frame);
 
         assert!(matches!(final_deserialized, FrameEnum::Transcription(_)));
         assert!(!matches!(

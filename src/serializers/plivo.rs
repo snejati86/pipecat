@@ -23,8 +23,6 @@
 //! { "event": "clearAudio", "streamId": "..." }
 //! ```
 
-use std::sync::Arc;
-
 use serde::Deserialize;
 use tracing::warn;
 
@@ -259,44 +257,39 @@ impl PlivoFrameSerializer {
 // ---------------------------------------------------------------------------
 
 impl FrameSerializer for PlivoFrameSerializer {
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
-        // InterruptionFrame -> clearAudio
-        if frame.downcast_ref::<InterruptionFrame>().is_some() {
-            let json = serde_json::json!({
-                "event": "clearAudio",
-                "streamId": &self.stream_id,
-            });
-            return serde_json::to_string(&json).ok().map(SerializedFrame::Text);
-        }
-
-        // OutputAudioRawFrame -> playAudio with mu-law payload
-        if let Some(audio_frame) = frame.downcast_ref::<OutputAudioRawFrame>() {
-            let ulaw_data = self.resample_and_encode(&audio_frame.audio.audio);
-            if ulaw_data.is_empty() {
-                return None;
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
+        match frame {
+            // InterruptionFrame -> clearAudio
+            FrameEnum::Interruption(_) => {
+                let json = serde_json::json!({
+                    "event": "clearAudio",
+                    "streamId": &self.stream_id,
+                });
+                serde_json::to_string(&json).ok().map(SerializedFrame::Text)
             }
-            let payload = encode_base64(&ulaw_data);
-            let json = serde_json::json!({
-                "event": "playAudio",
-                "streamId": &self.stream_id,
-                "media": {
-                    "contentType": "audio/x-mulaw",
-                    "sampleRate": self.plivo_sample_rate,
-                    "payload": payload,
-                },
-            });
-            return serde_json::to_string(&json).ok().map(SerializedFrame::Text);
+            // OutputAudioRawFrame -> playAudio with mu-law payload
+            FrameEnum::OutputAudioRaw(audio_frame) => {
+                let ulaw_data = self.resample_and_encode(&audio_frame.audio.audio);
+                if ulaw_data.is_empty() {
+                    return None;
+                }
+                let payload = encode_base64(&ulaw_data);
+                let json = serde_json::json!({
+                    "event": "playAudio",
+                    "streamId": &self.stream_id,
+                    "media": {
+                        "contentType": "audio/x-mulaw",
+                        "sampleRate": self.plivo_sample_rate,
+                        "payload": payload,
+                    },
+                });
+                serde_json::to_string(&json).ok().map(SerializedFrame::Text)
+            }
+            // EndFrame / CancelFrame -> return None (no wire message)
+            FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
+            // Unhandled frame types
+            _ => None,
         }
-
-        // EndFrame / CancelFrame -> return None (no wire message)
-        if frame.downcast_ref::<EndFrame>().is_some()
-            || frame.downcast_ref::<CancelFrame>().is_some()
-        {
-            return None;
-        }
-
-        // Unhandled frame types
-        None
     }
 
     fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
@@ -356,7 +349,7 @@ impl FrameSerializer for PlivoFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     // -----------------------------------------------------------------------
     // mu-law codec unit tests
     // -----------------------------------------------------------------------
@@ -625,9 +618,9 @@ mod tests {
     #[test]
     fn test_serialize_interruption_frame() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -649,8 +642,8 @@ mod tests {
             pcm_bytes.extend_from_slice(&s.to_le_bytes());
         }
 
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
-        let result = serializer.serialize(frame).unwrap();
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -673,22 +666,22 @@ mod tests {
     #[test]
     fn test_serialize_end_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(EndFrame::new());
-        assert!(serializer.serialize(frame).is_none());
+        let frame = FrameEnum::from(EndFrame::new());
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     #[test]
     fn test_serialize_cancel_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(None));
-        assert!(serializer.serialize(frame).is_none());
+        let frame = FrameEnum::from(CancelFrame::new(None));
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     #[test]
     fn test_serialize_unsupported_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello".to_string()));
-        assert!(serializer.serialize(frame).is_none());
+        let frame = FrameEnum::from(TextFrame::new("hello".to_string()));
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -707,8 +700,8 @@ mod tests {
         }
 
         // Serialize (pipeline PCM -> Plivo mu-law JSON)
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
-        let serialized = serializer.serialize(frame).unwrap();
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
+        let serialized = serializer.serialize(&frame).unwrap();
         let text = match serialized {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -808,8 +801,8 @@ mod tests {
             pcm_bytes.extend_from_slice(&s.to_le_bytes());
         }
 
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 24000, 1));
-        let result = serializer.serialize(frame).unwrap();
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes, 24000, 1));
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -846,9 +839,9 @@ mod tests {
     #[test]
     fn test_serialize_empty_audio_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(vec![], 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(vec![], 16000, 1));
         // Empty audio should result in no output (empty mu-law payload).
-        assert!(serializer.serialize(frame).is_none());
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     #[test]

@@ -297,8 +297,7 @@ async fn writer_task(
                 }
 
                 // Serialize and send to WebSocket
-                let arc_frame = directed.frame.into_arc_frame();
-                if let Some(serialized) = serializer.serialize(arc_frame) {
+                if let Some(serialized) = serializer.serialize(&directed.frame) {
                     let msg = match serialized {
                         SerializedFrame::Text(t) => WsMsg::Text(t.into()),
                         SerializedFrame::Binary(b) => WsMsg::Binary(b.into()),

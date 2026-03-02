@@ -31,8 +31,6 @@
 //!
 //! Ref docs: <https://developer.vonage.com/en/video/guides/audio-connector>
 
-use std::sync::Arc;
-
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -291,51 +289,48 @@ impl Default for VonageFrameSerializer {
 impl FrameSerializer for VonageFrameSerializer {
     fn setup(&mut self) {}
 
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
-        // InterruptionFrame -> clear action JSON
-        if frame.downcast_ref::<InterruptionFrame>().is_some() {
-            let json_str = serde_json::to_string(&serde_json::json!({"action": "clear"})).ok()?;
-            return Some(SerializedFrame::Text(json_str));
-        }
-
-        // OutputAudioRawFrame -> raw binary PCM
-        if let Some(audio_frame) = frame.downcast_ref::<OutputAudioRawFrame>() {
-            let pcm = &audio_frame.audio.audio;
-            if pcm.is_empty() {
-                return None;
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
+        match frame {
+            // InterruptionFrame -> clear action JSON
+            FrameEnum::Interruption(_) => {
+                let json_str =
+                    serde_json::to_string(&serde_json::json!({"action": "clear"})).ok()?;
+                Some(SerializedFrame::Text(json_str))
             }
+            // OutputAudioRawFrame -> raw binary PCM
+            FrameEnum::OutputAudioRaw(audio_frame) => {
+                let pcm = &audio_frame.audio.audio;
+                if pcm.is_empty() {
+                    return None;
+                }
 
-            // Resample from pipeline rate to Vonage rate if needed.
-            let resampled = resample_linear(
-                pcm,
-                audio_frame.audio.sample_rate,
-                self.params.vonage_sample_rate,
-            );
-            if resampled.is_empty() {
-                return None;
+                // Resample from pipeline rate to Vonage rate if needed.
+                let resampled = resample_linear(
+                    pcm,
+                    audio_frame.audio.sample_rate,
+                    self.params.vonage_sample_rate,
+                );
+                if resampled.is_empty() {
+                    return None;
+                }
+
+                Some(SerializedFrame::Binary(resampled))
             }
-
-            return Some(SerializedFrame::Binary(resampled));
+            // OutputTransportMessageFrame -> JSON text
+            FrameEnum::OutputTransportMessage(msg_frame) => {
+                let json_str = serde_json::to_string(&msg_frame.message).ok()?;
+                Some(SerializedFrame::Text(json_str))
+            }
+            // EndFrame and CancelFrame are ignored (hang-up is done externally).
+            FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
+            other => {
+                warn!(
+                    "VonageFrameSerializer: unsupported frame type '{}'",
+                    other
+                );
+                None
+            }
         }
-
-        // OutputTransportMessageFrame -> JSON text
-        if let Some(msg_frame) = frame.downcast_ref::<OutputTransportMessageFrame>() {
-            let json_str = serde_json::to_string(&msg_frame.message).ok()?;
-            return Some(SerializedFrame::Text(json_str));
-        }
-
-        // EndFrame and CancelFrame are ignored (hang-up is done externally).
-        if frame.downcast_ref::<EndFrame>().is_some()
-            || frame.downcast_ref::<CancelFrame>().is_some()
-        {
-            return None;
-        }
-
-        warn!(
-            "VonageFrameSerializer: unsupported frame type '{}'",
-            frame.name()
-        );
-        None
     }
 
     fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
@@ -361,7 +356,7 @@ impl FrameSerializer for VonageFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     // -----------------------------------------------------------------------
     // Constructor tests
     // -----------------------------------------------------------------------
@@ -665,9 +660,9 @@ mod tests {
     #[test]
     fn test_serialize_interruption_frame() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text for interruption"),
@@ -683,9 +678,9 @@ mod tests {
 
         let samples: Vec<i16> = vec![0, 1000, -1000, 5000, -5000];
         let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm.clone(), 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm.clone(), 16000, 1));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let binary = match result {
             SerializedFrame::Binary(b) => b,
             SerializedFrame::Text(_) => panic!("expected binary for audio"),
@@ -703,9 +698,9 @@ mod tests {
         // Create 160 PCM samples at 16kHz (10ms of audio).
         let samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
         let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm, 16000, 1));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let binary = match result {
             SerializedFrame::Binary(b) => b,
             SerializedFrame::Text(_) => panic!("expected binary for audio"),
@@ -718,9 +713,9 @@ mod tests {
     #[test]
     fn test_serialize_empty_audio_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(vec![], 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(vec![], 16000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
@@ -728,9 +723,9 @@ mod tests {
     fn test_serialize_output_transport_message() {
         let serializer = make_serializer();
         let msg = serde_json::json!({"action": "notify", "payload": {"key": "value"}});
-        let frame: Arc<dyn Frame> = Arc::new(OutputTransportMessageFrame::new(msg.clone()));
+        let frame = FrameEnum::from(OutputTransportMessageFrame::new(msg.clone()));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text for transport message"),
@@ -743,27 +738,27 @@ mod tests {
     #[test]
     fn test_serialize_end_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(EndFrame::new());
+        let frame = FrameEnum::from(EndFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_cancel_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(None));
+        let frame = FrameEnum::from(CancelFrame::new(None));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_unsupported_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello".to_string()));
+        let frame = FrameEnum::from(TextFrame::new("hello".to_string()));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
@@ -782,10 +777,10 @@ mod tests {
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm.clone(), 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm.clone(), 16000, 1));
 
         // Serialize
-        let serialized = serializer.serialize(frame).unwrap();
+        let serialized = serializer.serialize(&frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Binary(b) => b.as_slice(),
             SerializedFrame::Text(_) => panic!("expected binary"),
@@ -824,10 +819,10 @@ mod tests {
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm, 16000, 1));
 
         // Serialize
-        let serialized = serializer.serialize(frame).unwrap();
+        let serialized = serializer.serialize(&frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Binary(b) => b.clone(),
             SerializedFrame::Text(_) => panic!("expected binary"),
@@ -856,7 +851,7 @@ mod tests {
     #[test]
     fn test_should_ignore_frame_default() {
         let serializer = make_serializer();
-        let frame = TextFrame::new("test".to_string());
+        let frame = FrameEnum::from(TextFrame::new("test".to_string()));
         assert!(!serializer.should_ignore_frame(&frame));
     }
 
@@ -944,9 +939,9 @@ mod tests {
         let serializer = make_serializer_with_rates(16000, 16000);
 
         let original: Vec<u8> = vec![0x01, 0x00, 0xFF, 0x7F, 0x00, 0x80, 0xAB, 0xCD];
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(original.clone(), 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(original.clone(), 16000, 1));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let binary = match result {
             SerializedFrame::Binary(b) => b,
             SerializedFrame::Text(_) => panic!("expected binary"),

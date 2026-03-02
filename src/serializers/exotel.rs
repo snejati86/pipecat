@@ -28,8 +28,6 @@
 //! Inbound: mu-law 8kHz -> linear PCM 16-bit -> resample to pipeline rate
 //! Outbound: linear PCM at pipeline rate -> resample to 8kHz -> mu-law encode -> base64
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -328,58 +326,57 @@ impl ExotelFrameSerializer {
 // ---------------------------------------------------------------------------
 
 impl FrameSerializer for ExotelFrameSerializer {
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
         let stream_sid = self.stream_sid.as_deref().unwrap_or("");
 
-        // OutputAudioRawFrame -> Exotel media message
-        if let Some(audio_frame) = frame.downcast_ref::<OutputAudioRawFrame>() {
-            // Resample from pipeline rate to Exotel 8kHz
-            let pcm_data = if audio_frame.audio.sample_rate != EXOTEL_SAMPLE_RATE {
-                resample_linear(
-                    &audio_frame.audio.audio,
-                    audio_frame.audio.sample_rate,
-                    EXOTEL_SAMPLE_RATE,
-                )
-            } else {
-                audio_frame.audio.audio.clone()
-            };
+        match frame {
+            // OutputAudioRawFrame -> Exotel media message
+            FrameEnum::OutputAudioRaw(audio_frame) => {
+                // Resample from pipeline rate to Exotel 8kHz
+                let pcm_data = if audio_frame.audio.sample_rate != EXOTEL_SAMPLE_RATE {
+                    resample_linear(
+                        &audio_frame.audio.audio,
+                        audio_frame.audio.sample_rate,
+                        EXOTEL_SAMPLE_RATE,
+                    )
+                } else {
+                    audio_frame.audio.audio.clone()
+                };
 
-            // Convert PCM to mu-law
-            let mulaw_data = pcm_to_mulaw(&pcm_data);
+                // Convert PCM to mu-law
+                let mulaw_data = pcm_to_mulaw(&pcm_data);
 
-            // Base64 encode
-            let payload = encode_base64(&mulaw_data);
+                // Base64 encode
+                let payload = encode_base64(&mulaw_data);
 
-            let msg = ExotelMediaOut {
-                event: "media",
-                stream_sid,
-                media: ExotelMediaPayloadOut { payload },
-            };
+                let msg = ExotelMediaOut {
+                    event: "media",
+                    stream_sid,
+                    media: ExotelMediaPayloadOut { payload },
+                };
 
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
+            }
+            // InterruptionFrame -> Exotel clear message
+            FrameEnum::Interruption(_) => {
+                let msg = ExotelClearOut {
+                    event: "clear",
+                    stream_sid,
+                };
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
+            }
+            // TTSStoppedFrame -> Exotel mark message (for tracking playback completion)
+            FrameEnum::TTSStopped(tts_frame) => {
+                let mark_name = tts_frame.context_id.as_deref().unwrap_or("tts_stopped");
+                let msg = ExotelMarkOut {
+                    event: "mark",
+                    stream_sid,
+                    mark: ExotelMarkPayloadOut { name: mark_name },
+                };
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
+            }
+            _ => None,
         }
-
-        // InterruptionFrame -> Exotel clear message
-        if frame.downcast_ref::<InterruptionFrame>().is_some() {
-            let msg = ExotelClearOut {
-                event: "clear",
-                stream_sid,
-            };
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
-        }
-
-        // TTSStoppedFrame -> Exotel mark message (for tracking playback completion)
-        if let Some(tts_frame) = frame.downcast_ref::<TTSStoppedFrame>() {
-            let mark_name = tts_frame.context_id.as_deref().unwrap_or("tts_stopped");
-            let msg = ExotelMarkOut {
-                event: "mark",
-                stream_sid,
-                mark: ExotelMarkPayloadOut { name: mark_name },
-            };
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
-        }
-
-        None
     }
 
     fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
@@ -469,7 +466,7 @@ impl FrameSerializer for ExotelFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     // -----------------------------------------------------------------------
     // Mu-law codec unit tests
     // -----------------------------------------------------------------------
@@ -1022,9 +1019,9 @@ mod tests {
 
         // Create a simple audio frame with some PCM data (2 samples at 16kHz)
         let pcm_data = vec![0x00, 0x00, 0xE8, 0x03]; // samples: 0, 1000
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 16000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1047,9 +1044,9 @@ mod tests {
         let serializer = ExotelFrameSerializer::with_stream_sid(8000, "EX-stream-001".to_string());
 
         let pcm_data = vec![0x00, 0x00]; // 1 sample of silence
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 8000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1066,9 +1063,9 @@ mod tests {
     #[test]
     fn test_serialize_interruption_frame() {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-stream-456".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1083,9 +1080,9 @@ mod tests {
     #[test]
     fn test_serialize_tts_stopped_frame() {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-stream-789".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(TTSStoppedFrame::new(Some("ctx-42".to_string())));
+        let frame = FrameEnum::from(TTSStoppedFrame::new(Some("ctx-42".to_string())));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1101,9 +1098,9 @@ mod tests {
     #[test]
     fn test_serialize_tts_stopped_frame_no_context() {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-stream-789".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(TTSStoppedFrame::new(None));
+        let frame = FrameEnum::from(TTSStoppedFrame::new(None));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1115,16 +1112,16 @@ mod tests {
     #[test]
     fn test_serialize_unsupported_frame() {
         let serializer = ExotelFrameSerializer::new(16000);
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello".to_string()));
-        assert!(serializer.serialize(frame).is_none());
+        let frame = FrameEnum::from(TextFrame::new("hello".to_string()));
+        assert!(serializer.serialize(&frame).is_none());
     }
 
     #[test]
     fn test_serialize_with_empty_stream_sid() {
         let serializer = ExotelFrameSerializer::new(16000);
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1142,9 +1139,9 @@ mod tests {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-custom-sid".to_string());
 
         let pcm_data = vec![0x00, 0x00, 0xE8, 0x03];
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 16000, 1));
 
-        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(frame) {
+        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(&frame) {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             assert_eq!(parsed["streamSid"], "EX-custom-sid");
         } else {
@@ -1155,9 +1152,9 @@ mod tests {
     #[test]
     fn test_stream_sid_in_outgoing_clear() {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-clear-sid".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(frame) {
+        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(&frame) {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             assert_eq!(parsed["streamSid"], "EX-clear-sid");
         } else {
@@ -1168,9 +1165,9 @@ mod tests {
     #[test]
     fn test_stream_sid_in_outgoing_mark() {
         let serializer = ExotelFrameSerializer::with_stream_sid(16000, "EX-mark-sid".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(TTSStoppedFrame::new(Some("done".to_string())));
+        let frame = FrameEnum::from(TTSStoppedFrame::new(Some("done".to_string())));
 
-        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(frame) {
+        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(&frame) {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             assert_eq!(parsed["streamSid"], "EX-mark-sid");
         } else {
@@ -1194,9 +1191,8 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         // Serialize (output audio -> Exotel media JSON)
-        let out_frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(pcm_bytes.clone(), 16000, 1));
-        let serialized = serializer.serialize(out_frame).unwrap();
+        let out_frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes.clone(), 16000, 1));
+        let serialized = serializer.serialize(&out_frame).unwrap();
 
         // Extract the media JSON and re-wrap as incoming
         if let SerializedFrame::Text(json_str) = &serialized {
@@ -1240,9 +1236,8 @@ mod tests {
         let samples: Vec<i16> = vec![0, 500, 1000, -500, -1000];
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let out_frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(pcm_bytes.clone(), 8000, 1));
-        let serialized = serializer.serialize(out_frame).unwrap();
+        let out_frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes.clone(), 8000, 1));
+        let serialized = serializer.serialize(&out_frame).unwrap();
 
         if let SerializedFrame::Text(json_str) = &serialized {
             let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -1290,9 +1285,8 @@ mod tests {
         let samples: Vec<i16> = (0..240).map(|i| ((i * 50) % 10000) as i16).collect();
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let out_frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(pcm_bytes.clone(), 24000, 1));
-        let serialized = serializer.serialize(out_frame).unwrap();
+        let out_frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes.clone(), 24000, 1));
+        let serialized = serializer.serialize(&out_frame).unwrap();
 
         if let SerializedFrame::Text(json_str) = &serialized {
             let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -1334,9 +1328,9 @@ mod tests {
 
         // Create known PCM data
         let pcm_data: Vec<u8> = vec![0x00, 0x00, 0xE8, 0x03, 0x18, 0xFC];
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 8000, 1));
 
-        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(frame) {
+        if let Some(SerializedFrame::Text(json_str)) = serializer.serialize(&frame) {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             let payload = parsed["media"]["payload"].as_str().unwrap();
 

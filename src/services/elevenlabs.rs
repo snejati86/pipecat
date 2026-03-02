@@ -48,14 +48,12 @@
 //! ```
 
 use std::fmt;
-use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
@@ -210,8 +208,8 @@ pub struct ElevenLabsTTSService {
     ws_url: String,
     params: ElevenLabsInputParams,
 
-    /// The WebSocket connection, wrapped in a Mutex for interior mutability.
-    ws: Arc<Mutex<Option<WsStream>>>,
+    /// The WebSocket connection.
+    ws: Option<WsStream>,
 
     /// When true, the WebSocket has stale audio from an interrupted TTS
     /// generation that must be drained before the next request.
@@ -250,7 +248,7 @@ impl ElevenLabsTTSService {
             sample_rate,
             ws_url: Self::DEFAULT_WS_BASE_URL.to_string(),
             params: ElevenLabsInputParams::default(),
-            ws: Arc::new(Mutex::new(None)),
+            ws: None,
             needs_drain: false,
             last_metrics: None,
         }
@@ -341,9 +339,8 @@ impl ElevenLabsTTSService {
     ///
     /// This must be called before `run_tts`. If the connection is already open,
     /// this is a no-op.
-    pub async fn connect(&self) -> Result<(), String> {
-        let mut ws_guard = self.ws.lock().await;
-        if ws_guard.is_some() {
+    pub async fn connect(&mut self) -> Result<(), String> {
+        if self.ws.is_some() {
             return Ok(());
         }
 
@@ -359,7 +356,7 @@ impl ElevenLabsTTSService {
         match ws_result {
             Ok(Ok((stream, _response))) => {
                 tracing::info!(service = %self.name, "Connected to ElevenLabs WebSocket");
-                *ws_guard = Some(stream);
+                self.ws = Some(stream);
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -376,9 +373,8 @@ impl ElevenLabsTTSService {
     }
 
     /// Disconnect the WebSocket connection.
-    pub async fn disconnect(&self) {
-        let mut ws_guard = self.ws.lock().await;
-        if let Some(ref mut ws) = *ws_guard {
+    pub async fn disconnect(&mut self) {
+        if let Some(ref mut ws) = self.ws {
             tracing::debug!(service = %self.name, "Disconnecting from ElevenLabs WebSocket");
             if let Err(e) = ws.close(None).await {
                 tracing::warn!(
@@ -387,7 +383,7 @@ impl ElevenLabsTTSService {
                 );
             }
         }
-        *ws_guard = None;
+        self.ws = None;
     }
 
     /// Drain stale audio messages from an interrupted TTS generation.
@@ -398,8 +394,7 @@ impl ElevenLabsTTSService {
     /// If the drain times out or the connection is closed, the WebSocket is
     /// dropped so `connect()` will establish a fresh one.
     async fn drain_stale_messages(&mut self) {
-        let mut ws_guard = self.ws.lock().await;
-        let ws = match ws_guard.as_mut() {
+        let ws = match self.ws.as_mut() {
             Some(ws) => ws,
             None => return,
         };
@@ -420,7 +415,7 @@ impl ElevenLabsTTSService {
                         "Drain timed out — reconnecting"
                     );
                     // Force reconnect: drop the stale WebSocket
-                    *ws_guard = None;
+                    self.ws = None;
                     return;
                 }
                 msg = ws.next() => msg,
@@ -448,7 +443,7 @@ impl ElevenLabsTTSService {
                         drained,
                         "Drain: connection closed — will reconnect"
                     );
-                    *ws_guard = None;
+                    self.ws = None;
                     return;
                 }
                 Some(Ok(_)) => {
@@ -459,7 +454,7 @@ impl ElevenLabsTTSService {
                         service = %self.name,
                         "Drain: WebSocket error: {e} — will reconnect"
                     );
-                    *ws_guard = None;
+                    self.ws = None;
                     return;
                 }
             }
@@ -511,9 +506,7 @@ impl ElevenLabsTTSService {
         let ttfb_start = Instant::now();
         let mut got_first_audio = false;
 
-        // Send the request and receive responses under the lock.
-        let mut ws_guard = self.ws.lock().await;
-        let ws = match ws_guard.as_mut() {
+        let ws = match self.ws.as_mut() {
             Some(ws) => ws,
             None => {
                 frames.push(FrameEnum::Error(ErrorFrame::new(

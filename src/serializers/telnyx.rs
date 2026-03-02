@@ -23,8 +23,6 @@
 //! { "event": "clear" }
 //! ```
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -273,55 +271,52 @@ impl TelnyxFrameSerializer {
 impl FrameSerializer for TelnyxFrameSerializer {
     fn setup(&mut self) {}
 
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
-        // InterruptionFrame -> clear event
-        if frame.downcast_ref::<InterruptionFrame>().is_some() {
-            let msg = TelnyxClearOut { event: "clear" };
-            let json_str = serde_json::to_string(&msg).ok()?;
-            return Some(SerializedFrame::Text(json_str));
-        }
-
-        // OutputAudioRawFrame -> media event with base64 ulaw
-        if let Some(audio_frame) = frame.downcast_ref::<OutputAudioRawFrame>() {
-            let pcm = &audio_frame.audio.audio;
-            if pcm.is_empty() {
-                return None;
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
+        match frame {
+            // InterruptionFrame -> clear event
+            FrameEnum::Interruption(_) => {
+                let msg = TelnyxClearOut { event: "clear" };
+                let json_str = serde_json::to_string(&msg).ok()?;
+                Some(SerializedFrame::Text(json_str))
             }
+            // OutputAudioRawFrame -> media event with base64 ulaw
+            FrameEnum::OutputAudioRaw(audio_frame) => {
+                let pcm = &audio_frame.audio.audio;
+                if pcm.is_empty() {
+                    return None;
+                }
 
-            // Resample from pipeline rate to Telnyx rate (8 kHz).
-            let resampled = resample_linear(
-                pcm,
-                audio_frame.audio.sample_rate,
-                self.params.telnyx_sample_rate,
-            );
-            if resampled.is_empty() {
-                return None;
+                // Resample from pipeline rate to Telnyx rate (8 kHz).
+                let resampled = resample_linear(
+                    pcm,
+                    audio_frame.audio.sample_rate,
+                    self.params.telnyx_sample_rate,
+                );
+                if resampled.is_empty() {
+                    return None;
+                }
+
+                // Encode PCM to mu-law.
+                let ulaw_data = pcm_to_ulaw(&resampled);
+                let payload = encode_base64(&ulaw_data);
+
+                let msg = TelnyxMediaOut {
+                    event: "media",
+                    media: TelnyxMediaPayloadOut { payload },
+                };
+                let json_str = serde_json::to_string(&msg).ok()?;
+                Some(SerializedFrame::Text(json_str))
             }
-
-            // Encode PCM to mu-law.
-            let ulaw_data = pcm_to_ulaw(&resampled);
-            let payload = encode_base64(&ulaw_data);
-
-            let msg = TelnyxMediaOut {
-                event: "media",
-                media: TelnyxMediaPayloadOut { payload },
-            };
-            let json_str = serde_json::to_string(&msg).ok()?;
-            return Some(SerializedFrame::Text(json_str));
+            // EndFrame and CancelFrame are ignored (hang-up is done externally).
+            FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
+            other => {
+                warn!(
+                    "TelnyxFrameSerializer: unsupported frame type '{}'",
+                    other
+                );
+                None
+            }
         }
-
-        // EndFrame and CancelFrame are ignored (hang-up is done externally).
-        if frame.downcast_ref::<EndFrame>().is_some()
-            || frame.downcast_ref::<CancelFrame>().is_some()
-        {
-            return None;
-        }
-
-        warn!(
-            "TelnyxFrameSerializer: unsupported frame type '{}'",
-            frame.name()
-        );
-        None
     }
 
     fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
@@ -382,7 +377,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     // -----------------------------------------------------------------------
     // Mu-law codec tests
     // -----------------------------------------------------------------------
@@ -683,9 +678,9 @@ mod tests {
         // Create a small PCM audio frame at 8kHz (no resampling needed).
         let samples: Vec<i16> = vec![0, 1000, -1000, 5000, -5000];
         let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm, 8000, 1));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -709,9 +704,9 @@ mod tests {
         // Create 160 PCM samples at 16kHz (10ms of audio).
         let samples: Vec<i16> = (0..160).map(|i| (i * 100) as i16).collect();
         let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm, 16000, 1));
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -729,18 +724,18 @@ mod tests {
     #[test]
     fn test_serialize_empty_audio_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(vec![], 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(vec![], 16000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_interruption_frame() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame).unwrap();
+        let result = serializer.serialize(&frame).unwrap();
         let text = match result {
             SerializedFrame::Text(t) => t,
             SerializedFrame::Binary(_) => panic!("expected text"),
@@ -753,27 +748,27 @@ mod tests {
     #[test]
     fn test_serialize_end_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(EndFrame::new());
+        let frame = FrameEnum::from(EndFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_cancel_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(CancelFrame::new(None));
+        let frame = FrameEnum::from(CancelFrame::new(None));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_unsupported_frame_returns_none() {
         let serializer = make_serializer();
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello".to_string()));
+        let frame = FrameEnum::from(TextFrame::new("hello".to_string()));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
@@ -792,10 +787,10 @@ mod tests {
             .iter()
             .flat_map(|s| s.to_le_bytes())
             .collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm, 8000, 1));
 
         // Serialize
-        let serialized = serializer.serialize(frame).unwrap();
+        let serialized = serializer.serialize(&frame).unwrap();
         let bytes = match &serialized {
             SerializedFrame::Text(t) => t.as_bytes(),
             SerializedFrame::Binary(b) => b.as_slice(),
@@ -862,7 +857,7 @@ mod tests {
     #[test]
     fn test_should_ignore_frame_default() {
         let serializer = make_serializer();
-        let frame = TextFrame::new("test".to_string());
+        let frame = FrameEnum::from(TextFrame::new("test".to_string()));
         assert!(!serializer.should_ignore_frame(&frame));
     }
 

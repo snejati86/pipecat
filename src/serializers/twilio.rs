@@ -30,7 +30,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -308,85 +308,84 @@ impl TwilioFrameSerializer {
 }
 
 impl FrameSerializer for TwilioFrameSerializer {
-    fn serialize(&self, frame: Arc<dyn Frame>) -> Option<SerializedFrame> {
+    fn serialize(&self, frame: &FrameEnum) -> Option<SerializedFrame> {
         let stream_sid = self.stream_sid.as_deref().unwrap_or("");
 
-        // OutputAudioRawFrame -> Twilio media message
-        if let Some(audio_frame) = frame.downcast_ref::<OutputAudioRawFrame>() {
-            let debug = DEBUG_AUDIO.load(Ordering::Relaxed);
+        match frame {
+            // OutputAudioRawFrame -> Twilio media message
+            FrameEnum::OutputAudioRaw(audio_frame) => {
+                let debug = DEBUG_AUDIO.load(Ordering::Relaxed);
 
-            // --- Stage 1: raw PCM from TTS BEFORE resampling (pipeline rate) ---
-            if debug {
-                init_debug_audio_dir();
-                debug_audio_append("pre_resample_24k.raw", &audio_frame.audio.audio);
+                // --- Stage 1: raw PCM from TTS BEFORE resampling (pipeline rate) ---
+                if debug {
+                    init_debug_audio_dir();
+                    debug_audio_append("pre_resample_24k.raw", &audio_frame.audio.audio);
+                }
+
+                // Resample from pipeline rate to Twilio 8kHz using linear interpolation
+                let pcm_data = if audio_frame.audio.sample_rate != TWILIO_SAMPLE_RATE {
+                    resample_linear(
+                        &audio_frame.audio.audio,
+                        audio_frame.audio.sample_rate,
+                        TWILIO_SAMPLE_RATE,
+                    )
+                } else {
+                    audio_frame.audio.audio.clone()
+                };
+
+                if pcm_data.is_empty() {
+                    return None;
+                }
+
+                // --- Stage 2: PCM AFTER resampling to 8 kHz ---
+                if debug {
+                    debug_audio_append("post_resample_8k.raw", &pcm_data);
+                }
+
+                // Convert PCM to mu-law
+                let mulaw_data = pcm_to_mulaw(&pcm_data);
+
+                // --- Stage 3: mu-law roundtrip --- encode then decode back to PCM ---
+                // This lets us hear exactly what Twilio will play after decoding.
+                if debug {
+                    let decoded_pcm = mulaw_to_pcm(&mulaw_data);
+                    debug_audio_append("mulaw_decoded_8k.raw", &decoded_pcm);
+                }
+
+                // Base64 encode
+                let payload = encode_base64(&mulaw_data);
+
+                let msg = TwilioMediaOut {
+                    event: "media",
+                    stream_sid,
+                    media: TwilioMediaPayloadOut { payload },
+                };
+
+                tracing::trace!(bytes = mulaw_data.len(), "Twilio: serializing audio output");
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
             }
-
-            // Resample from pipeline rate to Twilio 8kHz using linear interpolation
-            let pcm_data = if audio_frame.audio.sample_rate != TWILIO_SAMPLE_RATE {
-                resample_linear(
-                    &audio_frame.audio.audio,
-                    audio_frame.audio.sample_rate,
-                    TWILIO_SAMPLE_RATE,
-                )
-            } else {
-                audio_frame.audio.audio.clone()
-            };
-
-            if pcm_data.is_empty() {
-                return None;
+            // InterruptionFrame -> Twilio clear message
+            FrameEnum::Interruption(_) => {
+                tracing::debug!("Twilio: sending clear (interruption)");
+                let msg = TwilioClearOut {
+                    event: "clear",
+                    stream_sid,
+                };
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
             }
-
-            // --- Stage 2: PCM AFTER resampling to 8 kHz ---
-            if debug {
-                debug_audio_append("post_resample_8k.raw", &pcm_data);
+            // TTSStoppedFrame -> Twilio mark message (for tracking playback completion)
+            FrameEnum::TTSStopped(tts_frame) => {
+                let mark_name = tts_frame.context_id.as_deref().unwrap_or("tts_stopped");
+                tracing::debug!(mark = %mark_name, "Twilio: sending mark");
+                let msg = TwilioMarkOut {
+                    event: "mark",
+                    stream_sid,
+                    mark: TwilioMarkPayloadOut { name: mark_name },
+                };
+                serde_json::to_string(&msg).ok().map(SerializedFrame::Text)
             }
-
-            // Convert PCM to mu-law
-            let mulaw_data = pcm_to_mulaw(&pcm_data);
-
-            // --- Stage 3: mu-law roundtrip — encode then decode back to PCM ---
-            // This lets us hear exactly what Twilio will play after decoding.
-            if debug {
-                let decoded_pcm = mulaw_to_pcm(&mulaw_data);
-                debug_audio_append("mulaw_decoded_8k.raw", &decoded_pcm);
-            }
-
-            // Base64 encode
-            let payload = encode_base64(&mulaw_data);
-
-            let msg = TwilioMediaOut {
-                event: "media",
-                stream_sid,
-                media: TwilioMediaPayloadOut { payload },
-            };
-
-            tracing::trace!(bytes = mulaw_data.len(), "Twilio: serializing audio output");
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
+            _ => None,
         }
-
-        // InterruptionFrame -> Twilio clear message
-        if frame.downcast_ref::<InterruptionFrame>().is_some() {
-            tracing::debug!("Twilio: sending clear (interruption)");
-            let msg = TwilioClearOut {
-                event: "clear",
-                stream_sid,
-            };
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
-        }
-
-        // TTSStoppedFrame -> Twilio mark message (for tracking playback completion)
-        if let Some(tts_frame) = frame.downcast_ref::<TTSStoppedFrame>() {
-            let mark_name = tts_frame.context_id.as_deref().unwrap_or("tts_stopped");
-            tracing::debug!(mark = %mark_name, "Twilio: sending mark");
-            let msg = TwilioMarkOut {
-                event: "mark",
-                stream_sid,
-                mark: TwilioMarkPayloadOut { name: mark_name },
-            };
-            return serde_json::to_string(&msg).ok().map(SerializedFrame::Text);
-        }
-
-        None
     }
 
     fn deserialize(&self, data: &[u8]) -> Option<FrameEnum> {
@@ -652,9 +651,9 @@ mod tests {
         // At 8kHz pipeline rate, no resampling occurs — exact PCM preserved through mu-law
         let serializer = TwilioFrameSerializer::with_stream_sid(8000, "MZ-test".to_string());
         let pcm_data = vec![0x00, 0x00]; // 1 sample of silence
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 8000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -709,8 +708,8 @@ mod tests {
             .collect();
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
-        let result = serializer.serialize(frame).unwrap();
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes, 16000, 1));
+        let result = serializer.serialize(&frame).unwrap();
 
         if let SerializedFrame::Text(json_str) = result {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -737,8 +736,8 @@ mod tests {
             .collect();
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_bytes, 24000, 1));
-        let result = serializer.serialize(frame).unwrap();
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes, 24000, 1));
+        let result = serializer.serialize(&frame).unwrap();
 
         if let SerializedFrame::Text(json_str) = result {
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -790,9 +789,9 @@ mod tests {
     fn test_resample_empty_input_serialize() {
         // Empty audio frame returns None (nothing to resample)
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ-test".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(vec![], 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(vec![], 16000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
@@ -1114,9 +1113,9 @@ mod tests {
             .map(|i| ((i as f64 * 0.1).sin() * 5000.0) as i16)
             .collect();
         let pcm_data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 16000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 16000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1138,9 +1137,9 @@ mod tests {
         let serializer = TwilioFrameSerializer::with_stream_sid(8000, "MZ123".to_string());
 
         let pcm_data = vec![0x00, 0x00]; // 1 sample of silence
-        let frame: Arc<dyn Frame> = Arc::new(OutputAudioRawFrame::new(pcm_data, 8000, 1));
+        let frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_data, 8000, 1));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1157,9 +1156,9 @@ mod tests {
     #[test]
     fn test_serialize_interruption_frame() {
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ456".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1174,9 +1173,9 @@ mod tests {
     #[test]
     fn test_serialize_tts_stopped_frame() {
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ789".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(TTSStoppedFrame::new(Some("ctx-42".to_string())));
+        let frame = FrameEnum::from(TTSStoppedFrame::new(Some("ctx-42".to_string())));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1192,9 +1191,9 @@ mod tests {
     #[test]
     fn test_serialize_tts_stopped_frame_no_context() {
         let serializer = TwilioFrameSerializer::with_stream_sid(16000, "MZ789".to_string());
-        let frame: Arc<dyn Frame> = Arc::new(TTSStoppedFrame::new(None));
+        let frame = FrameEnum::from(TTSStoppedFrame::new(None));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1206,18 +1205,18 @@ mod tests {
     #[test]
     fn test_serialize_unsupported_frame() {
         let serializer = TwilioFrameSerializer::new(16000);
-        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("hello".to_string()));
+        let frame = FrameEnum::from(TextFrame::new("hello".to_string()));
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_serialize_with_empty_stream_sid() {
         let serializer = TwilioFrameSerializer::new(16000);
-        let frame: Arc<dyn Frame> = Arc::new(InterruptionFrame::new());
+        let frame = FrameEnum::from(InterruptionFrame::new());
 
-        let result = serializer.serialize(frame);
+        let result = serializer.serialize(&frame);
         assert!(result.is_some());
 
         if let Some(SerializedFrame::Text(json_str)) = result {
@@ -1243,9 +1242,8 @@ mod tests {
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         // Serialize (output audio -> Twilio media JSON)
-        let out_frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(pcm_bytes.clone(), 16000, 1));
-        let serialized = serializer.serialize(out_frame).unwrap();
+        let out_frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes.clone(), 16000, 1));
+        let serialized = serializer.serialize(&out_frame).unwrap();
 
         // Extract the media JSON and re-wrap as incoming
         if let SerializedFrame::Text(json_str) = &serialized {
@@ -1292,9 +1290,8 @@ mod tests {
         let samples: Vec<i16> = vec![0, 500, 1000, -500, -1000];
         let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let out_frame: Arc<dyn Frame> =
-            Arc::new(OutputAudioRawFrame::new(pcm_bytes.clone(), 8000, 1));
-        let serialized = serializer.serialize(out_frame).unwrap();
+        let out_frame = FrameEnum::from(OutputAudioRawFrame::new(pcm_bytes.clone(), 8000, 1));
+        let serialized = serializer.serialize(&out_frame).unwrap();
 
         if let SerializedFrame::Text(json_str) = &serialized {
             let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
