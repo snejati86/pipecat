@@ -59,7 +59,9 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
-use crate::frames::{ErrorFrame, FrameEnum, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame};
+use crate::frames::{
+    ErrorFrame, FrameEnum, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
+};
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
 use crate::services::{AIService, TTSService};
@@ -550,10 +552,9 @@ impl ElevenLabsTTSService {
                                         "Time to first byte"
                                     );
                                 }
-                                let mut audio_frame =
-                                    TTSAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
-                                audio_frame.context_id = Some(context_id.clone());
-                                frames.push(audio_frame.into());
+                                let audio_frame =
+                                    OutputAudioRawFrame::new(audio_bytes, self.sample_rate, 1);
+                                frames.push(FrameEnum::OutputAudioRaw(audio_frame));
                             }
                         }
                         Err(e) => {
@@ -634,6 +635,11 @@ impl Processor for ElevenLabsTTSService {
     ) {
         match frame {
             FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                // Auto-reconnect if the WebSocket was disconnected (e.g. after interruption).
+                if let Err(e) = self.connect().await {
+                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+                    return;
+                }
                 let result_frames = self.run_tts(&t.text).await;
                 for f in result_frames {
                     ctx.send_downstream(f);
@@ -686,7 +692,7 @@ impl TTSService for ElevenLabsTTSService {
     ///
     /// The WebSocket connection must have been established via `connect()` before
     /// calling this method. Returns `TTSStartedFrame`, zero or more
-    /// `TTSAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
+    /// `OutputAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
     /// `ErrorFrame` is included in the returned vector.
     async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
@@ -908,10 +914,9 @@ impl ElevenLabsHttpTTSService {
                                 "Received TTS audio"
                             );
 
-                            let mut audio_frame =
-                                TTSAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
-                            audio_frame.context_id = Some(context_id.clone());
-                            frames.push(audio_frame.into());
+                            let audio_frame =
+                                OutputAudioRawFrame::new(audio_data.to_vec(), self.sample_rate, 1);
+                            frames.push(FrameEnum::OutputAudioRaw(audio_frame));
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
@@ -1004,7 +1009,7 @@ impl TTSService for ElevenLabsHttpTTSService {
     /// Synthesize speech from text using ElevenLabs' HTTP REST API.
     ///
     /// Makes a `POST` request to `/v1/text-to-speech/{voice_id}/stream` and returns
-    /// the complete audio as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame`
+    /// the complete audio as a single `OutputAudioRawFrame`, bracketed by `TTSStartedFrame`
     /// and `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
     async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
         tracing::debug!(service = %self.name, text = %text, "Generating TTS (HTTP)");
