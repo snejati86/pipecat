@@ -59,13 +59,11 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
-use crate::frames::{
-    ErrorFrame, Frame, FrameEnum, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
-    TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame, TextFrame,
-};
-use crate::impl_base_display;
-use crate::processors::{BaseProcessor, FrameDirection, FrameProcessor};
+use crate::frames::{ErrorFrame, FrameEnum, TTSAudioRawFrame, TTSStartedFrame, TTSStoppedFrame};
+use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
+use crate::processors::FrameDirection;
 use crate::services::{AIService, TTSService};
+use crate::utils::base_object::obj_id;
 
 /// Generate a unique context ID using the shared utility.
 fn generate_context_id() -> String {
@@ -202,7 +200,8 @@ type WsStream =
 /// The service maintains a persistent WebSocket connection and supports
 /// context-based audio management for handling interruptions and cancellations.
 pub struct ElevenLabsTTSService {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     api_key: String,
     voice_id: String,
     model: String,
@@ -238,7 +237,8 @@ impl ElevenLabsTTSService {
         let output_format = Self::DEFAULT_OUTPUT_FORMAT.to_string();
         let sample_rate = sample_rate_from_output_format(&output_format);
         Self {
-            base: BaseProcessor::new(Some("ElevenLabsTTSService".to_string()), false),
+            id: obj_id(),
+            name: "ElevenLabsTTSService".into(),
             api_key: api_key.into(),
             voice_id: voice_id.into(),
             model: Self::DEFAULT_MODEL.to_string(),
@@ -344,7 +344,7 @@ impl ElevenLabsTTSService {
 
         let url = self.build_ws_url();
 
-        tracing::debug!(service = %self.base.name(), "Connecting to ElevenLabs WebSocket");
+        tracing::debug!(service = %self.name, "Connecting to ElevenLabs WebSocket");
 
         let ws_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -353,18 +353,18 @@ impl ElevenLabsTTSService {
         .await;
         match ws_result {
             Ok(Ok((stream, _response))) => {
-                tracing::info!(service = %self.base.name(), "Connected to ElevenLabs WebSocket");
+                tracing::info!(service = %self.name, "Connected to ElevenLabs WebSocket");
                 *ws_guard = Some(stream);
                 Ok(())
             }
             Ok(Err(e)) => {
                 let msg = format!("Failed to connect to ElevenLabs WebSocket: {e}");
-                tracing::error!(service = %self.base.name(), "{}", msg);
+                tracing::error!(service = %self.name, "{}", msg);
                 Err(msg)
             }
             Err(_) => {
                 let msg = "ElevenLabs WebSocket connection timed out after 10s".to_string();
-                tracing::error!(service = %self.base.name(), "{}", msg);
+                tracing::error!(service = %self.name, "{}", msg);
                 Err(msg)
             }
         }
@@ -374,10 +374,10 @@ impl ElevenLabsTTSService {
     pub async fn disconnect(&self) {
         let mut ws_guard = self.ws.lock().await;
         if let Some(ref mut ws) = *ws_guard {
-            tracing::debug!(service = %self.base.name(), "Disconnecting from ElevenLabs WebSocket");
+            tracing::debug!(service = %self.name, "Disconnecting from ElevenLabs WebSocket");
             if let Err(e) = ws.close(None).await {
                 tracing::warn!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     "Failed to close ElevenLabs WebSocket: {e}"
                 );
             }
@@ -458,7 +458,7 @@ impl ElevenLabsTTSService {
         if let Ok(flush_json) = serde_json::to_string(&flush) {
             if let Err(e) = ws.send(WsMessage::Text(flush_json)).await {
                 tracing::warn!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     "Failed to send flush message: {e}"
                 );
             }
@@ -470,7 +470,7 @@ impl ElevenLabsTTSService {
         ))));
 
         tracing::debug!(
-            service = %self.base.name(),
+            service = %self.name,
             text = %text,
             context_id = %context_id,
             "Sent TTS request over WebSocket"
@@ -501,7 +501,7 @@ impl ElevenLabsTTSService {
                 WsMessage::Text(t) => t.to_string(),
                 WsMessage::Close(_) => {
                     tracing::debug!(
-                        service = %self.base.name(),
+                        service = %self.name,
                         "WebSocket closed by server"
                     );
                     break;
@@ -513,7 +513,7 @@ impl ElevenLabsTTSService {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(
-                        service = %self.base.name(),
+                        service = %self.name,
                         "Failed to parse WebSocket message: {e}"
                     );
                     continue;
@@ -523,7 +523,7 @@ impl ElevenLabsTTSService {
             // Check for errors.
             if let Some(ref error) = response.error {
                 tracing::error!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     context_id = %context_id,
                     error = %error,
                     "ElevenLabs WebSocket error"
@@ -545,7 +545,7 @@ impl ElevenLabsTTSService {
                                     got_first_audio = true;
                                     let ttfb = ttfb_start.elapsed();
                                     tracing::debug!(
-                                        service = %self.base.name(),
+                                        service = %self.name,
                                         ttfb_ms = %ttfb.as_millis(),
                                         "Time to first byte"
                                     );
@@ -558,7 +558,7 @@ impl ElevenLabsTTSService {
                         }
                         Err(e) => {
                             tracing::warn!(
-                                service = %self.base.name(),
+                                service = %self.name,
                                 "Failed to decode base64 audio chunk: {e}"
                             );
                         }
@@ -569,7 +569,7 @@ impl ElevenLabsTTSService {
             // Check if this is the final message.
             if response.is_final == Some(true) {
                 tracing::debug!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     context_id = %context_id,
                     "TTS generation complete"
                 );
@@ -596,8 +596,8 @@ impl ElevenLabsTTSService {
 impl fmt::Debug for ElevenLabsTTSService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElevenLabsTTSService")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("voice_id", &self.voice_id)
             .field("model", &self.model)
             .field("output_format", &self.output_format)
@@ -606,44 +606,62 @@ impl fmt::Debug for ElevenLabsTTSService {
     }
 }
 
-impl_base_display!(ElevenLabsTTSService);
+impl fmt::Display for ElevenLabsTTSService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
 
 #[async_trait]
-impl FrameProcessor for ElevenLabsTTSService {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
+impl Processor for ElevenLabsTTSService {
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Process incoming frames.
-    ///
-    /// - `TextFrame`: Triggers TTS generation via WebSocket.
-    /// - `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame`: Passed through downstream.
-    /// - All other frames: Pushed through in their original direction.
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        let any = frame.as_any();
+    fn id(&self) -> u64 {
+        self.id
+    }
 
-        if let Some(text_frame) = any.downcast_ref::<TextFrame>() {
-            tracing::debug!(
-                service = %self.base.name(),
-                text = %text_frame.text,
-                "Processing TextFrame for TTS"
-            );
-            let result_frames = self.run_tts(&text_frame.text).await;
-            for f in result_frames {
-                self.push_frame(f.into(), FrameDirection::Downstream).await;
+    fn weight(&self) -> ProcessorWeight {
+        ProcessorWeight::Heavy
+    }
+
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        match frame {
+            FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                let result_frames = self.run_tts(&t.text).await;
+                for f in result_frames {
+                    ctx.send_downstream(f);
+                }
             }
-        } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
-            || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
-        {
-            // LLM response boundary frames are passed through downstream.
-            self.push_frame(frame, FrameDirection::Downstream).await;
-        } else {
-            // Pass all other frames through in their original direction.
-            self.push_frame(frame, direction).await;
+            FrameEnum::Start(_) => {
+                if let Err(e) = self.connect().await {
+                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+                }
+                ctx.send_downstream(frame);
+            }
+            FrameEnum::End(_) | FrameEnum::Cancel(_) => {
+                self.disconnect().await;
+                ctx.send_downstream(frame);
+            }
+            FrameEnum::Interruption(_) => {
+                self.disconnect().await;
+                ctx.send_downstream(frame);
+            }
+            FrameEnum::LLMFullResponseStart(_) | FrameEnum::LLMFullResponseEnd(_) => {
+                ctx.send_downstream(frame);
+            }
+            other => ctx.send(other, direction),
         }
+    }
+
+    async fn cleanup(&mut self) {
+        self.disconnect().await;
     }
 }
 
@@ -671,7 +689,7 @@ impl TTSService for ElevenLabsTTSService {
     /// `TTSAudioRawFrame`s, and a `TTSStoppedFrame`. If an error occurs, an
     /// `ErrorFrame` is included in the returned vector.
     async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
-        tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (WebSocket)");
+        tracing::debug!(service = %self.name, text = %text, "Generating TTS (WebSocket)");
         self.run_tts_ws(text).await
     }
 }
@@ -687,7 +705,8 @@ impl TTSService for ElevenLabsTTSService {
 /// making this simpler to use but with higher latency compared to the
 /// WebSocket variant.
 pub struct ElevenLabsHttpTTSService {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     api_key: String,
     voice_id: String,
     model: String,
@@ -721,7 +740,8 @@ impl ElevenLabsHttpTTSService {
         let output_format = Self::DEFAULT_OUTPUT_FORMAT.to_string();
         let sample_rate = sample_rate_from_output_format(&output_format);
         Self {
-            base: BaseProcessor::new(Some("ElevenLabsHttpTTSService".to_string()), false),
+            id: obj_id(),
+            name: "ElevenLabsHttpTTSService".into(),
             api_key: api_key.into(),
             voice_id: voice_id.into(),
             model: Self::DEFAULT_MODEL.to_string(),
@@ -861,7 +881,7 @@ impl ElevenLabsHttpTTSService {
             Ok(resp) => {
                 let ttfb = ttfb_start.elapsed();
                 tracing::debug!(
-                    service = %self.base.name(),
+                    service = %self.name,
                     ttfb_ms = %ttfb.as_millis(),
                     status = %resp.status(),
                     "Received HTTP response"
@@ -872,7 +892,7 @@ impl ElevenLabsHttpTTSService {
                     let error_text = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
                     let error_msg =
                         format!("ElevenLabs API returned status {status}: {error_text}");
-                    tracing::error!(service = %self.base.name(), "{}", error_msg);
+                    tracing::error!(service = %self.name, "{}", error_msg);
                     frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                 } else {
                     match resp.bytes().await {
@@ -883,7 +903,7 @@ impl ElevenLabsHttpTTSService {
                             });
 
                             tracing::debug!(
-                                service = %self.base.name(),
+                                service = %self.name,
                                 audio_bytes = audio_data.len(),
                                 "Received TTS audio"
                             );
@@ -895,7 +915,7 @@ impl ElevenLabsHttpTTSService {
                         }
                         Err(e) => {
                             let error_msg = format!("Failed to read audio response body: {e}");
-                            tracing::error!(service = %self.base.name(), "{}", error_msg);
+                            tracing::error!(service = %self.name, "{}", error_msg);
                             frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
                         }
                     }
@@ -903,7 +923,7 @@ impl ElevenLabsHttpTTSService {
             }
             Err(e) => {
                 let error_msg = format!("HTTP request to ElevenLabs failed: {e}");
-                tracing::error!(service = %self.base.name(), "{}", error_msg);
+                tracing::error!(service = %self.name, "{}", error_msg);
                 frames.push(FrameEnum::Error(ErrorFrame::new(error_msg, false)));
             }
         }
@@ -920,8 +940,8 @@ impl ElevenLabsHttpTTSService {
 impl fmt::Debug for ElevenLabsHttpTTSService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ElevenLabsHttpTTSService")
-            .field("id", &self.base.id())
-            .field("name", &self.base.name())
+            .field("id", &self.id)
+            .field("name", &self.name)
             .field("voice_id", &self.voice_id)
             .field("model", &self.model)
             .field("output_format", &self.output_format)
@@ -931,43 +951,43 @@ impl fmt::Debug for ElevenLabsHttpTTSService {
     }
 }
 
-impl_base_display!(ElevenLabsHttpTTSService);
+impl fmt::Display for ElevenLabsHttpTTSService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
 
 #[async_trait]
-impl FrameProcessor for ElevenLabsHttpTTSService {
-    fn base(&self) -> &BaseProcessor {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut BaseProcessor {
-        &mut self.base
+impl Processor for ElevenLabsHttpTTSService {
+    fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Process incoming frames.
-    ///
-    /// - `TextFrame`: Triggers TTS generation via the HTTP API.
-    /// - `LLMFullResponseStartFrame` / `LLMFullResponseEndFrame`: Passed through downstream.
-    /// - All other frames: Pushed through in their original direction.
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        let any = frame.as_any();
+    fn id(&self) -> u64 {
+        self.id
+    }
 
-        if let Some(text_frame) = any.downcast_ref::<TextFrame>() {
-            tracing::debug!(
-                service = %self.base.name(),
-                text = %text_frame.text,
-                "Processing TextFrame for HTTP TTS"
-            );
-            let result_frames = self.run_tts(&text_frame.text).await;
-            for f in result_frames {
-                self.push_frame(f.into(), FrameDirection::Downstream).await;
+    fn weight(&self) -> ProcessorWeight {
+        ProcessorWeight::Heavy
+    }
+
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        match frame {
+            FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                let result_frames = self.run_tts(&t.text).await;
+                for f in result_frames {
+                    ctx.send_downstream(f);
+                }
             }
-        } else if any.downcast_ref::<LLMFullResponseStartFrame>().is_some()
-            || any.downcast_ref::<LLMFullResponseEndFrame>().is_some()
-        {
-            // LLM response boundary frames are passed through downstream.
-            self.push_frame(frame, FrameDirection::Downstream).await;
-        } else {
-            // Pass all other frames through in their original direction.
-            self.push_frame(frame, direction).await;
+            FrameEnum::LLMFullResponseStart(_) | FrameEnum::LLMFullResponseEnd(_) => {
+                ctx.send_downstream(frame);
+            }
+            other => ctx.send(other, direction),
         }
     }
 }
@@ -987,7 +1007,7 @@ impl TTSService for ElevenLabsHttpTTSService {
     /// the complete audio as a single `TTSAudioRawFrame`, bracketed by `TTSStartedFrame`
     /// and `TTSStoppedFrame`. If an error occurs, an `ErrorFrame` is included.
     async fn run_tts(&mut self, text: &str) -> Vec<FrameEnum> {
-        tracing::debug!(service = %self.base.name(), text = %text, "Generating TTS (HTTP)");
+        tracing::debug!(service = %self.name, text = %text, "Generating TTS (HTTP)");
         self.run_tts_http(text).await
     }
 }
@@ -1621,19 +1641,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FrameProcessor base tests
+    // Processor trait tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_ws_processor_name() {
         let service = ElevenLabsTTSService::new("key", "voice");
-        assert_eq!(service.base().name(), "ElevenLabsTTSService");
+        assert_eq!(Processor::name(&service), "ElevenLabsTTSService");
     }
 
     #[test]
     fn test_http_processor_name() {
         let service = ElevenLabsHttpTTSService::new("key", "voice");
-        assert_eq!(service.base().name(), "ElevenLabsHttpTTSService");
+        assert_eq!(Processor::name(&service), "ElevenLabsHttpTTSService");
     }
 
     // -----------------------------------------------------------------------

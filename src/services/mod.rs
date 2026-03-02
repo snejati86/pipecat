@@ -20,13 +20,14 @@ pub mod qwen;
 pub mod sambanova;
 pub mod together;
 
+pub mod elevenlabs;
+
 // Legacy FrameProcessor services -- commented out until migrated to new Processor API:
 // pub mod anthropic;
 // pub mod assemblyai;
 // pub mod aws_polly;
 // pub mod azure;
 // pub mod deepseek;
-// pub mod elevenlabs;
 // pub mod gladia;
 // pub mod google;
 // pub mod google_stt;
