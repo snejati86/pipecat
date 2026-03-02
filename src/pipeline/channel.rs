@@ -77,7 +77,10 @@ impl PrioritySender {
     /// they are uninterruptible (e.g., `FunctionCallResultFrame`, `ErrorFrame`).
     pub async fn send(&self, frame: FrameEnum, direction: FrameDirection) {
         let directed = DirectedFrame { frame, direction };
-        if matches!(directed.frame.kind(), FrameKind::System | FrameKind::Control) {
+        if matches!(
+            directed.frame.kind(),
+            FrameKind::System | FrameKind::Control
+        ) {
             if self.priority_tx.send(directed).is_err() {
                 tracing::warn!("PrioritySender: priority receiver dropped, frame lost");
             }
@@ -412,6 +415,16 @@ impl ChannelPipeline {
                                             buffered_priority.push(pf);
                                         }
                                     }
+                                    // Forward ctx output immediately during Heavy process()
+                                    // so streaming frames (e.g. LLM tokens, TTS audio chunks)
+                                    // reach downstream processors without waiting for process()
+                                    // to complete.
+                                    Some(frame) = ctx_down_rx.recv() => {
+                                        downstream_tx.send(frame, FrameDirection::Downstream).await;
+                                    }
+                                    Some(frame) = ctx_up_rx.recv() => {
+                                        upstream_tx.send(frame, FrameDirection::Upstream).await;
+                                    }
                                 }
                             }
                         };
@@ -630,9 +643,7 @@ impl ChannelPipeline {
 
     /// Send a frame into the pipeline.
     pub async fn send(&self, frame: FrameEnum) {
-        self.input_tx
-            .send(frame, FrameDirection::Downstream)
-            .await;
+        self.input_tx.send(frame, FrameDirection::Downstream).await;
     }
 
     /// Cancel the pipeline and wait for all tasks to finish.
@@ -780,7 +791,9 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(vec![]);
         let mut output = pipeline.take_output().unwrap();
 
-        pipeline.send(FrameEnum::Text(TextFrame::new("hello"))).await;
+        pipeline
+            .send(FrameEnum::Text(TextFrame::new("hello")))
+            .await;
 
         let received = output.recv().await.unwrap();
         match received.frame {
@@ -793,20 +806,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_passthrough() {
-        let procs: Vec<Box<dyn Processor>> =
-            vec![Box::new(PassthroughProc::new(1, "PT"))];
+        let procs: Vec<Box<dyn Processor>> = vec![Box::new(PassthroughProc::new(1, "PT"))];
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
         pipeline.send(FrameEnum::Text(TextFrame::new("test"))).await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            output.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), output.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match received.frame {
             FrameEnum::Text(text) => assert_eq!(text.text, "test"),
@@ -822,15 +831,14 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
-        pipeline.send(FrameEnum::Text(TextFrame::new("hello world"))).await;
+        pipeline
+            .send(FrameEnum::Text(TextFrame::new("hello world")))
+            .await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            output.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), output.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match received.frame {
             FrameEnum::Text(text) => assert_eq!(text.text, "HELLO WORLD"),
@@ -849,15 +857,14 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
-        pipeline.send(FrameEnum::Text(TextFrame::new("chain test"))).await;
+        pipeline
+            .send(FrameEnum::Text(TextFrame::new("chain test")))
+            .await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            output.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(200), output.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match received.frame {
             FrameEnum::Text(text) => assert_eq!(text.text, "CHAIN TEST"),
@@ -869,21 +876,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_priority_system_frame() {
-        let procs: Vec<Box<dyn Processor>> =
-            vec![Box::new(PassthroughProc::new(1, "PT"))];
+        let procs: Vec<Box<dyn Processor>> = vec![Box::new(PassthroughProc::new(1, "PT"))];
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
         // End frame is a control frame (routed through unbounded priority channel)
         pipeline.send(FrameEnum::End(EndFrame::new())).await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            output.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), output.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         assert!(matches!(received.frame, FrameEnum::End(_)));
 
@@ -898,8 +901,7 @@ mod tests {
     /// FIFO ordering and defeating incremental LLM-to-TTS streaming.
     #[tokio::test]
     async fn test_llm_token_ordering_preserved() {
-        let procs: Vec<Box<dyn Processor>> =
-            vec![Box::new(PassthroughProc::new(1, "PT"))];
+        let procs: Vec<Box<dyn Processor>> = vec![Box::new(PassthroughProc::new(1, "PT"))];
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
@@ -922,13 +924,11 @@ mod tests {
             "LLMFullResponseEndFrame",
         ];
         for expected_name in &expected_names {
-            let received = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                output.recv(),
-            )
-            .await
-            .expect("timeout waiting for frame")
-            .expect("channel closed");
+            let received =
+                tokio::time::timeout(std::time::Duration::from_millis(200), output.recv())
+                    .await
+                    .expect("timeout waiting for frame")
+                    .expect("channel closed");
 
             assert_eq!(
                 received.frame.name(),
@@ -944,8 +944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancellation() {
-        let procs: Vec<Box<dyn Processor>> =
-            vec![Box::new(PassthroughProc::new(1, "PT"))];
+        let procs: Vec<Box<dyn Processor>> = vec![Box::new(PassthroughProc::new(1, "PT"))];
         let pipeline = ChannelPipeline::new(procs);
 
         assert!(!pipeline.cancel_token().is_cancelled());
@@ -968,13 +967,11 @@ mod tests {
         }
 
         for i in 0..5 {
-            let received = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                output.recv(),
-            )
-            .await
-            .expect("timeout")
-            .expect("channel closed");
+            let received =
+                tokio::time::timeout(std::time::Duration::from_millis(200), output.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("channel closed");
 
             match received.frame {
                 FrameEnum::Text(text) => {
@@ -1037,15 +1034,14 @@ mod tests {
         let mut pipeline = ChannelPipeline::new(procs);
         let mut upstream = pipeline.take_upstream().unwrap();
 
-        pipeline.send(FrameEnum::Text(TextFrame::new("upstream test"))).await;
+        pipeline
+            .send(FrameEnum::Text(TextFrame::new("upstream test")))
+            .await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            upstream.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), upstream.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match received.frame {
             FrameEnum::Text(text) => assert_eq!(text.text, "upstream test"),
@@ -1070,13 +1066,23 @@ mod tests {
         let (tx, mut rx) = priority_channel(64);
 
         // Send a mix of data and uninterruptible frames
-        tx.send(FrameEnum::Text(TextFrame::new("discard me")), FrameDirection::Downstream).await;
-        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream).await;
-        tx.send(FrameEnum::Text(TextFrame::new("discard too")), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::Text(TextFrame::new("discard me")),
+            FrameDirection::Downstream,
+        )
+        .await;
+        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream)
+            .await;
+        tx.send(
+            FrameEnum::Text(TextFrame::new("discard too")),
+            FrameDirection::Downstream,
+        )
+        .await;
         tx.send(
             FrameEnum::Error(crate::frames::ErrorFrame::new("keep me", false)),
             FrameDirection::Downstream,
-        ).await;
+        )
+        .await;
 
         // Give channels time to deliver
         tokio::task::yield_now().await;
@@ -1084,7 +1090,11 @@ mod tests {
         let (preserved, discarded) = rx.drain_data_selective();
 
         assert_eq!(discarded, 2, "should discard 2 TextFrames");
-        assert_eq!(preserved.len(), 2, "should preserve EndFrame and ErrorFrame");
+        assert_eq!(
+            preserved.len(),
+            2,
+            "should preserve EndFrame and ErrorFrame"
+        );
 
         let names: Vec<&str> = preserved.iter().map(|p| p.frame.name()).collect();
         assert!(names.contains(&"EndFrame"));
@@ -1191,41 +1201,39 @@ mod tests {
         use crate::frames::InterruptionFrame;
 
         // Create a pipeline with a slow heavy processor (100 iterations = ~1s)
-        let procs: Vec<Box<dyn Processor>> = vec![
-            Box::new(SlowHeavyProc::new(100)),
-        ];
+        let procs: Vec<Box<dyn Processor>> = vec![Box::new(SlowHeavyProc::new(100))];
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
 
         // Send a text frame that will trigger the slow processing
-        pipeline.send(FrameEnum::Text(TextFrame::new("hello"))).await;
+        pipeline
+            .send(FrameEnum::Text(TextFrame::new("hello")))
+            .await;
 
         // Wait a bit for processing to start
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         // Send InterruptionFrame while process() is running
-        pipeline.send(FrameEnum::Interruption(InterruptionFrame::new())).await;
+        pipeline
+            .send(FrameEnum::Interruption(InterruptionFrame::new()))
+            .await;
 
         // Collect output frames with a timeout
         let mut received_frames = Vec::new();
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                output.recv(),
-            ).await {
-                Ok(Some(directed)) => {
-                    received_frames.push(directed.frame);
-                    // Stop after seeing the interruption frame
-                    if matches!(received_frames.last(), Some(FrameEnum::Interruption(_))) {
-                        break;
-                    }
-                }
-                _ => break,
+        while let Ok(Some(directed)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), output.recv()).await
+        {
+            received_frames.push(directed.frame);
+            // Stop after seeing the interruption frame
+            if matches!(received_frames.last(), Some(FrameEnum::Interruption(_))) {
+                break;
             }
         }
 
         // Verify we got the InterruptionFrame (it was dispatched after interruption)
-        let has_interruption = received_frames.iter().any(|f| matches!(f, FrameEnum::Interruption(_)));
+        let has_interruption = received_frames
+            .iter()
+            .any(|f| matches!(f, FrameEnum::Interruption(_)));
         assert!(
             has_interruption,
             "InterruptionFrame should be forwarded through the pipeline"
@@ -1250,7 +1258,7 @@ mod tests {
     async fn test_heavy_processor_normal_completion() {
         // Verify Heavy processors still work normally without interruption
         let procs: Vec<Box<dyn Processor>> = vec![
-            Box::new(SlowHeavyProc::new(3)),  // 3 iterations = ~30ms
+            Box::new(SlowHeavyProc::new(3)), // 3 iterations = ~30ms
         ];
         let mut pipeline = ChannelPipeline::new(procs);
         let mut output = pipeline.take_output().unwrap();
@@ -1259,14 +1267,10 @@ mod tests {
 
         // Collect all output
         let mut received = Vec::new();
-        loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                output.recv(),
-            ).await {
-                Ok(Some(directed)) => received.push(directed.frame),
-                _ => break,
-            }
+        while let Ok(Some(directed)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), output.recv()).await
+        {
+            received.push(directed.frame);
         }
 
         // Should get all 3 tokens
@@ -1293,14 +1297,18 @@ mod tests {
         assert!(tx.is_flushing());
 
         // Send a data frame (TextFrame is Data kind)
-        tx.send(FrameEnum::Text(TextFrame::new("should be dropped")), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::Text(TextFrame::new("should be dropped")),
+            FrameDirection::Downstream,
+        )
+        .await;
 
         // The data frame should NOT be received (channel should be empty)
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_err(), "Data frame should have been dropped during flush, but was received");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Data frame should have been dropped during flush, but was received"
+        );
     }
 
     #[tokio::test]
@@ -1317,14 +1325,15 @@ mod tests {
         tx.send(
             FrameEnum::Interruption(InterruptionFrame::new()),
             FrameDirection::Downstream,
-        ).await;
+        )
+        .await;
 
         // The system frame SHOULD be received even during flush
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_ok(), "System frame should pass through during flush");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "System frame should pass through during flush"
+        );
         let directed = result.unwrap().expect("channel should not be closed");
         assert!(
             matches!(directed.frame, FrameEnum::Interruption(_)),
@@ -1339,25 +1348,33 @@ mod tests {
 
         // Phase 1: flush is active — data frames are dropped
         tx.start_flush();
-        tx.send(FrameEnum::Text(TextFrame::new("dropped")), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::Text(TextFrame::new("dropped")),
+            FrameDirection::Downstream,
+        )
+        .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_err(), "Data frame should be dropped while flushing");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Data frame should be dropped while flushing"
+        );
 
         // Phase 2: stop flush — data frames flow normally
         tx.stop_flush();
         assert!(!tx.is_flushing());
 
-        tx.send(FrameEnum::Text(TextFrame::new("hello")), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::Text(TextFrame::new("hello")),
+            FrameDirection::Downstream,
+        )
+        .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_ok(), "Data frame should flow after flush is stopped");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "Data frame should flow after flush is stopped"
+        );
         let directed = result.unwrap().expect("channel should not be closed");
         match directed.frame {
             FrameEnum::Text(text) => assert_eq!(text.text, "hello"),
@@ -1367,7 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_priority_sender_flush_preserves_uninterruptible_data() {
-        use crate::frames::{FunctionCallResultFrame, ErrorFrame};
+        use crate::frames::{ErrorFrame, FunctionCallResultFrame};
 
         let (tx, mut rx) = priority_channel(64);
         tx.start_flush();
@@ -1380,13 +1397,17 @@ mod tests {
             serde_json::json!({"arg": "val"}),
             serde_json::json!({"status": "ok"}),
         );
-        tx.send(FrameEnum::FunctionCallResult(result_frame), FrameDirection::Downstream).await;
+        tx.send(
+            FrameEnum::FunctionCallResult(result_frame),
+            FrameDirection::Downstream,
+        )
+        .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_ok(), "Uninterruptible data frame must NOT be dropped during flush");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "Uninterruptible data frame must NOT be dropped during flush"
+        );
 
         // ErrorFrame is FrameKind::System, so it takes the priority channel
         // path and bypasses the flush gate entirely (same as StartFrame, etc.).
@@ -1394,20 +1415,25 @@ mod tests {
         tx.send(
             FrameEnum::Error(ErrorFrame::new("test error", false)),
             FrameDirection::Downstream,
-        ).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_ok(), "System-kind ErrorFrame must pass through during flush");
+        )
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "System-kind ErrorFrame must pass through during flush"
+        );
 
         // Regular data frame should still be dropped.
-        tx.send(FrameEnum::Text(TextFrame::new("should drop")), FrameDirection::Downstream).await;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_err(), "Regular data frame should be dropped during flush");
+        tx.send(
+            FrameEnum::Text(TextFrame::new("should drop")),
+            FrameDirection::Downstream,
+        )
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "Regular data frame should be dropped during flush"
+        );
     }
 
     #[tokio::test]
@@ -1416,13 +1442,14 @@ mod tests {
         tx.start_flush();
 
         // EndFrame is FrameKind::Control — must pass through during flush.
-        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream).await;
+        tx.send(FrameEnum::End(EndFrame::new()), FrameDirection::Downstream)
+            .await;
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-        assert!(result.is_ok(), "Control frame should pass through during flush");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            result.is_ok(),
+            "Control frame should pass through during flush"
+        );
         assert!(matches!(result.unwrap().unwrap().frame, FrameEnum::End(_)));
     }
 
@@ -1487,13 +1514,10 @@ mod tests {
         // Send a TextFrame to trigger the panic
         pipeline.send(FrameEnum::Text(TextFrame::new("boom"))).await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            output.recv(),
-        )
-        .await
-        .expect("timeout waiting for error frame")
-        .expect("channel closed unexpectedly");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), output.recv())
+            .await
+            .expect("timeout waiting for error frame")
+            .expect("channel closed unexpectedly");
 
         match received.frame {
             FrameEnum::Error(err) => {
@@ -1525,13 +1549,10 @@ mod tests {
         // Send a TextFrame to trigger the panic
         pipeline.send(FrameEnum::Text(TextFrame::new("boom"))).await;
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            output.recv(),
-        )
-        .await
-        .expect("timeout waiting for error frame")
-        .expect("channel closed unexpectedly");
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), output.recv())
+            .await
+            .expect("timeout waiting for error frame")
+            .expect("channel closed unexpectedly");
 
         match received.frame {
             FrameEnum::Error(err) => {

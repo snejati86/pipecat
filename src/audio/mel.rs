@@ -141,10 +141,7 @@ impl MelSpectrogram {
             fft.process(&mut fft_buffer);
 
             // Power spectrum: |STFT|^2
-            let power: Vec<f32> = fft_buffer[..n_freqs]
-                .iter()
-                .map(|c| c.norm_sqr())
-                .collect();
+            let power: Vec<f32> = fft_buffer[..n_freqs].iter().map(|c| c.norm_sqr()).collect();
 
             // Apply mel filterbank
             for (mel_idx, filter) in self.filterbank.iter().enumerate() {
@@ -270,7 +267,8 @@ mod tests {
         let result = mel.compute_padded(&audio);
         assert_eq!(result.dim(), (N_MELS, MAX_FRAMES));
         // Later frames should be zero (padding)
-        assert!(result[[0, MAX_FRAMES - 1]].abs() < 0.01 || true); // padded region
+        // Padded region — later frames should be near zero but exact values
+        // depend on FFT windowing, so we just check it didn't panic above.
     }
 
     #[test]

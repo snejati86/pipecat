@@ -87,7 +87,6 @@ impl fmt::Display for ExtensionFrame {
 #[derive(Debug)]
 pub enum FrameEnum {
     // ===================== SYSTEM FRAMES =====================
-
     /// Initial frame to start pipeline processing.
     Start(StartFrame),
     /// Pipeline cancellation request.
@@ -156,7 +155,6 @@ pub enum FrameEnum {
     InterruptionTask(InterruptionTaskFrame),
 
     // ===================== DATA FRAMES =====================
-
     /// Text data.
     Text(TextFrame),
     /// LLM-generated text.
@@ -195,7 +193,6 @@ pub enum FrameEnum {
     Sprite(SpriteFrame),
 
     // ===================== CONTROL FRAMES =====================
-
     /// Graceful pipeline shutdown (uninterruptible).
     End(EndFrame),
     /// Stop pipeline, keep processors running (uninterruptible).
@@ -238,12 +235,10 @@ pub enum FrameEnum {
     ServiceSwitcher(ServiceSwitcherFrame),
 
     // ===================== TEST FRAMES =====================
-
     /// Test-only: insert delay between frames.
     Sleep(SleepFrame),
 
     // ===================== EXTENSION =====================
-
     /// Third-party extension frame.
     Extension(ExtensionFrame),
 }
@@ -582,30 +577,80 @@ impl FrameEnum {
         if matches!(self, FrameEnum::Extension(_)) {
             return Arc::new(self) as Arc<dyn Frame>;
         }
-        into_arc_match!(self,
-            Start, Cancel, Error, FatalError, Interruption,
-            UserStartedSpeaking, UserStoppedSpeaking, UserSpeaking,
-            BotStartedSpeaking, BotStoppedSpeaking, BotSpeaking,
-            UserMuteStarted, UserMuteStopped, Metrics, STTMute,
-            InputAudioRaw, InputImageRaw, InputTextRaw,
-            VADUserStartedSpeaking, VADUserStoppedSpeaking,
-            FunctionCallsStarted, FunctionCallCancel,
-            InputTransportMessage, OutputTransportMessageUrgent,
-            UserImageRequest, ServiceMetadata, STTMetadata,
-            SpeechControlParams, Task, EndTask, CancelTask, StopTask, InterruptionTask,
-            Text, LLMText, OutputAudioRaw, TTSAudioRaw, OutputImageRaw,
-            Transcription, InterimTranscription, FunctionCallResult,
-            TTSSpeak, OutputTransportMessage,
-            LLMMessagesAppend, LLMMessagesUpdate, LLMSetTools, LLMRun,
-            LLMConfigureOutput, LLMEnablePromptCaching, OutputDTMF, Sprite,
-            End, Stop, Heartbeat,
-            LLMFullResponseStart, LLMFullResponseEnd,
-            TTSStarted, TTSStopped,
-            LLMUpdateSettings, TTSUpdateSettings, STTUpdateSettings,
-            VADParamsUpdate, FilterControl, FilterEnable,
-            MixerControl, MixerEnable, OutputTransportReady,
-            LLMContextSummaryRequest, LLMContextSummaryResult,
-            FunctionCallInProgress, ServiceSwitcher, Sleep,
+        into_arc_match!(
+            self,
+            Start,
+            Cancel,
+            Error,
+            FatalError,
+            Interruption,
+            UserStartedSpeaking,
+            UserStoppedSpeaking,
+            UserSpeaking,
+            BotStartedSpeaking,
+            BotStoppedSpeaking,
+            BotSpeaking,
+            UserMuteStarted,
+            UserMuteStopped,
+            Metrics,
+            STTMute,
+            InputAudioRaw,
+            InputImageRaw,
+            InputTextRaw,
+            VADUserStartedSpeaking,
+            VADUserStoppedSpeaking,
+            FunctionCallsStarted,
+            FunctionCallCancel,
+            InputTransportMessage,
+            OutputTransportMessageUrgent,
+            UserImageRequest,
+            ServiceMetadata,
+            STTMetadata,
+            SpeechControlParams,
+            Task,
+            EndTask,
+            CancelTask,
+            StopTask,
+            InterruptionTask,
+            Text,
+            LLMText,
+            OutputAudioRaw,
+            TTSAudioRaw,
+            OutputImageRaw,
+            Transcription,
+            InterimTranscription,
+            FunctionCallResult,
+            TTSSpeak,
+            OutputTransportMessage,
+            LLMMessagesAppend,
+            LLMMessagesUpdate,
+            LLMSetTools,
+            LLMRun,
+            LLMConfigureOutput,
+            LLMEnablePromptCaching,
+            OutputDTMF,
+            Sprite,
+            End,
+            Stop,
+            Heartbeat,
+            LLMFullResponseStart,
+            LLMFullResponseEnd,
+            TTSStarted,
+            TTSStopped,
+            LLMUpdateSettings,
+            TTSUpdateSettings,
+            STTUpdateSettings,
+            VADParamsUpdate,
+            FilterControl,
+            FilterEnable,
+            MixerControl,
+            MixerEnable,
+            OutputTransportReady,
+            LLMContextSummaryRequest,
+            LLMContextSummaryResult,
+            FunctionCallInProgress,
+            ServiceSwitcher,
+            Sleep,
         )
     }
 
@@ -825,7 +870,10 @@ impl_from_frame!(VADUserStoppedSpeaking, VADUserStoppedSpeakingFrame);
 impl_from_frame!(FunctionCallsStarted, FunctionCallsStartedFrame);
 impl_from_frame!(FunctionCallCancel, FunctionCallCancelFrame);
 impl_from_frame!(InputTransportMessage, InputTransportMessageFrame);
-impl_from_frame!(OutputTransportMessageUrgent, OutputTransportMessageUrgentFrame);
+impl_from_frame!(
+    OutputTransportMessageUrgent,
+    OutputTransportMessageUrgentFrame
+);
 impl_from_frame!(UserImageRequest, UserImageRequestFrame);
 impl_from_frame!(ServiceMetadata, ServiceMetadataFrame);
 impl_from_frame!(STTMetadata, STTMetadataFrame);
@@ -1033,8 +1081,7 @@ mod tests {
     fn test_frame_enum_metadata_via_trait() {
         let mut frame_enum = FrameEnum::from(TextFrame::new("meta"));
         // Use Frame trait methods to set metadata
-        Frame::metadata_mut(&mut frame_enum)
-            .insert("key".to_string(), serde_json::json!("value"));
+        Frame::metadata_mut(&mut frame_enum).insert("key".to_string(), serde_json::json!("value"));
         assert_eq!(Frame::metadata(&frame_enum).len(), 1);
     }
 
@@ -1118,21 +1165,19 @@ mod tests {
         assert_eq!(*ext.data.downcast_ref::<u64>().unwrap(), 99);
 
         // Builder: set kind to Data
-        let ext_data = ExtensionFrame::new(Box::new("payload"), "DataExt")
-            .with_kind(FrameKind::Data);
+        let ext_data =
+            ExtensionFrame::new(Box::new("payload"), "DataExt").with_kind(FrameKind::Data);
         let frame = FrameEnum::from(ext_data);
         assert!(frame.is_data_frame());
         assert!(!frame.is_uninterruptible());
 
         // Builder: set kind to System
-        let ext_sys = ExtensionFrame::new(Box::new(true), "SysExt")
-            .with_kind(FrameKind::System);
+        let ext_sys = ExtensionFrame::new(Box::new(true), "SysExt").with_kind(FrameKind::System);
         let frame = FrameEnum::from(ext_sys);
         assert!(frame.is_system_frame());
 
         // Builder: set uninterruptible
-        let ext_unint = ExtensionFrame::new(Box::new(0u8), "UnintExt")
-            .with_uninterruptible(true);
+        let ext_unint = ExtensionFrame::new(Box::new(0u8), "UnintExt").with_uninterruptible(true);
         let frame = FrameEnum::from(ext_unint);
         assert!(frame.is_uninterruptible());
         assert!(frame.is_control_frame()); // kind still defaults to Control
@@ -1244,7 +1289,7 @@ mod tests {
     fn test_try_from_arc_multi_ref_fails() {
         let arc_frame: Arc<dyn Frame> = Arc::new(TextFrame::new("shared"));
         let _clone = arc_frame.clone(); // Creates second reference
-        // try_from_arc requires sole ownership
+                                        // try_from_arc requires sole ownership
         assert!(FrameEnum::try_from_arc(arc_frame).is_none());
     }
 

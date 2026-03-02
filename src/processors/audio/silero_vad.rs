@@ -104,10 +104,7 @@ impl SileroVADProcessor {
                                 VADUserStartedSpeakingFrame::new(start_secs, ts),
                             ));
 
-                            tracing::debug!(
-                                "SileroVAD: speech started (prob={:.3})",
-                                probability
-                            );
+                            tracing::debug!("SileroVAD: speech started (prob={:.3})", probability);
                         }
                         VADEvent::SpeechStopped => {
                             let ts = Self::current_timestamp();
@@ -120,10 +117,7 @@ impl SileroVADProcessor {
                                 VADUserStoppedSpeakingFrame::new(stop_secs, ts),
                             ));
 
-                            tracing::debug!(
-                                "SileroVAD: speech stopped (prob={:.3})",
-                                probability
-                            );
+                            tracing::debug!("SileroVAD: speech stopped (prob={:.3})", probability);
                         }
                         VADEvent::None => {}
                     }

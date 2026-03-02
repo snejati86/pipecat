@@ -137,11 +137,7 @@ impl SileroVAD {
 
         // Extract output probability
         let output_array = outputs["output"].try_extract_array::<f32>()?;
-        let probability = output_array
-            .iter()
-            .next()
-            .copied()
-            .unwrap_or(0.0);
+        let probability = output_array.iter().next().copied().unwrap_or(0.0);
 
         // Extract updated LSTM state — output name is "stateN"
         let new_state_array = outputs["stateN"].try_extract_array::<f32>()?;

@@ -36,8 +36,8 @@ use tracing;
 
 use crate::frames::frame_enum::FrameEnum;
 use crate::frames::{
-    ErrorFrame, InterimTranscriptionFrame, TranscriptionFrame,
-    UserStartedSpeakingFrame, UserStoppedSpeakingFrame,
+    ErrorFrame, InterimTranscriptionFrame, TranscriptionFrame, UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 };
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
@@ -131,7 +131,6 @@ struct DgError {
     message: Option<String>,
     variant: Option<String>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Type aliases for the WebSocket split halves
@@ -472,20 +471,18 @@ impl DeepgramSTTService {
         let msg_type = envelope.msg_type.as_deref().unwrap_or("");
 
         match msg_type {
-            "Results" => {
-                match serde_json::from_str::<DgResult>(text) {
-                    Ok(result) => {
-                        Self::handle_transcription_result(result, text, frame_tx, user_id);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "DeepgramSTTService: failed to parse Results message: {}: {}",
-                            e,
-                            text,
-                        );
-                    }
+            "Results" => match serde_json::from_str::<DgResult>(text) {
+                Ok(result) => {
+                    Self::handle_transcription_result(result, text, frame_tx, user_id);
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(
+                        "DeepgramSTTService: failed to parse Results message: {}: {}",
+                        e,
+                        text,
+                    );
+                }
+            },
             "SpeechStarted" => {
                 if vad_events {
                     tracing::debug!("DeepgramSTTService: speech started event");
@@ -745,10 +742,7 @@ impl Processor for DeepgramSTTService {
                     let mut sink = sender.lock().await;
                     // Take ownership of the audio bytes — no clone needed since
                     // STT consumes the frame (not forwarded downstream).
-                    if let Err(e) = sink
-                        .send(Message::Binary(audio_frame.audio.audio))
-                        .await
-                    {
+                    if let Err(e) = sink.send(Message::Binary(audio_frame.audio.audio)).await {
                         tracing::error!("DeepgramSTTService: failed to send audio: {}", e);
                         // Drop the sink lock and clear ws_sender so next frame triggers reconnect.
                         drop(sink);

@@ -109,7 +109,10 @@ impl SmartTurnProcessor {
 
     /// Release the pending stop frame and all held frames downstream.
     fn release_pending(&mut self, ctx: &ProcessorContext) {
-        tracing::debug!(held_frames = self.held_frames.len(), "SmartTurn: releasing pending stop");
+        tracing::debug!(
+            held_frames = self.held_frames.len(),
+            "SmartTurn: releasing pending stop"
+        );
         if let Some(stop_frame) = self.pending_stop.take() {
             ctx.send_downstream(FrameEnum::UserStoppedSpeaking(stop_frame));
         }
@@ -294,7 +297,10 @@ impl Processor for SmartTurnProcessor {
                     // Hold the frame and run inference
                     self.pending_stop = Some(stop_frame);
                     self.stop_received_at = Some(Instant::now());
-                    tracing::debug!(audio_samples = self.audio_buffer.len(), "SmartTurn: holding UserStoppedSpeaking");
+                    tracing::debug!(
+                        audio_samples = self.audio_buffer.len(),
+                        "SmartTurn: holding UserStoppedSpeaking"
+                    );
 
                     // Run immediate inference on current audio buffer
                     self.check_pending(ctx).await;

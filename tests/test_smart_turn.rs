@@ -56,7 +56,10 @@ fn test_mel_spectrogram_sine_wave() {
     assert_eq!(result.dim().0, 80);
     assert!(result.dim().1 > 0);
     let max_val = result.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    assert!(max_val > -1.0, "Sine wave should produce non-trivial mel values");
+    assert!(
+        max_val > -1.0,
+        "Sine wave should produce non-trivial mel values"
+    );
 }
 
 #[test]
@@ -120,11 +123,7 @@ mod processor_tests {
         proc.process(start, FrameDirection::Downstream, &ctx).await;
         let _ = drx.recv().await;
 
-        let audio = FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
-            vec![0u8; 640],
-            16000,
-            1,
-        ));
+        let audio = FrameEnum::InputAudioRaw(InputAudioRawFrame::new(vec![0u8; 640], 16000, 1));
         proc.process(audio, FrameDirection::Downstream, &ctx).await;
 
         let received = drx.recv().await.unwrap();

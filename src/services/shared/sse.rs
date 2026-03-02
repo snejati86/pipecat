@@ -198,15 +198,21 @@ mod tests {
              data: {\"no_event\":true}\n\n",
         );
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].clone(), SseEvent::Data {
-            event_type: Some("ping".to_string()),
-            data: "{}".to_string(),
-        });
+        assert_eq!(
+            events[0].clone(),
+            SseEvent::Data {
+                event_type: Some("ping".to_string()),
+                data: "{}".to_string(),
+            }
+        );
         // After the empty line, event type should be None.
-        assert_eq!(events[1].clone(), SseEvent::Data {
-            event_type: None,
-            data: "{\"no_event\":true}".to_string(),
-        });
+        assert_eq!(
+            events[1].clone(),
+            SseEvent::Data {
+                event_type: None,
+                data: "{\"no_event\":true}".to_string(),
+            }
+        );
     }
 
     #[test]

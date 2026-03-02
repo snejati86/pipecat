@@ -249,10 +249,7 @@ pub trait LlmProtocol: Send + Sync + 'static {
     }
 
     /// Parse a streaming SSE data payload into a chunk.
-    fn parse_streaming_data(
-        &self,
-        data: &str,
-    ) -> Result<ChatCompletionChunk, serde_json::Error> {
+    fn parse_streaming_data(&self, data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
         serde_json::from_str(data)
     }
 
@@ -285,11 +282,7 @@ pub trait LlmProtocol: Send + Sync + 'static {
     }
 
     /// Format the tool result message.
-    fn format_tool_result_message(
-        &self,
-        tool_call_id: &str,
-        result: &str,
-    ) -> serde_json::Value {
+    fn format_tool_result_message(&self, tool_call_id: &str, result: &str) -> serde_json::Value {
         serde_json::json!({
             "role": "tool",
             "tool_call_id": tool_call_id,

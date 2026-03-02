@@ -65,11 +65,7 @@ impl<P: LlmProtocol> GenericLlmService<P> {
         } else {
             model
         };
-        let name = format!(
-            "{}LLMService({})",
-            protocol.service_name(),
-            model
-        );
+        let name = format!("{}LLMService({})", protocol.service_name(), model);
 
         Self {
             id: crate::utils::base_object::obj_id(),
@@ -117,9 +113,7 @@ impl<P: LlmProtocol> GenericLlmService<P> {
 
     /// Execute a streaming chat-completion call and send resulting frames via context.
     async fn process_streaming_response(&mut self, ctx: &ProcessorContext) {
-        let url = self
-            .protocol
-            .streaming_url(&self.base_url, &self.model);
+        let url = self.protocol.streaming_url(&self.base_url, &self.model);
         let body = self.protocol.build_streaming_body(
             &self.model,
             &self.messages,
@@ -256,10 +250,7 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                         model: Some(self.model.clone()),
                     };
 
-                    ctx.send_downstream(FrameEnum::Metrics(MetricsFrame::new(vec![
-                        metrics_data,
-                    ])));
-
+                    ctx.send_downstream(FrameEnum::Metrics(MetricsFrame::new(vec![metrics_data])));
                 }
 
                 // Skip chunks with no choices.
@@ -336,11 +327,9 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                 "tool call functions/tool_ids length mismatch"
             );
             let mut function_calls = Vec::with_capacity(functions.len());
-            for ((name, args_str), tool_id) in
-                functions.into_iter().zip(arguments).zip(tool_ids)
-            {
-                let parsed_args: serde_json::Value =
-                    serde_json::from_str(&args_str).unwrap_or_else(|e| {
+            for ((name, args_str), tool_id) in functions.into_iter().zip(arguments).zip(tool_ids) {
+                let parsed_args: serde_json::Value = serde_json::from_str(&args_str)
+                    .unwrap_or_else(|e| {
                         warn!(error = %e, raw = %args_str, "Failed to parse tool call arguments");
                         serde_json::Value::Object(serde_json::Map::new())
                     });
@@ -353,19 +342,18 @@ impl<P: LlmProtocol> GenericLlmService<P> {
                 });
             }
 
-            debug!(count = function_calls.len(), "Emitting FunctionCallsStartedFrame");
+            debug!(
+                count = function_calls.len(),
+                "Emitting FunctionCallsStartedFrame"
+            );
             ctx.send_downstream(FrameEnum::FunctionCallsStarted(
                 FunctionCallsStartedFrame::new(function_calls),
             ));
-
         }
 
         // --- Emit response-end frame ---
         tracing::debug!("LLM response stream complete");
-        ctx.send_downstream(FrameEnum::LLMFullResponseEnd(
-            LLMFullResponseEndFrame::new(),
-        ));
-
+        ctx.send_downstream(FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()));
     }
 }
 
@@ -456,10 +444,10 @@ impl<P: LlmProtocol> Processor for GenericLlmService<P> {
                     &r.function_name,
                     &r.arguments.to_string(),
                 ));
-                self.messages.push(self.protocol.format_tool_result_message(
-                    &r.tool_call_id,
-                    &r.result.to_string(),
-                ));
+                self.messages.push(
+                    self.protocol
+                        .format_tool_result_message(&r.tool_call_id, &r.result.to_string()),
+                );
 
                 debug!(
                     function = %r.function_name,
@@ -518,9 +506,7 @@ impl<P: LlmProtocol> AIService for GenericLlmService<P> {
 #[async_trait]
 impl<P: LlmProtocol> LLMService for GenericLlmService<P> {
     async fn run_inference(&mut self, messages: &[serde_json::Value]) -> Option<String> {
-        let url = self
-            .protocol
-            .inference_url(&self.base_url, &self.model);
+        let url = self.protocol.inference_url(&self.base_url, &self.model);
         let body = self.protocol.build_inference_body(
             &self.model,
             messages,

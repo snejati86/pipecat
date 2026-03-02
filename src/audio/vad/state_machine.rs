@@ -182,8 +182,7 @@ impl VADStateMachine {
             );
             self.prev_volume = volume;
 
-            let speaking =
-                confidence >= self.params.confidence && volume >= self.params.min_volume;
+            let speaking = confidence >= self.params.confidence && volume >= self.params.min_volume;
 
             self.advance_state(speaking);
         }
@@ -373,7 +372,7 @@ mod tests {
         assert!(sm.is_initialized());
         // 16000 / 100 = 160 samples per 10 ms window.
         assert_eq!(sm.vad_frames, 160);
-        assert_eq!(sm.vad_frames_num_bytes, 160 * 1 * 2); // 320 bytes
+        assert_eq!(sm.vad_frames_num_bytes, 160 * 2); // 320 bytes
         assert!(sm.vad_start_frames > 0);
         assert!(sm.vad_stop_frames > 0);
     }

@@ -144,8 +144,7 @@ mod tests {
 
     #[test]
     fn test_http_referer_builder() {
-        let svc =
-            OpenRouterLLMService::new("key", "model").with_http_referer("https://myapp.com");
+        let svc = OpenRouterLLMService::new("key", "model").with_http_referer("https://myapp.com");
         assert_eq!(
             svc.protocol.http_referer,
             Some("https://myapp.com".to_string())
@@ -181,10 +180,7 @@ mod tests {
             transforms: Some(vec!["middle-out".to_string()]),
         };
         let body = protocol.build_streaming_body("model", &[], &None, &None, None, None);
-        assert_eq!(
-            body["provider"],
-            serde_json::json!({"order": ["OpenAI"]})
-        );
+        assert_eq!(body["provider"], serde_json::json!({"order": ["OpenAI"]}));
         assert_eq!(body["transforms"], serde_json::json!(["middle-out"]));
         assert_eq!(body["stream"], serde_json::json!(true));
         // http_referer and x_title are headers, not body fields

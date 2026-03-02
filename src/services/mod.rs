@@ -22,25 +22,6 @@ pub mod together;
 
 pub mod elevenlabs;
 
-// Legacy FrameProcessor services -- commented out until migrated to new Processor API:
-// pub mod anthropic;
-// pub mod assemblyai;
-// pub mod aws_polly;
-// pub mod azure;
-// pub mod deepseek;
-// pub mod gladia;
-// pub mod google;
-// pub mod google_stt;
-// pub mod google_tts;
-// pub mod hume;
-// pub mod kokoro;
-// pub mod lmnt;
-// pub mod neuphonic;
-// pub mod ollama;
-// pub mod piper;
-// pub mod rime;
-// pub mod whisper;
-
 use async_trait::async_trait;
 
 use crate::frames::FrameEnum;

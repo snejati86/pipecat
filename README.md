@@ -13,7 +13,7 @@ See [GETTING_STARTED.md](GETTING_STARTED.md) for the full developer onboarding g
 
 ## Architecture
 
-All data flows as `Arc<dyn Frame>` objects through a chain of `FrameProcessor` trait objects:
+All data flows as `FrameEnum` values through a chain of `Processor` trait objects, connected by priority channels:
 
 ```
 [Source] → [Processor1] → [Processor2] → ... → [Sink]
@@ -21,59 +21,66 @@ All data flows as `Arc<dyn Frame>` objects through a chain of `FrameProcessor` t
            ←──────────── upstream ─────────────
 ```
 
-**Downstream** carries content (audio, text, images) from input to output.
-**Upstream** carries acknowledgments, errors, and feedback from output to input.
+Each processor runs as an independent tokio task. **Downstream** carries content (audio, text, images) from input to output. **Upstream** carries acknowledgments, errors, and feedback from output to input.
 
 ### Core Concepts
 
 | Concept | Type | Purpose |
 |---------|------|---------|
-| Frame | `Arc<dyn Frame>` | Unit of data flowing through the pipeline |
-| FrameProcessor | `Arc<Mutex<dyn FrameProcessor>>` | Receives, transforms, and pushes frames |
-| Pipeline | `Pipeline` | Chains processors into a linear sequence |
-| PipelineTask | `PipelineTask` | Manages lifecycle (start, run, stop) of a pipeline |
-| PipelineRunner | `PipelineRunner` | Top-level entry point for executing tasks |
-| Observer | `Arc<dyn Observer>` | Monitors frame flow without modifying the pipeline |
+| Frame | `FrameEnum` | Unit of data flowing through the pipeline (70+ types) |
+| Processor | `dyn Processor` | Receives, transforms, and sends frames via context channels |
+| ChannelPipeline | `ChannelPipeline` | Chains processors with priority channels, each in its own tokio task |
+| ProcessorContext | `ProcessorContext` | Carries channel senders for `send_downstream()` / `send_upstream()` |
+| ProcessorWeight | `ProcessorWeight` | Categorizes processor cost (Light, Standard, Heavy) for scheduling |
+| Observer | `dyn Observer` | Monitors frame flow without modifying the pipeline |
 
 ## Hello World
 
 ```rust
-use std::sync::Arc;
 use async_trait::async_trait;
-use pipecat::frames::{Frame, TextFrame};
-use pipecat::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
-use pipecat::processors::{BaseProcessor, FrameDirection, FrameProcessor};
-use pipecat::impl_base_debug_display;
+use pipecat::prelude::*;
 
-struct UpperCase { base: BaseProcessor }
-
-impl UpperCase {
-    fn new() -> Self { Self { base: BaseProcessor::new(Some("UpperCase".into()), false) } }
+struct UpperCase {
+    id: u64,
+    name: String,
 }
 
-impl_base_debug_display!(UpperCase);
+impl UpperCase {
+    fn new() -> Self {
+        Self { id: obj_id(), name: "UpperCase".into() }
+    }
+}
+
+impl_processor!(UpperCase);
 
 #[async_trait]
-impl FrameProcessor for UpperCase {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+impl Processor for UpperCase {
+    fn name(&self) -> &str { &self.name }
+    fn id(&self) -> u64 { self.id }
 
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        if let Some(text) = frame.downcast_ref::<TextFrame>() {
-            self.push_frame(Arc::new(TextFrame::new(text.text.to_uppercase())), direction).await;
-        } else {
-            self.push_frame(frame, direction).await;
+    async fn process(&mut self, frame: FrameEnum, direction: FrameDirection, ctx: &ProcessorContext) {
+        match frame {
+            FrameEnum::Text(mut text) => {
+                text.text = text.text.to_uppercase();
+                ctx.send(FrameEnum::Text(text), direction);
+            }
+            other => ctx.send(other, direction),
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let pipeline = Pipeline::builder().with_processor(UpperCase::new()).build();
-    let task = PipelineTask::builder(pipeline).build();
-    task.queue_frame(Arc::new(TextFrame::new("hello world"))).await;
-    task.stop_when_done().await;
-    PipelineRunner::new().run(&task).await;
+    let mut pipeline = ChannelPipeline::new(vec![Box::new(UpperCase::new())]);
+    let mut output = pipeline.take_output().unwrap();
+
+    pipeline.send(FrameEnum::Text(TextFrame::new("hello world"))).await;
+
+    if let Some(directed) = output.recv().await {
+        println!("{:?}", directed.frame); // Text("HELLO WORLD")
+    }
+
+    pipeline.shutdown().await;
 }
 ```
 
@@ -86,6 +93,8 @@ async fn main() {
 | **Deepgram** | STT | `DeepgramSTTService::new(api_key)` |
 | **Cartesia** (WebSocket) | TTS | `CartesiaTTSService::new(api_key, voice_id)` |
 | **Cartesia** (HTTP) | TTS | `CartesiaHttpTTSService::new(api_key, voice_id)` |
+| **ElevenLabs** (WebSocket) | TTS | `ElevenLabsTTSService::new(api_key, voice_id)` |
+| **ElevenLabs** (HTTP) | TTS | `ElevenLabsHttpTTSService::new(api_key, voice_id)` |
 
 All services use the builder pattern:
 
@@ -101,16 +110,16 @@ let stt = DeepgramSTTService::new("key")
 | Module | Purpose |
 |--------|---------|
 | `frames` | 70+ frame types (text, audio, control signals) |
-| `processors` | FrameProcessor trait, filters, aggregators |
-| `pipeline` | Pipeline, PipelineTask, PipelineRunner |
-| `services` | AI service integrations (OpenAI, Deepgram, Cartesia) |
-| `transports` | WebSocket transport |
-| `serializers` | JSON frame serializer |
+| `processors` | Processor trait, aggregators, audio processors |
+| `pipeline` | ChannelPipeline orchestration |
+| `services` | AI service integrations (OpenAI, Deepgram, Cartesia, ElevenLabs) |
+| `session` | Telephony session management (Twilio, etc.) |
+| `serializers` | Frame serialization (JSON, Twilio, Vonage, etc.) |
 | `observers` | Pipeline monitoring |
-| `audio` | VAD, filters, mixers, turn detection |
+| `audio` | VAD, resampling, codec, mel spectrogram |
 | `turns` | User turn management strategies |
 | `metrics` | Telemetry data models |
-| `utils` | BaseObject, shared helpers |
+| `utils` | Object IDs, shared helpers |
 
 ## Project Structure
 
@@ -121,20 +130,23 @@ let stt = DeepgramSTTService::new("key")
 │   ├── lib.rs                  # Crate root
 │   ├── prelude.rs              # Common re-exports
 │   ├── frames/                 # 70+ frame types
-│   ├── processors/             # FrameProcessor + filters + aggregators
-│   ├── pipeline/               # Pipeline orchestration
+│   ├── processors/             # Processor trait + aggregators
+│   ├── pipeline/               # ChannelPipeline orchestration
 │   ├── services/               # AI service integrations
 │   │   ├── openai.rs           #   OpenAI LLM + TTS
 │   │   ├── deepgram.rs         #   Deepgram STT
-│   │   └── cartesia.rs         #   Cartesia TTS
-│   ├── transports/             # WebSocket transport
-│   ├── serializers/            # JSON frame serializer
+│   │   ├── cartesia.rs         #   Cartesia TTS
+│   │   └── elevenlabs.rs       #   ElevenLabs TTS
+│   ├── session/                # Telephony sessions (Twilio, etc.)
+│   ├── serializers/            # Frame serializers
 │   ├── observers/              # Pipeline monitoring
-│   ├── audio/                  # VAD, filters, mixers
+│   ├── audio/                  # VAD, resampling, codecs
 │   ├── turns/                  # Turn management
 │   ├── metrics/                # Telemetry
-│   └── utils/                  # BaseObject, helpers
-└── tests/                      # Integration tests
+│   └── utils/                  # Object IDs, helpers
+├── examples/                   # Working examples
+│   └── twilio_outbound.rs      #   Twilio outbound call bot
+└── benches/                    # Performance benchmarks
 ```
 
 ## License

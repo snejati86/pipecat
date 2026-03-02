@@ -64,9 +64,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing;
 
 use crate::frames::frame_enum::FrameEnum;
-use crate::frames::{
-    ErrorFrame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-};
+use crate::frames::{ErrorFrame, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame};
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
 use crate::services::{AIService, TTSService};
@@ -505,21 +503,19 @@ impl CartesiaTTSService {
             return Ok(());
         }
         // Take pipeline senders from PipelinePending state.
-        let (down_tx, up_tx) = match std::mem::replace(
-            &mut self.connection,
-            CartesiaConnection::Disconnected,
-        ) {
-            CartesiaConnection::PipelinePending { down_tx, up_tx } => (down_tx, up_tx),
-            CartesiaConnection::Pipeline { .. } | CartesiaConnection::Standalone { .. } => {
-                // Already connected -- should not reach here due to is_connected() guard.
-                return Ok(());
-            }
-            CartesiaConnection::Disconnected => {
-                return Err(
-                    "connect_pipeline called before pipeline senders captured".to_string(),
-                );
-            }
-        };
+        let (down_tx, up_tx) =
+            match std::mem::replace(&mut self.connection, CartesiaConnection::Disconnected) {
+                CartesiaConnection::PipelinePending { down_tx, up_tx } => (down_tx, up_tx),
+                CartesiaConnection::Pipeline { .. } | CartesiaConnection::Standalone { .. } => {
+                    // Already connected -- should not reach here due to is_connected() guard.
+                    return Ok(());
+                }
+                CartesiaConnection::Disconnected => {
+                    return Err(
+                        "connect_pipeline called before pipeline senders captured".to_string()
+                    );
+                }
+            };
 
         match self.open_websocket(down_tx.clone(), up_tx.clone()).await {
             Ok((ws_sender, ws_reader_task)) => {
@@ -766,9 +762,9 @@ impl CartesiaTTSService {
                                         "Sent queued TTS request"
                                     );
                                     {
-                                        let mut state = queue_state.lock().expect("queue_state poisoned");
-                                        state.current_context_id =
-                                            Some(req.context_id.clone());
+                                        let mut state =
+                                            queue_state.lock().expect("queue_state poisoned");
+                                        state.current_context_id = Some(req.context_id.clone());
                                     }
                                     let _ = down_tx.send(FrameEnum::TTSStarted(
                                         TTSStartedFrame::new(Some(req.context_id)),
@@ -778,7 +774,8 @@ impl CartesiaTTSService {
                                         service = %name,
                                         "Failed to send queued TTS request"
                                     );
-                                    let mut state = queue_state.lock().expect("queue_state poisoned");
+                                    let mut state =
+                                        queue_state.lock().expect("queue_state poisoned");
                                     state.in_flight = false;
                                     state.current_context_id = None;
                                 }
@@ -1174,7 +1171,9 @@ impl TTSService for CartesiaTTSService {
         }
 
         let mut frames: Vec<FrameEnum> = Vec::new();
-        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         // Poll standalone_rx until TTSStoppedFrame arrives.
         // Extract rx from the Standalone variant. If not in Standalone state
@@ -1207,7 +1206,9 @@ impl TTSService for CartesiaTTSService {
                         break;
                     }
                     if is_error {
-                        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
+                        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                            context_id.clone(),
+                        ))));
                         break;
                     }
                 }
@@ -1216,7 +1217,9 @@ impl TTSService for CartesiaTTSService {
                         "Reader channel closed unexpectedly".to_string(),
                         false,
                     )));
-                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                        context_id.clone(),
+                    ))));
                     break;
                 }
                 Err(_) => {
@@ -1224,7 +1227,9 @@ impl TTSService for CartesiaTTSService {
                         "TTS generation timed out after 30s".to_string(),
                         false,
                     )));
-                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id.clone()))));
+                    frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+                        context_id.clone(),
+                    ))));
                     break;
                 }
             }
@@ -1404,7 +1409,9 @@ impl CartesiaHttpTTSService {
         let ttfb_start = Instant::now();
 
         // Push TTSStartedFrame.
-        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(context_id.clone()))));
+        frames.push(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+            context_id.clone(),
+        ))));
 
         let response = self
             .client
@@ -1466,7 +1473,9 @@ impl CartesiaHttpTTSService {
         }
 
         // Push TTSStoppedFrame.
-        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(context_id))));
+        frames.push(FrameEnum::TTSStopped(TTSStoppedFrame::new(Some(
+            context_id,
+        ))));
 
         frames
     }

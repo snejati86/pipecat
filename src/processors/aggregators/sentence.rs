@@ -178,12 +178,8 @@ impl Processor for SentenceAggregator {
                     let remaining = std::mem::take(&mut self.aggregation);
                     tracing::debug!(text = %remaining, "Sentence: flushing on response end");
                     ctx.send_downstream(FrameEnum::Text(TextFrame::new(remaining)));
-
                 }
-                ctx.send_downstream(FrameEnum::LLMFullResponseEnd(
-                    LLMFullResponseEndFrame::new(),
-                ));
-
+                ctx.send_downstream(FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()));
             }
 
             // All other frames pass through

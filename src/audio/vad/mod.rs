@@ -3,10 +3,9 @@
 
 //! Voice Activity Detection (VAD) subsystem.
 
-// pub mod analyzer; // Legacy FrameProcessor — commented out until migrated
-pub mod state_machine;
 #[cfg(feature = "silero-vad")]
 pub mod silero;
+pub mod state_machine;
 
 use serde::{Deserialize, Serialize};
 

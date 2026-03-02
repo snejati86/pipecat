@@ -54,10 +54,7 @@ impl LlmProtocol for PerplexityProtocol {
     fn extra_body_fields(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut map = serde_json::Map::new();
         if let Some(ref domains) = self.search_domain_filter {
-            map.insert(
-                "search_domain_filter".into(),
-                serde_json::json!(domains),
-            );
+            map.insert("search_domain_filter".into(), serde_json::json!(domains));
         }
         if let Some(return_images) = self.return_images {
             map.insert("return_images".into(), serde_json::json!(return_images));
@@ -69,10 +66,7 @@ impl LlmProtocol for PerplexityProtocol {
             );
         }
         if let Some(ref recency) = self.search_recency_filter {
-            map.insert(
-                "search_recency_filter".into(),
-                serde_json::json!(recency),
-            );
+            map.insert("search_recency_filter".into(), serde_json::json!(recency));
         }
         map
     }
@@ -168,10 +162,7 @@ mod tests {
     #[test]
     fn test_search_recency_filter_builder() {
         let svc = PerplexityLLMService::new("key", "model").with_search_recency_filter("week");
-        assert_eq!(
-            svc.protocol.search_recency_filter,
-            Some("week".to_string())
-        );
+        assert_eq!(svc.protocol.search_recency_filter, Some("week".to_string()));
     }
 
     #[test]

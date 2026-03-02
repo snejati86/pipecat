@@ -139,10 +139,7 @@ mod tests {
     #[test]
     fn test_result_format_builder() {
         let svc = QwenLLMService::new("key", "model").with_result_format("message");
-        assert_eq!(
-            svc.protocol.result_format,
-            Some("message".to_string())
-        );
+        assert_eq!(svc.protocol.result_format, Some("message".to_string()));
     }
 
     #[test]

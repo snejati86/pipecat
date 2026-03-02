@@ -29,11 +29,12 @@ Add the dependency to `Cargo.toml`:
 [dependencies]
 pipecat = { path = "../pipecat-rs" }  # Or from crates.io when published
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 ```
 
 ## Core Concepts
 
-Everything in pipecat-rs is built around five ideas:
+Everything in pipecat-rs is built around these ideas:
 
 ```
 [Source] → [Processor A] → [Processor B] → [Sink]
@@ -43,57 +44,57 @@ Everything in pipecat-rs is built around five ideas:
 
 | Concept | What It Does |
 |---------|-------------|
-| **Frame** | A unit of data (text, audio, image) or a control signal flowing through the pipeline |
-| **FrameProcessor** | Receives frames, transforms them, and pushes results to the next processor |
-| **Pipeline** | Chains processors together in a linear sequence |
-| **PipelineTask** | Manages the lifecycle of a pipeline (start, run, stop) |
-| **PipelineRunner** | Top-level entry point that runs a task to completion |
+| **FrameEnum** | A tagged enum representing all frame types (text, audio, control signals) flowing through the pipeline |
+| **Processor** | Receives frames, transforms them, and sends results via `ProcessorContext` |
+| **ChannelPipeline** | Chains processors together, each running in its own tokio task with priority channels |
+| **ProcessorContext** | Provides `send_downstream()`, `send_upstream()`, and `send()` for delivering frames |
+| **ProcessorWeight** | Classifies processor cost: Light (<1ms), Standard (1-10ms), Heavy (>10ms, network-bound) |
 
-Frames flow **downstream** (left to right) carrying content. Errors and acknowledgments flow **upstream** (right to left).
+Frames flow **downstream** (left to right) carrying content. Errors and acknowledgments flow **upstream** (right to left). Each processor runs in its own tokio task, enabling true parallel processing.
 
 ## Hello World: A Text Pipeline
 
-The simplest possible pipeline — push a `TextFrame` through a custom processor:
+The simplest possible pipeline — send a `TextFrame` through a custom processor:
 
 ```rust
-use std::fmt;
-use std::sync::Arc;
-
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-
-use pipecat::frames::{Frame, TextFrame};
-use pipecat::pipeline::{Pipeline, PipelineParams, PipelineRunner, PipelineTask};
-use pipecat::processors::{BaseProcessor, FrameDirection, FrameProcessor};
-use pipecat::impl_base_debug_display;
+use pipecat::prelude::*;
 
 /// A processor that converts text to uppercase.
 struct UpperCaseProcessor {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
 }
 
 impl UpperCaseProcessor {
     fn new() -> Self {
         Self {
-            base: BaseProcessor::new(Some("UpperCase".into()), false),
+            id: obj_id(),
+            name: "UpperCase".into(),
         }
     }
 }
 
-impl_base_debug_display!(UpperCaseProcessor);
+impl_processor!(UpperCaseProcessor);
 
 #[async_trait]
-impl FrameProcessor for UpperCaseProcessor {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+impl Processor for UpperCaseProcessor {
+    fn name(&self) -> &str { &self.name }
+    fn id(&self) -> u64 { self.id }
 
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        if let Some(text) = frame.downcast_ref::<TextFrame>() {
-            let upper = Arc::new(TextFrame::new(text.text.to_uppercase()));
-            println!("Transformed: {} → {}", text.text, upper.text);
-            self.push_frame(upper, direction).await;
-        } else {
-            self.push_frame(frame, direction).await;
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        match frame {
+            FrameEnum::Text(mut text) => {
+                println!("Transformed: {} → {}", text.text, text.text.to_uppercase());
+                text.text = text.text.to_uppercase();
+                ctx.send(FrameEnum::Text(text), direction);
+            }
+            other => ctx.send(other, direction),
         }
     }
 }
@@ -101,23 +102,23 @@ impl FrameProcessor for UpperCaseProcessor {
 #[tokio::main]
 async fn main() {
     // 1. Build the pipeline
-    let pipeline = Pipeline::builder()
-        .with_processor(UpperCaseProcessor::new())
-        .build();
+    let mut pipeline = ChannelPipeline::new(vec![
+        Box::new(UpperCaseProcessor::new()),
+    ]);
+    let mut output = pipeline.take_output().unwrap();
 
-    // 2. Create a task
-    let task = PipelineTask::builder(pipeline)
-        .params(PipelineParams::default())
-        .build();
+    // 2. Send frames
+    pipeline.send(FrameEnum::Text(TextFrame::new("hello, world!"))).await;
+    pipeline.send(FrameEnum::Text(TextFrame::new("pipecat is great"))).await;
 
-    // 3. Queue frames and signal completion
-    task.queue_frame(Arc::new(TextFrame::new("hello, world!"))).await;
-    task.queue_frame(Arc::new(TextFrame::new("pipecat is great"))).await;
-    task.stop_when_done().await;
+    // 3. Read output
+    while let Some(directed) = output.recv().await {
+        if let FrameEnum::Text(text) = &directed.frame {
+            println!("Got: {}", text.text);
+        }
+    }
 
-    // 4. Run
-    let runner = PipelineRunner::new();
-    runner.run(&task).await;
+    pipeline.shutdown().await;
 }
 ```
 
@@ -128,6 +129,8 @@ cargo run
 # Output:
 # Transformed: hello, world! → HELLO, WORLD!
 # Transformed: pipecat is great → PIPECAT IS GREAT
+# Got: HELLO, WORLD!
+# Got: PIPECAT IS GREAT
 ```
 
 ## Using the Prelude
@@ -138,36 +141,9 @@ The prelude re-exports the most common types so you don't have to list them indi
 use pipecat::prelude::*;
 ```
 
-This gives you `Arc`, all common frame types, `Pipeline`, `PipelineTask`, `PipelineRunner`, `BaseProcessor`, `FrameProcessor`, `FrameDirection`, and helper functions.
+This gives you `FrameEnum`, all common frame types, `ChannelPipeline`, `Processor`, `ProcessorContext`, `ProcessorWeight`, `FrameDirection`, `obj_id()`, `impl_processor!`, service traits, and more.
 
-### Helper Functions
-
-The prelude includes two convenience functions to reduce boilerplate:
-
-```rust
-use pipecat::prelude::*;
-
-// Wrap a frame in Arc for pipeline use
-let f: FrameRef = frame(TextFrame::new("hello"));
-
-// Wrap a processor in Arc<Mutex<>> for pipeline use
-let p: ProcessorRef = processor(UpperCaseProcessor::new());
-```
-
-### The `pipeline!` Macro
-
-Build pipelines without explicit `Arc::new(Mutex::new(...))` wrapping:
-
-```rust
-use pipecat::pipeline;
-
-let pipe = pipeline![
-    UpperCaseProcessor::new(),
-    my_other_processor,
-];
-```
-
-## Example: Say One Thing (TTS)
+## Example: TTS Pipeline
 
 Send text to a TTS service and get audio frames back:
 
@@ -177,22 +153,27 @@ use pipecat::services::cartesia::CartesiaTTSService;
 
 #[tokio::main]
 async fn main() {
-    // 1. Create a TTS service
     let tts = CartesiaTTSService::new("your-api-key", "voice-id")
-        .with_model("sonic-2")
+        .with_model("sonic-3")
         .with_sample_rate(24000);
 
-    // 2. Build a pipeline
-    let pipeline = Pipeline::builder()
-        .with_processor(tts)
-        .build();
+    let mut pipeline = ChannelPipeline::new(vec![Box::new(tts)]);
+    let mut output = pipeline.take_output().unwrap();
 
-    // 3. Create and run the task
-    let task = PipelineTask::builder(pipeline).build();
-    task.queue_frame(Arc::new(TextFrame::new("Hello from pipecat!"))).await;
-    task.stop_when_done().await;
+    pipeline.send(FrameEnum::Start(StartFrame::new())).await;
+    pipeline.send(FrameEnum::Text(TextFrame::new("Hello from pipecat!"))).await;
 
-    PipelineRunner::new().run(&task).await;
+    // Audio frames arrive as OutputAudioRawFrame
+    while let Some(directed) = output.recv().await {
+        match &directed.frame {
+            FrameEnum::OutputAudioRaw(audio) => {
+                println!("Got {} bytes of audio", audio.audio.audio.len());
+            }
+            _ => {}
+        }
+    }
+
+    pipeline.shutdown().await;
 }
 ```
 
@@ -204,155 +185,142 @@ Chain an LLM with a TTS service — the LLM generates text, which the TTS conver
 use pipecat::prelude::*;
 use pipecat::services::openai::OpenAILLMService;
 use pipecat::services::cartesia::CartesiaTTSService;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() {
-    // 1. Create services
     let llm = OpenAILLMService::new("your-openai-key", "gpt-4o")
         .with_temperature(0.7);
 
+    let sentence_agg = SentenceAggregator::new();
+
     let tts = CartesiaTTSService::new("your-cartesia-key", "voice-id")
+        .with_model("sonic-3")
         .with_sample_rate(24000);
 
-    // 2. Build pipeline: LLM → TTS
-    let pipeline = Pipeline::builder()
-        .with_processor(llm)
-        .with_processor(tts)
-        .build();
+    // Pipeline: LLM → Sentence Aggregator → TTS
+    let mut pipeline = ChannelPipeline::new(vec![
+        Box::new(llm),
+        Box::new(sentence_agg),
+        Box::new(tts),
+    ]);
+    let mut output = pipeline.take_output().unwrap();
 
-    // 3. Send context and run
-    let task = PipelineTask::builder(pipeline).build();
+    // Send start frame and LLM context
+    pipeline.send(FrameEnum::Start(StartFrame::new())).await;
 
-    // Queue an LLM context message
-    let messages = vec![serde_json::json!({
+    let messages = vec![json!({
         "role": "user",
         "content": "Tell me a one-sentence joke about Rust."
     })];
-    task.queue_frame(Arc::new(LLMMessagesAppendFrame::new(messages))).await;
-    task.stop_when_done().await;
+    let context = LLMContext::with_messages(messages);
+    pipeline.send(FrameEnum::LLMMessagesAppend(
+        LLMMessagesAppendFrame::new(context.get_messages_for_completion())
+    )).await;
 
-    PipelineRunner::new().run(&task).await;
-}
-```
+    // Read output frames
+    while let Some(directed) = output.recv().await {
+        match &directed.frame {
+            FrameEnum::OutputAudioRaw(audio) => {
+                println!("Audio chunk: {} bytes", audio.audio.audio.len());
+            }
+            _ => {}
+        }
+    }
 
-## Example: STT + LLM + TTS (Listen and Respond)
-
-A full conversational loop over WebSocket — the user speaks, the agent listens, thinks, and replies:
-
-```rust
-use pipecat::prelude::*;
-use pipecat::services::deepgram::DeepgramSTTService;
-use pipecat::services::openai::OpenAILLMService;
-use pipecat::services::cartesia::CartesiaTTSService;
-use pipecat::transports::websocket::WebSocketTransport;
-use pipecat::transports::{Transport, TransportParams};
-use pipecat::serializers::json::JsonFrameSerializer;
-
-#[tokio::main]
-async fn main() {
-    // 1. Create services
-    let stt = DeepgramSTTService::new("your-deepgram-key")
-        .with_model("nova-2")
-        .with_language("en")
-        .with_vad_events(true);
-
-    let llm = OpenAILLMService::new("your-openai-key", "gpt-4o");
-
-    let tts = CartesiaTTSService::new("your-cartesia-key", "voice-id")
-        .with_sample_rate(16000);
-
-    // 2. Create transport
-    let transport_params = TransportParams {
-        audio_in_enabled: true,
-        audio_in_sample_rate: Some(16000),
-        audio_out_enabled: true,
-        audio_out_sample_rate: Some(16000),
-        ..Default::default()
-    };
-    let serializer = Arc::new(JsonFrameSerializer::new()) as Arc<dyn FrameSerializer>;
-    let transport = WebSocketTransport::new(transport_params, serializer);
-
-    // 3. Build pipeline: Transport In → STT → LLM → TTS → Transport Out
-    let pipeline = Pipeline::new(vec![
-        transport.input(),
-        Arc::new(tokio::sync::Mutex::new(stt)),
-        Arc::new(tokio::sync::Mutex::new(llm)),
-        Arc::new(tokio::sync::Mutex::new(tts)),
-        transport.output(),
-    ]);
-
-    // 4. Run
-    let task = PipelineTask::builder(pipeline)
-        .params(PipelineParams {
-            allow_interruptions: true,
-            enable_metrics: true,
-            ..Default::default()
-        })
-        .build();
-
-    // Start WebSocket server
-    transport.serve("127.0.0.1:8765").await.expect("Failed to start server");
-
-    PipelineRunner::new().run(&task).await;
+    pipeline.shutdown().await;
 }
 ```
 
 ## Writing Custom Processors
 
-Every processor embeds a `BaseProcessor` and implements the `FrameProcessor` trait:
+Every processor has `id` and `name` fields and implements the `Processor` trait:
 
 ```rust
 use pipecat::prelude::*;
-use pipecat::impl_base_debug_display;
 
 struct WordCounter {
-    base: BaseProcessor,
+    id: u64,
+    name: String,
     count: usize,
 }
 
 impl WordCounter {
     fn new() -> Self {
         Self {
-            base: BaseProcessor::new(Some("WordCounter".into()), false),
+            id: obj_id(),
+            name: "WordCounter".into(),
             count: 0,
         }
     }
 }
 
-impl_base_debug_display!(WordCounter);
+impl_processor!(WordCounter);
 
-#[async_trait::async_trait]
-impl FrameProcessor for WordCounter {
-    fn base(&self) -> &BaseProcessor { &self.base }
-    fn base_mut(&mut self) -> &mut BaseProcessor { &mut self.base }
+#[async_trait]
+impl Processor for WordCounter {
+    fn name(&self) -> &str { &self.name }
+    fn id(&self) -> u64 { self.id }
 
-    async fn process_frame(&mut self, frame: Arc<dyn Frame>, direction: FrameDirection) {
-        if let Some(text) = frame.downcast_ref::<TextFrame>() {
+    async fn process(
+        &mut self,
+        frame: FrameEnum,
+        direction: FrameDirection,
+        ctx: &ProcessorContext,
+    ) {
+        if let FrameEnum::Text(ref text) = frame {
             self.count += text.text.split_whitespace().count();
             println!("Total words so far: {}", self.count);
         }
-        // Always push the frame through (don't swallow it)
-        self.push_frame(frame, direction).await;
+        // Always forward the frame (don't swallow it)
+        ctx.send(frame, direction);
     }
 }
 ```
 
 ### Key Rules
 
-1. **Always push frames forward** unless you intentionally want to consume them. If you don't push, downstream processors never see the frame.
+1. **Always forward frames** unless you intentionally want to consume them. Use `ctx.send(frame, direction)` for passthrough.
 2. **Handle unknown frame types** by passing them through unchanged. Only match on the types you care about.
-3. **Use `downcast_ref`** to check if a frame is a specific type. This is how you pattern-match on `dyn Frame`.
-4. **Push errors upstream** with `self.push_error("something went wrong", false).await` for recoverable errors.
+3. **Use `match` on `FrameEnum`** to pattern-match frame types — exhaustive matching is enforced at compile time.
+4. **Send errors upstream** with `ctx.send_upstream(FrameEnum::Error(ErrorFrame::new("msg", false)))` for recoverable errors.
+5. **Set `weight()`** appropriately: `Light` for <1ms work, `Standard` for 1-10ms, `Heavy` for network I/O. Heavy processors get interruption monitoring.
 
-### The `impl_base_debug_display!` Macro
+### The `impl_processor!` Macro
 
-This macro generates the `Debug` and `Display` implementations that the `FrameProcessor` trait requires:
+This macro generates the `Debug` and `Display` implementations from `id` and `name` fields:
 
 ```rust
-impl_base_debug_display!(MyProcessor);
+impl_processor!(MyProcessor);
 // Expands to:
-// impl Debug for MyProcessor { ... }
-// impl Display for MyProcessor { ... }
+// impl Debug for MyProcessor { ... }   // Shows struct name, id, name
+// impl Display for MyProcessor { ... } // Shows just the name
+```
+
+### Heavy Processors and Interruptions
+
+Processors with `ProcessorWeight::Heavy` get special handling — the pipeline monitors for `InterruptionFrame` while `process()` is running and cancels the interruption token:
+
+```rust
+#[async_trait]
+impl Processor for MyHeavyProcessor {
+    fn weight(&self) -> ProcessorWeight { ProcessorWeight::Heavy }
+
+    async fn process(&mut self, frame: FrameEnum, direction: FrameDirection, ctx: &ProcessorContext) {
+        // Long-running work — check interruption token in select!
+        loop {
+            tokio::select! {
+                _ = ctx.interruption_token().cancelled() => {
+                    // Interrupted! Clean up and return.
+                    break;
+                }
+                result = self.do_work() => {
+                    ctx.send_downstream(result);
+                }
+            }
+        }
+    }
+}
 ```
 
 ## Available Services
@@ -364,6 +332,8 @@ impl_base_debug_display!(MyProcessor);
 | **Deepgram** | STT | `DeepgramSTTService::new(api_key)` |
 | **Cartesia** (WebSocket) | TTS | `CartesiaTTSService::new(api_key, voice_id)` |
 | **Cartesia** (HTTP) | TTS | `CartesiaHttpTTSService::new(api_key, voice_id)` |
+| **ElevenLabs** (WebSocket) | TTS | `ElevenLabsTTSService::new(api_key, voice_id)` |
+| **ElevenLabs** (HTTP) | TTS | `ElevenLabsHttpTTSService::new(api_key, voice_id)` |
 
 All services use the builder pattern for optional configuration:
 
@@ -373,57 +343,52 @@ let stt = DeepgramSTTService::new("key")
     .with_language("en")
     .with_sample_rate(16000)
     .with_vad_events(true)
-    .with_interim_results(true)
-    .with_smart_format(true);
-```
-
-## Pipeline Monitoring with Observers
-
-Observe frame flow without modifying the pipeline:
-
-```rust
-use pipecat::observers::{Observer, FrameProcessed};
-
-struct MetricsLogger;
-
-#[async_trait::async_trait]
-impl Observer for MetricsLogger {
-    async fn on_process_frame(&self, data: &FrameProcessed) {
-        println!("[{}] processed {}", data.processor_name, data.frame_name);
-    }
-}
-
-let task = PipelineTask::builder(pipeline)
-    .observer(Arc::new(MetricsLogger))
-    .build();
+    .with_utterance_end_ms(1000);
 ```
 
 ## Testing Your Processors
 
-Use the built-in `run_test` utility to verify frame flow:
+Test processors directly using `ProcessorContext` with channel receivers:
 
 ```rust
-use pipecat::tests::run_test;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use pipecat::prelude::*;
 
 #[tokio::test]
 async fn test_upper_case() {
-    let processor = Arc::new(Mutex::new(UpperCaseProcessor::new()));
+    let (dtx, mut drx) = mpsc::unbounded_channel();
+    let (utx, _urx) = mpsc::unbounded_channel();
+    let ctx = ProcessorContext::new(dtx, utx, CancellationToken::new(), 1);
 
-    let result = run_test(
-        processor,
-        vec![Arc::new(TextFrame::new("hello"))],
-        Some(vec!["TextFrame"]),  // Expected downstream frame names
-        None,                     // Don't check upstream
-        true,                     // Send EndFrame after inputs
-        vec![],                   // No observers
-        None,                     // Default pipeline params
+    let mut proc = UpperCaseProcessor::new();
+    proc.process(
+        FrameEnum::Text(TextFrame::new("hello")),
+        FrameDirection::Downstream,
+        &ctx,
     ).await;
 
-    // Inspect the actual frames
-    let text = result.downstream_frames[0]
-        .downcast_ref::<TextFrame>()
-        .unwrap();
-    assert_eq!(text.text, "HELLO");
+    let output = drx.recv().await.unwrap();
+    assert!(matches!(output, FrameEnum::Text(t) if t.text == "HELLO"));
+}
+```
+
+For integration tests with full pipelines:
+
+```rust
+#[tokio::test]
+async fn test_pipeline() {
+    let mut pipeline = ChannelPipeline::new(vec![
+        Box::new(UpperCaseProcessor::new()),
+    ]);
+    let mut output = pipeline.take_output().unwrap();
+
+    pipeline.send(FrameEnum::Text(TextFrame::new("hello"))).await;
+
+    let received = output.recv().await.unwrap();
+    assert!(matches!(received.frame, FrameEnum::Text(t) if t.text == "HELLO"));
+
+    pipeline.shutdown().await;
 }
 ```
 
@@ -432,17 +397,15 @@ async fn test_upper_case() {
 | Frame | Category | Constructor | Purpose |
 |-------|----------|-------------|---------|
 | `TextFrame` | Data | `TextFrame::new("text")` | General text content |
-| `TextFrame` | Data | `TextFrame::from("text")` | Shorthand via `From` |
-| `LLMTextFrame` | Data | `LLMTextFrame::new(text)` | Text from an LLM (has inter-frame spaces) |
+| `LLMTextFrame` | Data | `LLMTextFrame::new(text)` | Text from an LLM |
 | `TranscriptionFrame` | Data | `TranscriptionFrame::new(text, user_id, ts)` | Final STT result |
 | `InterimTranscriptionFrame` | Data | `InterimTranscriptionFrame::new(text, uid, ts)` | Partial STT result |
 | `InputAudioRawFrame` | System | `InputAudioRawFrame::new(bytes, sr, ch)` | Audio input (PCM16 LE) |
 | `OutputAudioRawFrame` | Data | `OutputAudioRawFrame::new(bytes, sr, ch)` | Audio output |
 | `TTSAudioRawFrame` | Data | `TTSAudioRawFrame::new(bytes, sr, ch)` | Audio from TTS |
-| `StartFrame` | System | `StartFrame::new(in_sr, out_sr, interrupts, metrics)` | Initialize pipeline |
+| `StartFrame` | System | `StartFrame::new()` | Initialize pipeline |
 | `EndFrame` | Control | `EndFrame::new()` | Graceful shutdown |
-| `StopFrame` | Control | `StopFrame::new()` | Stop but keep alive |
-| `CancelFrame` | System | `CancelFrame::new(reason)` | Immediate cancellation |
+| `CancelFrame` | System | `CancelFrame::new()` | Immediate cancellation |
 | `ErrorFrame` | System | `ErrorFrame::new("msg", fatal)` | Error notification |
 | `InterruptionFrame` | System | `InterruptionFrame::new()` | User interrupted the bot |
 | `LLMMessagesAppendFrame` | Data | `LLMMessagesAppendFrame::new(msgs)` | Append to LLM context |
@@ -461,19 +424,20 @@ async fn test_upper_case() {
     ┌──────────────────────────────────────────────┐
     │                                              │
     │  ┌─────────┐    ┌─────────┐    ┌─────────┐  │
-    │  │Transport│──→ │  STT    │──→ │  LLM    │  │
-    │  │  Input  │    │(Deepgram│    │(OpenAI) │  │
+    │  │Telephony│──→ │  STT    │──→ │  LLM    │  │
+    │  │ Session │    │(Deepgram│    │(OpenAI) │  │
     │  └─────────┘    └─────────┘    └────┬────┘  │
     │       ↑                             │       │
     │   WebSocket                         ↓       │
-    │   (frames)                    ┌─────────┐   │
+    │   (Twilio)                    ┌─────────┐   │
     │       ↑                       │   TTS   │   │
     │  ┌─────────┐                  │(Cartesia│   │
-    │  │Transport│←─────────────────┤   )     │   │
-    │  │  Output │                  └─────────┘   │
+    │  │Telephony│←─────────────────┤   )     │   │
+    │  │ Session │                  └─────────┘   │
     │  └─────────┘                                │
     │                                              │
-    │  Pipeline = [Input → STT → LLM → TTS → Out] │
+    │  ChannelPipeline = [STT → LLM → TTS]        │
+    │  (each processor in its own tokio task)      │
     └──────────────────────────────────────────────┘
 ```
 
@@ -485,27 +449,29 @@ pipecat-rs/
 ├── src/
 │   ├── lib.rs              # Crate root
 │   ├── prelude.rs          # Common re-exports
-│   ├── frames/             # 70+ frame types
-│   ├── processors/         # FrameProcessor trait + filters + aggregators
-│   ├── pipeline/           # Pipeline, PipelineTask, PipelineRunner
+│   ├── frames/             # 70+ frame types (FrameEnum)
+│   ├── processors/         # Processor trait + aggregators
+│   ├── pipeline/           # ChannelPipeline orchestration
 │   ├── services/           # AI service integrations
 │   │   ├── openai.rs       #   OpenAI LLM + TTS
 │   │   ├── deepgram.rs     #   Deepgram STT
-│   │   └── cartesia.rs     #   Cartesia TTS (WebSocket + HTTP)
-│   ├── transports/         # WebSocket transport
-│   ├── serializers/        # JSON frame serializer
+│   │   ├── cartesia.rs     #   Cartesia TTS
+│   │   └── elevenlabs.rs   #   ElevenLabs TTS
+│   ├── session/            # Telephony sessions (Twilio, etc.)
+│   ├── serializers/        # Frame serializers
 │   ├── observers/          # Pipeline monitoring
-│   ├── audio/              # VAD, filters, mixers
-│   ├── turns/              # Turn management strategies
-│   ├── metrics/            # Telemetry data models
-│   └── utils/              # BaseObject, helpers
-└── tests/                  # Integration tests
+│   ├── audio/              # VAD, resampling, codecs
+│   ├── turns/              # Turn management
+│   ├── metrics/            # Telemetry
+│   └── utils/              # Object IDs, helpers
+├── examples/               # Working examples
+└── benches/                # Performance benchmarks
 ```
 
 ## Next Steps
 
 - Browse the [frame definitions](src/frames/mod.rs) to see all 70+ frame types
 - Read the [service implementations](src/services/) to understand how AI providers integrate
-- Look at the [test suite](tests/) for working examples of pipeline construction
-- Check the [filters](src/processors/filters/mod.rs) for ready-to-use frame filtering
+- Look at the [Twilio outbound example](examples/twilio_outbound.rs) for a complete voice bot
 - Explore [aggregators](src/processors/aggregators/) for sentence detection and LLM context management
+- Check [CLAUDE.md](CLAUDE.md) for architecture details and code style guidelines

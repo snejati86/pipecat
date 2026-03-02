@@ -473,9 +473,9 @@ impl GenesysFrameSerializer {
                         if let Some(digit_str) = &dtmf.digit {
                             debug!("Genesys: DTMF digit={}", digit_str);
                             if let Some(entry) = Self::parse_dtmf_digit(digit_str) {
-                                return Some(vec![DeserializedOutput::Frame(FrameEnum::OutputDTMF(
-                                    OutputDTMFFrame::new(entry),
-                                ))]);
+                                return Some(vec![DeserializedOutput::Frame(
+                                    FrameEnum::OutputDTMF(OutputDTMFFrame::new(entry)),
+                                )]);
                             } else {
                                 warn!("Genesys: unknown DTMF digit '{}'", digit_str);
                                 return None;
@@ -488,9 +488,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_update",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
-                    InputTransportMessageFrame::new(json),
-                ))])
+                Some(vec![DeserializedOutput::Frame(
+                    FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)),
+                )])
             }
             "pause" => {
                 debug!("Genesys: pause event received");
@@ -498,9 +498,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_pause",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
-                    InputTransportMessageFrame::new(json),
-                ))])
+                Some(vec![DeserializedOutput::Frame(
+                    FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)),
+                )])
             }
             "resume" => {
                 debug!("Genesys: resume event received");
@@ -508,9 +508,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_resume",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
-                    InputTransportMessageFrame::new(json),
-                ))])
+                Some(vec![DeserializedOutput::Frame(
+                    FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)),
+                )])
             }
             "disconnect" => {
                 debug!("Genesys: disconnect event received");
@@ -518,9 +518,9 @@ impl GenesysFrameSerializer {
                     "type": "genesys_disconnect",
                     "session_id": self.session_id,
                 });
-                Some(vec![DeserializedOutput::Frame(FrameEnum::InputTransportMessage(
-                    InputTransportMessageFrame::new(json),
-                ))])
+                Some(vec![DeserializedOutput::Frame(
+                    FrameEnum::InputTransportMessage(InputTransportMessageFrame::new(json)),
+                )])
             }
             other => {
                 if !other.is_empty() {

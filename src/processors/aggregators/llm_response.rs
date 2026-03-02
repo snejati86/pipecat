@@ -146,10 +146,9 @@ impl Processor for LLMResponseAggregator {
                         "role": "assistant",
                         "content": text,
                     })];
-                    ctx.send_downstream(FrameEnum::LLMMessagesAppend(
-                        LLMMessagesAppendFrame::new(messages),
-                    ));
-
+                    ctx.send_downstream(FrameEnum::LLMMessagesAppend(LLMMessagesAppendFrame::new(
+                        messages,
+                    )));
                 }
                 self.in_response = false;
                 ctx.send_downstream(frame);
@@ -250,10 +249,9 @@ impl LLMUserContextAggregator {
         }
 
         // Push append frame downstream
-        ctx.send_downstream(FrameEnum::LLMMessagesAppend(
-            LLMMessagesAppendFrame::new(vec![message]),
-        ));
-
+        ctx.send_downstream(FrameEnum::LLMMessagesAppend(LLMMessagesAppendFrame::new(
+            vec![message],
+        )));
     }
 }
 
@@ -462,9 +460,9 @@ impl LLMAssistantContextAggregator {
         }
 
         // Push append frame downstream
-        ctx.send_downstream(FrameEnum::LLMMessagesAppend(
-            LLMMessagesAppendFrame::new(vec![message]),
-        ));
+        ctx.send_downstream(FrameEnum::LLMMessagesAppend(LLMMessagesAppendFrame::new(
+            vec![message],
+        )));
 
         tracing::debug!("AssistantContext: pushed assistant message");
     }

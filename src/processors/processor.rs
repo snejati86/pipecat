@@ -262,7 +262,7 @@ pub trait Processor: Send + Sync + fmt::Debug + fmt::Display {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frames::{TextFrame, EndFrame};
+    use crate::frames::{EndFrame, TextFrame};
 
     // -- ProcessorWeight tests -----------------------------------------------
 
@@ -361,11 +361,22 @@ mod tests {
 
     #[async_trait]
     impl Processor for UpperCaseProcessor {
-        fn name(&self) -> &str { "UpperCase" }
-        fn id(&self) -> u64 { self.id }
-        fn weight(&self) -> ProcessorWeight { ProcessorWeight::Light }
+        fn name(&self) -> &str {
+            "UpperCase"
+        }
+        fn id(&self) -> u64 {
+            self.id
+        }
+        fn weight(&self) -> ProcessorWeight {
+            ProcessorWeight::Light
+        }
 
-        async fn process(&mut self, frame: FrameEnum, _direction: FrameDirection, ctx: &ProcessorContext) {
+        async fn process(
+            &mut self,
+            frame: FrameEnum,
+            _direction: FrameDirection,
+            ctx: &ProcessorContext,
+        ) {
             match frame {
                 FrameEnum::Text(mut text) => {
                     text.text = text.text.to_uppercase();

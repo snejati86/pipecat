@@ -59,9 +59,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing;
 
-use crate::frames::{
-    ErrorFrame, FrameEnum, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame,
-};
+use crate::frames::{ErrorFrame, FrameEnum, OutputAudioRawFrame, TTSStartedFrame, TTSStoppedFrame};
 use crate::processors::processor::{Processor, ProcessorContext, ProcessorWeight};
 use crate::processors::FrameDirection;
 use crate::services::{AIService, TTSService};
@@ -215,6 +213,10 @@ pub struct ElevenLabsTTSService {
     /// The WebSocket connection, wrapped in a Mutex for interior mutability.
     ws: Arc<Mutex<Option<WsStream>>>,
 
+    /// When true, the WebSocket has stale audio from an interrupted TTS
+    /// generation that must be drained before the next request.
+    needs_drain: bool,
+
     /// Last metrics collected (available after `run_tts` completes).
     pub last_metrics: Option<TTSMetrics>,
 }
@@ -249,6 +251,7 @@ impl ElevenLabsTTSService {
             ws_url: Self::DEFAULT_WS_BASE_URL.to_string(),
             params: ElevenLabsInputParams::default(),
             ws: Arc::new(Mutex::new(None)),
+            needs_drain: false,
             last_metrics: None,
         }
     }
@@ -385,6 +388,82 @@ impl ElevenLabsTTSService {
             }
         }
         *ws_guard = None;
+    }
+
+    /// Drain stale audio messages from an interrupted TTS generation.
+    ///
+    /// After an interruption, the server may still be sending audio chunks from
+    /// the previous request. This reads and discards messages until `isFinal: true`
+    /// or a timeout, leaving the WebSocket ready for the next request.
+    /// If the drain times out or the connection is closed, the WebSocket is
+    /// dropped so `connect()` will establish a fresh one.
+    async fn drain_stale_messages(&mut self) {
+        let mut ws_guard = self.ws.lock().await;
+        let ws = match ws_guard.as_mut() {
+            Some(ws) => ws,
+            None => return,
+        };
+
+        tracing::debug!(service = %self.name, "Draining stale WebSocket messages after interruption");
+
+        let drain_timeout = std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + drain_timeout;
+        let mut drained = 0usize;
+
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!(
+                        service = %self.name,
+                        drained,
+                        "Drain timed out — reconnecting"
+                    );
+                    // Force reconnect: drop the stale WebSocket
+                    *ws_guard = None;
+                    return;
+                }
+                msg = ws.next() => msg,
+            };
+
+            match msg {
+                Some(Ok(WsMessage::Text(text))) => {
+                    drained += 1;
+                    if let Ok(resp) =
+                        serde_json::from_str::<ElevenLabsWsResponse>(&text.to_string())
+                    {
+                        if resp.is_final == Some(true) {
+                            tracing::debug!(
+                                service = %self.name,
+                                drained,
+                                "Drain complete (isFinal received)"
+                            );
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) | None => {
+                    tracing::debug!(
+                        service = %self.name,
+                        drained,
+                        "Drain: connection closed — will reconnect"
+                    );
+                    *ws_guard = None;
+                    return;
+                }
+                Some(Ok(_)) => {
+                    drained += 1;
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        service = %self.name,
+                        "Drain: WebSocket error: {e} — will reconnect"
+                    );
+                    *ws_guard = None;
+                    return;
+                }
+            }
+        }
     }
 
     /// Build the voice settings for the initial WebSocket message.
@@ -635,7 +714,12 @@ impl Processor for ElevenLabsTTSService {
     ) {
         match frame {
             FrameEnum::Text(ref t) if !t.text.is_empty() => {
-                // Auto-reconnect if the WebSocket was disconnected (e.g. after interruption).
+                // Drain stale audio from a previous interrupted generation.
+                if self.needs_drain {
+                    self.drain_stale_messages().await;
+                    self.needs_drain = false;
+                }
+                // Auto-reconnect if the WebSocket was disconnected.
                 if let Err(e) = self.connect().await {
                     ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
                     return;
@@ -656,7 +740,10 @@ impl Processor for ElevenLabsTTSService {
                 ctx.send_downstream(frame);
             }
             FrameEnum::Interruption(_) => {
-                self.disconnect().await;
+                // Keep the WebSocket alive — just mark that we need to drain
+                // stale audio from the interrupted generation before the next
+                // TTS request. This avoids the ~194ms reconnection penalty.
+                self.needs_drain = true;
                 ctx.send_downstream(frame);
             }
             FrameEnum::LLMFullResponseStart(_) | FrameEnum::LLMFullResponseEnd(_) => {

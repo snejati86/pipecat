@@ -82,8 +82,7 @@ impl SmartTurn {
             .into_shape_with_order((1, n_mels, n_frames))
             .map_err(|e| SmartTurnError::InvalidInput(format!("Shape error: {}", e)))?;
 
-        let input_value = Tensor::from_array(input)
-            .map_err(SmartTurnError::Ort)?;
+        let input_value = Tensor::from_array(input).map_err(SmartTurnError::Ort)?;
 
         // Run inference
         let outputs = self

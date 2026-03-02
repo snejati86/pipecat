@@ -50,7 +50,10 @@ fn test_state_machine_confidence_triggers_speech() {
             break;
         }
     }
-    assert!(started, "Expected SpeechStarted after high confidence values");
+    assert!(
+        started,
+        "Expected SpeechStarted after high confidence values"
+    );
     assert_eq!(sm.state(), VADState::Speaking);
 }
 
@@ -80,7 +83,10 @@ fn test_state_machine_speech_to_quiet() {
             break;
         }
     }
-    assert!(stopped, "Expected SpeechStopped after low confidence values");
+    assert!(
+        stopped,
+        "Expected SpeechStopped after low confidence values"
+    );
     assert_eq!(sm.state(), VADState::Quiet);
 }
 
@@ -165,11 +171,7 @@ mod processor_tests {
         let _ = drx.recv().await; // consume start
 
         // Send audio frame — silence (20ms at 16kHz PCM16 mono)
-        let audio = FrameEnum::InputAudioRaw(InputAudioRawFrame::new(
-            vec![0u8; 640],
-            16000,
-            1,
-        ));
+        let audio = FrameEnum::InputAudioRaw(InputAudioRawFrame::new(vec![0u8; 640], 16000, 1));
         proc.process(audio, FrameDirection::Downstream, &ctx).await;
 
         // Audio should always pass through

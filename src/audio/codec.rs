@@ -203,10 +203,7 @@ mod tests {
     #[test]
     fn test_resample_upsample() {
         // 2 samples at 8kHz -> should produce ~6 samples at 24kHz
-        let data: Vec<u8> = [100i16, 200]
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [100i16, 200].iter().flat_map(|s| s.to_le_bytes()).collect();
         let result = resample_linear(&data, 8000, 24000);
         assert_eq!(result.len() / 2, 6); // 2 * (24000/8000) = 6 samples
     }

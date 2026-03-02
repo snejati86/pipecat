@@ -10,9 +10,7 @@ use pipecat::services::TTSService;
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter("debug")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("debug").init();
 
     let api_key = std::env::var("CARTESIA_API_KEY").expect("CARTESIA_API_KEY must be set");
 
@@ -57,7 +55,8 @@ async fn main() {
     }
 
     println!("\n=== Summary ===");
-    println!("Total audio: {} bytes ({:.2}s at 24kHz 16-bit mono)",
+    println!(
+        "Total audio: {} bytes ({:.2}s at 24kHz 16-bit mono)",
         total_audio_bytes,
         total_audio_bytes as f64 / (24000.0 * 2.0)
     );

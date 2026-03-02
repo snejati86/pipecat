@@ -22,17 +22,26 @@ mod rubato_stability {
                 .collect();
 
             let chunk = [input.as_slice()];
-            let (_, out_len) = resampler.process_into_buffer(&chunk, &mut wave_out, None).unwrap();
+            let (_, out_len) = resampler
+                .process_into_buffer(&chunk, &mut wave_out, None)
+                .unwrap();
 
             let max_abs = wave_out[0][..out_len]
                 .iter()
                 .map(|s| s.abs())
                 .fold(0.0f32, f32::max);
-            
+
             println!(
                 "Chunk {:2}: {} input -> {} output, max_abs={:.6}{}",
-                chunk_num, input_frames, out_len, max_abs,
-                if max_abs > 1.0 { " *** OVERFLOW ***" } else { "" }
+                chunk_num,
+                input_frames,
+                out_len,
+                max_abs,
+                if max_abs > 1.0 {
+                    " *** OVERFLOW ***"
+                } else {
+                    ""
+                }
             );
 
             assert!(
@@ -60,17 +69,26 @@ mod rubato_stability {
                 .collect();
 
             let chunk = [input.as_slice()];
-            let (_, out_len) = resampler.process_into_buffer(&chunk, &mut wave_out, None).unwrap();
+            let (_, out_len) = resampler
+                .process_into_buffer(&chunk, &mut wave_out, None)
+                .unwrap();
 
             let max_abs = wave_out[0][..out_len]
                 .iter()
                 .map(|s| s.abs())
                 .fold(0.0f64, f64::max);
-            
+
             println!(
                 "f64 Chunk {:2}: {} input -> {} output, max_abs={:.6}{}",
-                chunk_num, input_frames, out_len, max_abs,
-                if max_abs > 1.0 { " *** OVERFLOW ***" } else { "" }
+                chunk_num,
+                input_frames,
+                out_len,
+                max_abs,
+                if max_abs > 1.0 {
+                    " *** OVERFLOW ***"
+                } else {
+                    ""
+                }
             );
 
             assert!(
@@ -79,7 +97,7 @@ mod rubato_stability {
             );
         }
     }
-    
+
     #[test]
     fn test_fft_resample_larger_chunk() {
         // Try chunk_size=1024 instead of 160
@@ -98,17 +116,26 @@ mod rubato_stability {
                 .collect();
 
             let chunk = [input.as_slice()];
-            let (_, out_len) = resampler.process_into_buffer(&chunk, &mut wave_out, None).unwrap();
+            let (_, out_len) = resampler
+                .process_into_buffer(&chunk, &mut wave_out, None)
+                .unwrap();
 
             let max_abs = wave_out[0][..out_len]
                 .iter()
                 .map(|s| s.abs())
                 .fold(0.0f32, f32::max);
-            
+
             println!(
                 "Large chunk {:2}: {} input -> {} output, max_abs={:.6}{}",
-                chunk_num, input_frames, out_len, max_abs,
-                if max_abs > 1.0 { " *** OVERFLOW ***" } else { "" }
+                chunk_num,
+                input_frames,
+                out_len,
+                max_abs,
+                if max_abs > 1.0 {
+                    " *** OVERFLOW ***"
+                } else {
+                    ""
+                }
             );
 
             assert!(

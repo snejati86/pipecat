@@ -38,7 +38,10 @@ mod tests {
     #[test]
     fn test_service_creation() {
         let svc = FireworksLLMService::new("test-key", "");
-        assert_eq!(svc.model, "accounts/fireworks/models/llama-v3p1-70b-instruct");
+        assert_eq!(
+            svc.model,
+            "accounts/fireworks/models/llama-v3p1-70b-instruct"
+        );
         assert!(svc.messages.is_empty());
         assert!(svc.tools.is_none());
     }

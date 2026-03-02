@@ -8,43 +8,14 @@
 
 pub mod aggregators;
 pub mod audio;
-// pub mod filters; // Legacy FrameProcessor — commented out until migrated
 pub mod metrics;
 pub mod processor;
 pub use processor::{Processor, ProcessorContext, ProcessorWeight};
 
-/// Implement `Debug` and `Display` for a type that contains a `base: BaseProcessor` field.
-///
-/// The `Debug` impl prints `TypeName(name)` and the `Display` impl prints just the
-/// processor name obtained from `self.base.name()`.
-///
-/// # Examples
-///
-/// ```ignore
-/// impl_base_debug_display!(MyProcessor);
-/// ```
-#[macro_export]
-macro_rules! impl_base_debug_display {
-    ($struct_name:ident) => {
-        impl std::fmt::Debug for $struct_name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}({})", stringify!($struct_name), self.base.name())
-            }
-        }
-
-        impl std::fmt::Display for $struct_name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.base.name())
-            }
-        }
-    };
-}
-
 /// Implement `Debug` and `Display` for a processor struct with `id: u64` and `name: String` fields.
 ///
-/// Unlike [`impl_base_debug_display!`], which requires a `base: BaseProcessor` field, this macro
-/// works with any struct that has `id` and `name` fields directly. The `Debug` output uses
-/// `debug_struct` with `..` non-exhaustive notation; the `Display` output prints just the name.
+/// The `Debug` output uses `debug_struct` with `..` non-exhaustive notation;
+/// the `Display` output prints just the name.
 ///
 /// # Examples
 ///
@@ -75,27 +46,6 @@ macro_rules! impl_processor {
         impl ::std::fmt::Display for $ty {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 write!(f, "{}", self.name)
-            }
-        }
-    };
-}
-
-/// Implement only `Display` for a type that contains a `base: BaseProcessor` field.
-///
-/// Use this when the type needs a custom `Debug` implementation (e.g. to show
-/// extra fields) but the standard `Display` that prints `self.base.name()`.
-///
-/// # Examples
-///
-/// ```ignore
-/// impl_base_display!(CartesiaTTSService);
-/// ```
-#[macro_export]
-macro_rules! impl_base_display {
-    ($struct_name:ident) => {
-        impl std::fmt::Display for $struct_name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.base.name())
             }
         }
     };

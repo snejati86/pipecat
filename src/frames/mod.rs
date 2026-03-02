@@ -285,9 +285,6 @@ pub trait ControlFrameMarker: Frame {}
 /// Marker trait for frames that must not be discarded during interruptions.
 pub trait UninterruptibleFrameMarker: Frame {}
 
-/// A thread-safe, reference-counted frame for passing through pipelines.
-pub type FrameRef = Arc<dyn Frame>;
-
 // ---------------------------------------------------------------------------
 // Common base fields for all frames
 // ---------------------------------------------------------------------------
@@ -368,26 +365,43 @@ macro_rules! impl_frame_trait {
             self.fields.pts = pts;
         }
         fn metadata(&self) -> &HashMap<String, serde_json::Value> {
-            self.fields.metadata.as_deref().unwrap_or_else(|| empty_metadata())
+            self.fields
+                .metadata
+                .as_deref()
+                .unwrap_or_else(|| empty_metadata())
         }
         fn metadata_mut(&mut self) -> &mut HashMap<String, serde_json::Value> {
-            self.fields.metadata.get_or_insert_with(|| Box::new(HashMap::new()))
+            self.fields
+                .metadata
+                .get_or_insert_with(|| Box::new(HashMap::new()))
         }
         fn transport_source(&self) -> Option<&str> {
-            self.fields.transport.as_ref().and_then(|t| t.source.as_deref())
+            self.fields
+                .transport
+                .as_ref()
+                .and_then(|t| t.source.as_deref())
         }
         fn set_transport_source(&mut self, source: Option<String>) {
             if source.is_some() || self.fields.transport.is_some() {
-                let t = self.fields.transport.get_or_insert_with(|| Box::new(TransportInfo::default()));
+                let t = self
+                    .fields
+                    .transport
+                    .get_or_insert_with(|| Box::new(TransportInfo::default()));
                 t.source = source;
             }
         }
         fn transport_destination(&self) -> Option<&str> {
-            self.fields.transport.as_ref().and_then(|t| t.destination.as_deref())
+            self.fields
+                .transport
+                .as_ref()
+                .and_then(|t| t.destination.as_deref())
         }
         fn set_transport_destination(&mut self, dest: Option<String>) {
             if dest.is_some() || self.fields.transport.is_some() {
-                let t = self.fields.transport.get_or_insert_with(|| Box::new(TransportInfo::default()));
+                let t = self
+                    .fields
+                    .transport
+                    .get_or_insert_with(|| Box::new(TransportInfo::default()));
                 t.destination = dest;
             }
         }
@@ -688,7 +702,9 @@ impl fmt::Display for ErrorFrame {
         write!(
             f,
             "{}(error: {}, fatal: {})",
-            self.name(), self.error, self.fatal
+            self.name(),
+            self.error,
+            self.fatal
         )
     }
 }
@@ -714,11 +730,7 @@ impl FatalErrorFrame {
 
 impl fmt::Display for FatalErrorFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}(error: {}, fatal: true)",
-            self.name(), self.error
-        )
+        write!(f, "{}(error: {}, fatal: true)", self.name(), self.error)
     }
 }
 
@@ -1170,7 +1182,11 @@ impl fmt::Display for UserImageRequestFrame {
         write!(
             f,
             "{}(user: {}, text: {:?}, append_to_context: {:?}, video_source: {:?})",
-            self.name(), self.user_id, self.text, self.append_to_context, self.video_source
+            self.name(),
+            self.user_id,
+            self.text,
+            self.append_to_context,
+            self.video_source
         )
     }
 }
@@ -1609,7 +1625,11 @@ impl fmt::Display for TranscriptionFrame {
         write!(
             f,
             "{}(user: {}, text: [{}], language: {:?}, timestamp: {})",
-            self.name(), self.user_id, self.text, self.language, self.timestamp
+            self.name(),
+            self.user_id,
+            self.text,
+            self.language,
+            self.timestamp
         )
     }
 }
@@ -1654,7 +1674,11 @@ impl fmt::Display for InterimTranscriptionFrame {
         write!(
             f,
             "{}(user: {}, text: [{}], language: {:?}, timestamp: {})",
-            self.name(), self.user_id, self.text, self.language, self.timestamp
+            self.name(),
+            self.user_id,
+            self.text,
+            self.language,
+            self.timestamp
         )
     }
 }
@@ -2635,8 +2659,8 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_ref() {
-        let frame: FrameRef = Arc::new(TextFrame::new("arc test".to_string()));
+    fn test_arc_dyn_frame() {
+        let frame: Arc<dyn Frame> = Arc::new(TextFrame::new("arc test".to_string()));
         assert!(frame.is_data_frame());
         let text = frame.downcast_ref::<TextFrame>().unwrap();
         assert_eq!(text.text, "arc test");

@@ -185,13 +185,13 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
 
     let llm = OpenAILLMService::new(&state.openai_api_key, "gpt-4o-mini").with_temperature(0.7);
 
-    // Cartesia TTS
-    let tts =
-        CartesiaTTSService::new(&state.cartesia_api_key, "a0e99841-438c-4a64-b679-ae501e7d6091")
-            .with_model("sonic-3");
-    // -- OR swap to ElevenLabs: --
-    // use pipecat::services::elevenlabs::ElevenLabsTTSService;
-    // let tts = ElevenLabsTTSService::new("your-elevenlabs-api-key", "voice-id");
+    let tts = CartesiaTTSService::new(
+        &state.cartesia_api_key,
+        "79a125e8-cd45-4c13-8a67-188112f4dd22",
+    )
+    .with_model("sonic-3")
+    .with_sample_rate(8000)
+    .with_encoding("pcm_s16le");
 
     let system_prompt = "You are a friendly and helpful AI phone assistant. \
         Keep your responses concise and conversational - you're on a phone call. \
