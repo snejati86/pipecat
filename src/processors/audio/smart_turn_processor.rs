@@ -306,6 +306,10 @@ impl Processor for SmartTurnProcessor {
             }
 
             FrameEnum::UserStartedSpeaking(_) => {
+                tracing::debug!(
+                    pending_stop = self.pending_stop.is_some(),
+                    "SmartTurn: received UserStartedSpeaking"
+                );
                 if self.pending_stop.is_some() {
                     // User resumed speaking, cancel the pending stop
                     tracing::debug!("SmartTurn: user resumed speaking, cancelling pending stop");

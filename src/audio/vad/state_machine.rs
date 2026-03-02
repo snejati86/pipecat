@@ -95,6 +95,25 @@ impl VADStateMachine {
         self.initialized = true;
     }
 
+    /// Override the analysis window size for external VAD backends.
+    ///
+    /// The default analysis window is 10ms (`sample_rate / 100`). When using
+    /// an external model like Silero VAD that processes larger chunks (e.g.
+    /// 512 samples = 32ms at 16kHz), call this after [`set_sample_rate`] so
+    /// the start/stop frame counts are calculated correctly.
+    pub fn set_analysis_window(&mut self, samples: u32) {
+        self.vad_frames = samples;
+        self.vad_frames_num_bytes = (samples as usize)
+            .saturating_mul(self.num_channels as usize)
+            .saturating_mul(2);
+        // Recalculate start/stop thresholds with the new window size.
+        if self.sample_rate > 0 && self.vad_frames > 0 {
+            let window_secs = self.vad_frames as f64 / self.sample_rate as f64;
+            self.vad_start_frames = (self.params.start_secs / window_secs).round() as u32;
+            self.vad_stop_frames = (self.params.stop_secs / window_secs).round() as u32;
+        }
+    }
+
     /// Update the VAD parameters and reset the state machine.
     ///
     /// Recalculates timing thresholds from the new params and resets the state

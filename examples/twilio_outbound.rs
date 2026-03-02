@@ -207,14 +207,9 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     let llm = OpenAILLMService::new(&state.openai_api_key, "gpt-4o-mini").with_temperature(0.7);
 
     // Cartesia TTS -- Sonic 3 model, 24kHz PCM
-    let mut tts =
+    let tts =
         CartesiaTTSService::new(&state.cartesia_api_key, "a0e99841-438c-4a64-b679-ae501e7d6091")
             .with_model("sonic-3");
-
-    // Pre-connect Cartesia WebSocket to avoid cold-start latency on first TTS request.
-    if let Err(e) = tts.connect().await {
-        tracing::warn!("Failed to pre-connect Cartesia: {e}");
-    }
 
     // Watch channel for bot-speaking detection (writer task → mute processor)
     let (bot_speaking_tx, bot_speaking_rx) = tokio::sync::watch::channel(false);
@@ -246,9 +241,13 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     processors.push(Box::new(mute_processor));
 
     // Silero VAD: neural speech detection (8kHz Twilio audio is resampled to 16kHz internally)
+    // start_secs=0.3 filters false triggers from telephony call-setup noise (~260ms burst).
     #[cfg(feature = "silero-vad")]
     {
-        let vad = SileroVADProcessor::new(VADParams::default());
+        let vad = SileroVADProcessor::new(VADParams {
+            start_secs: 0.3,
+            ..VADParams::default()
+        });
         processors.push(Box::new(vad));
         tracing::info!("Silero VAD enabled");
     }

@@ -54,6 +54,9 @@ impl SileroVADProcessor {
     fn init_resampler(&mut self, input_sample_rate: u32) {
         self.input_sample_rate = input_sample_rate;
         self.state_machine.set_sample_rate(TARGET_SAMPLE_RATE);
+        // Silero processes 512-sample chunks, not 10ms (160-sample) windows.
+        self.state_machine
+            .set_analysis_window(SILERO_CHUNK_SAMPLES as u32);
 
         if AudioResampler::needs_resampling(input_sample_rate) {
             self.resampler = Some(AudioResampler::new(input_sample_rate));
