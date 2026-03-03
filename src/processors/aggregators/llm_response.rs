@@ -506,12 +506,13 @@ impl Processor for LLMAssistantContextAggregator {
         ctx: &ProcessorContext,
     ) {
         match frame {
-            // LLMFullResponseStartFrame -- increment depth; consumed (NOT forwarded)
+            // LLMFullResponseStartFrame -- increment depth, forward downstream.
             FrameEnum::LLMFullResponseStart(_) => {
                 self.response_depth += 1;
+                ctx.send(frame, direction);
             }
 
-            // LLMFullResponseEndFrame -- decrement depth; if 0 → push aggregation; consumed
+            // LLMFullResponseEndFrame -- decrement depth; if 0 → push aggregation; forward downstream.
             FrameEnum::LLMFullResponseEnd(_) => {
                 if self.response_depth > 0 {
                     self.response_depth -= 1;
@@ -519,6 +520,7 @@ impl Processor for LLMAssistantContextAggregator {
                 if self.response_depth == 0 {
                     self.push_aggregation(ctx).await;
                 }
+                ctx.send(frame, direction);
             }
 
             // TextFrame / LLMTextFrame -- accumulate when inside a response; always pass through
@@ -763,14 +765,15 @@ mod tests {
         let mut agg = LLMAssistantContextAggregator::new(context.clone());
         let (ctx, mut drx, _urx) = make_ctx();
 
-        // Start response (consumed)
+        // Start response (forwarded downstream)
         agg.process(
             FrameEnum::LLMFullResponseStart(LLMFullResponseStartFrame::new()),
             FrameDirection::Downstream,
             &ctx,
         )
         .await;
-        assert!(drx.try_recv().is_err()); // start is consumed
+        let start = drx.try_recv().unwrap();
+        assert!(matches!(start, FrameEnum::LLMFullResponseStart(_)));
 
         // Text frames (passed through)
         agg.process(
@@ -797,7 +800,7 @@ mod tests {
         .await;
         let _ = drx.try_recv().unwrap();
 
-        // End response (consumed, triggers push_aggregation)
+        // End response (triggers push_aggregation, then forwarded)
         agg.process(
             FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()),
             FrameDirection::Downstream,
@@ -805,7 +808,7 @@ mod tests {
         )
         .await;
 
-        // Should have pushed an LLMMessagesAppend frame
+        // Should have pushed an LLMMessagesAppend frame, then the EndFrame
         let append = drx.try_recv().unwrap();
         match append {
             FrameEnum::LLMMessagesAppend(a) => {
@@ -814,6 +817,10 @@ mod tests {
             }
             _ => panic!("Expected LLMMessagesAppend"),
         }
+
+        // EndFrame forwarded after the append
+        let end = drx.try_recv().unwrap();
+        assert!(matches!(end, FrameEnum::LLMFullResponseEnd(_)));
 
         // Context should have the assistant message
         let c = context.lock().await;
@@ -828,13 +835,14 @@ mod tests {
         let mut agg = LLMAssistantContextAggregator::new(context.clone());
         let (ctx, mut drx, _urx) = make_ctx();
 
-        // Start response
+        // Start response (forwarded)
         agg.process(
             FrameEnum::LLMFullResponseStart(LLMFullResponseStartFrame::new()),
             FrameDirection::Downstream,
             &ctx,
         )
         .await;
+        let _ = drx.try_recv().unwrap(); // consume forwarded start
 
         // Accumulate some text
         agg.process(
@@ -872,19 +880,21 @@ mod tests {
         let mut agg = LLMAssistantContextAggregator::new(context.clone());
         let (ctx, mut drx, _urx) = make_ctx();
 
-        // Nested start
+        // Nested start (both forwarded)
         agg.process(
             FrameEnum::LLMFullResponseStart(LLMFullResponseStartFrame::new()),
             FrameDirection::Downstream,
             &ctx,
         )
         .await;
+        let _ = drx.try_recv().unwrap(); // forwarded start 1
         agg.process(
             FrameEnum::LLMFullResponseStart(LLMFullResponseStartFrame::new()),
             FrameDirection::Downstream,
             &ctx,
         )
         .await;
+        let _ = drx.try_recv().unwrap(); // forwarded start 2
 
         agg.process(
             FrameEnum::Text(TextFrame::new("Nested")),
@@ -894,16 +904,18 @@ mod tests {
         .await;
         let _ = drx.try_recv().unwrap(); // text pass-through
 
-        // First end -- depth goes from 2 to 1, no flush
+        // First end -- depth goes from 2 to 1, no flush but forwarded
         agg.process(
             FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()),
             FrameDirection::Downstream,
             &ctx,
         )
         .await;
-        assert!(drx.try_recv().is_err()); // no flush yet
+        let end1 = drx.try_recv().unwrap();
+        assert!(matches!(end1, FrameEnum::LLMFullResponseEnd(_))); // forwarded, no flush
+        assert!(drx.try_recv().is_err()); // no append yet
 
-        // Second end -- depth goes from 1 to 0, flush
+        // Second end -- depth goes from 1 to 0, flush then forwarded
         agg.process(
             FrameEnum::LLMFullResponseEnd(LLMFullResponseEndFrame::new()),
             FrameDirection::Downstream,

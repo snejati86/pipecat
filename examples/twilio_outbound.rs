@@ -21,7 +21,7 @@
 //!
 //! [Twilio WS Input] -> [Silero VAD*] -> [Smart Turn*] -> [Deepgram STT]
 //!        -> [VAD Turn Start] -> [User Context Aggregator] -> [OpenAI LLM]
-//!        -> [ElevenLabs TTS] -> [Assistant Context Aggregator] -> [Output]
+//!        -> [Assistant Context Aggregator] -> [ElevenLabs TTS] -> [Output]
 //!
 //! * Silero VAD enabled with `--features silero-vad`
 //! * Smart Turn enabled with `--features smart-turn` (includes silero-vad)
@@ -207,8 +207,9 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
 
     // Build processor chain:
     //   [Mute*] -> [VAD*] -> [Smart Turn*] -> STT -> VAD Turn Start
-    //   -> User Context -> LLM -> Sentence Aggregator -> TTS -> Assistant Context
+    //   -> User Context -> LLM -> Sentence Aggregator -> Assistant Context -> TTS
     //
+    // Assistant Context goes BEFORE TTS so it sees TextFrames (TTS consumes them).
     // * Mute is auto-added by TelephonySession when enable_mute is true
     let mut processors: Vec<Box<dyn Processor>> = Vec::new();
 
@@ -237,8 +238,8 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     processors.push(Box::new(pair.user_aggregator));
     processors.push(Box::new(llm));
     processors.push(Box::new(SentenceAggregator::new()));
-    processors.push(Box::new(tts));
     processors.push(Box::new(pair.assistant_aggregator));
+    processors.push(Box::new(tts));
 
     // Step 3: Run the session (handles reader/writer tasks, lifecycle, shutdown)
     session
