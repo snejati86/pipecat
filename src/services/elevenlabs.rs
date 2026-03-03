@@ -49,7 +49,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -241,15 +241,20 @@ type WsReader = futures_util::stream::SplitStream<WsStream>;
 
 /// ElevenLabs TTS service using WebSocket streaming.
 ///
-/// Supports two modes:
+/// Uses a single persistent WebSocket connection for the entire call duration.
+/// One ElevenLabs "context" is opened per LLM turn (not per sentence), keeping
+/// concurrent context count to 1 and avoiding the `max_active_conversations`
+/// limit (5 per connection).
 ///
-/// - **Token streaming**: Receives `LLMFullResponseStart` → `LLMTextFrame` tokens
-///   → `LLMFullResponseEnd`. Streams each token directly to ElevenLabs' WebSocket,
-///   letting ElevenLabs handle text buffering internally. A background reader task
-///   decodes audio and sends `OutputAudioRawFrame`s downstream.
+/// Frame flow (with SentenceAggregator upstream):
+/// - `LLMFullResponseStart` → open context (init message), emit `TTSStarted`
+/// - `TextFrame` (per sentence) → append text to the turn's context
+/// - `LLMFullResponseEnd` → flush context, audio continues via reader task
+/// - `InterruptionFrame` → close context to cancel in-flight generation
 ///
-/// - **Sentence mode** (legacy): Receives a `TextFrame` with complete text.
-///   Sends init + text + flush in one shot; reader task handles audio delivery.
+/// A background reader task decodes audio from the WebSocket and sends
+/// `OutputAudioRawFrame`s downstream. A keepalive task sends pings every 15s
+/// to prevent the connection from timing out during silence.
 pub struct ElevenLabsTTSService {
     id: u64,
     name: String,
@@ -262,13 +267,17 @@ pub struct ElevenLabsTTSService {
     params: ElevenLabsInputParams,
 
     /// WebSocket writer half (send side of the split connection).
-    ws_writer: Option<WsWriter>,
+    /// Wrapped in Arc<tokio::sync::Mutex> so the keepalive task can also write.
+    ws_writer: Arc<tokio::sync::Mutex<Option<WsWriter>>>,
 
     /// WebSocket reader half, stored temporarily until the reader task is spawned.
     ws_reader: Option<WsReader>,
 
     /// Background task that reads WS responses and sends audio frames downstream.
     reader_task: Option<JoinHandle<()>>,
+
+    /// Background task that sends periodic keepalive pings to prevent WS timeout.
+    keepalive_task: Option<JoinHandle<()>>,
 
     /// Downstream sender captured from ProcessorContext on first process() call.
     down_tx: Option<mpsc::UnboundedSender<FrameEnum>>,
@@ -312,9 +321,10 @@ impl ElevenLabsTTSService {
             sample_rate,
             ws_url: Self::DEFAULT_WS_BASE_URL.to_string(),
             params: ElevenLabsInputParams::default(),
-            ws_writer: None,
+            ws_writer: Arc::new(tokio::sync::Mutex::new(None)),
             ws_reader: None,
             reader_task: None,
+            keepalive_task: None,
             down_tx: None,
             current_context_id: Arc::new(StdMutex::new(None)),
             token_streaming: false,
@@ -407,7 +417,7 @@ impl ElevenLabsTTSService {
     /// handled via the `xi-api-key` header in `connect()`.
     fn build_ws_url(&self) -> String {
         let mut url = format!(
-            "{}/v1/text-to-speech/{}/multi-stream-input?model_id={}&output_format={}&auto_mode=true",
+            "{}/v1/text-to-speech/{}/multi-stream-input?model_id={}&output_format={}&auto_mode=true&inactivity_timeout=180",
             self.ws_url, self.voice_id, self.model, self.output_format
         );
         if let Some(latency) = self.params.optimize_streaming_latency {
@@ -445,7 +455,7 @@ impl ElevenLabsTTSService {
     /// stored in `ws_reader` until `ensure_reader_spawned()` moves it into a
     /// background task.
     pub async fn connect(&mut self) -> Result<(), String> {
-        if self.ws_writer.is_some() {
+        if self.ws_writer.lock().await.is_some() {
             return Ok(());
         }
 
@@ -462,9 +472,13 @@ impl ElevenLabsTTSService {
             Ok(Ok((stream, _response))) => {
                 tracing::info!(service = %self.name, "Connected to ElevenLabs WebSocket");
                 let (sink, reader) = stream.split();
-                self.ws_writer = Some(sink);
+                *self.ws_writer.lock().await = Some(sink);
                 self.ws_reader = Some(reader);
                 *self.current_context_id.lock().unwrap() = None;
+
+                // Spawn keepalive task — sends a space every 15s to prevent WS timeout
+                self.spawn_keepalive_task();
+
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -482,18 +496,24 @@ impl ElevenLabsTTSService {
 
     /// Disconnect the WebSocket and stop the reader task.
     pub async fn disconnect(&mut self) {
-        if let Some(ref mut writer) = self.ws_writer {
-            tracing::debug!(service = %self.name, "Disconnecting from ElevenLabs WebSocket");
-            let close_msg = ElevenLabsWsCloseSocket { close_socket: true };
-            if let Ok(json) = serde_json::to_string(&close_msg) {
-                let _ = writer.send(WsMessage::Text(json)).await;
+        {
+            let mut writer_guard = self.ws_writer.lock().await;
+            if let Some(ref mut writer) = *writer_guard {
+                tracing::debug!(service = %self.name, "Disconnecting from ElevenLabs WebSocket");
+                let close_msg = ElevenLabsWsCloseSocket { close_socket: true };
+                if let Ok(json) = serde_json::to_string(&close_msg) {
+                    let _ = writer.send(WsMessage::Text(json)).await;
+                }
+                let _ = writer.close().await;
             }
-            let _ = writer.close().await;
+            *writer_guard = None;
         }
-        self.ws_writer = None;
         self.ws_reader = None;
         *self.current_context_id.lock().unwrap() = None;
         self.token_streaming = false;
+        if let Some(task) = self.keepalive_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.reader_task.take() {
             task.abort();
         }
@@ -555,12 +575,46 @@ impl ElevenLabsTTSService {
         )));
     }
 
+    /// Spawn a background task that sends periodic keepalive pings.
+    ///
+    /// ElevenLabs closes idle WebSocket connections after `inactivity_timeout` seconds
+    /// (default 20s, we set 180s in the URL). This task sends a space character every
+    /// 15 seconds to keep the connection alive indefinitely.
+    fn spawn_keepalive_task(&mut self) {
+        if let Some(task) = self.keepalive_task.take() {
+            task.abort();
+        }
+        let writer = Arc::clone(&self.ws_writer);
+        let service_name = self.name.clone();
+        self.keepalive_task = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.tick().await; // skip first immediate tick
+            loop {
+                interval.tick().await;
+                let mut guard = writer.lock().await;
+                if let Some(ref mut w) = *guard {
+                    let msg = serde_json::json!({"text": " "}).to_string();
+                    if w.send(WsMessage::Text(msg)).await.is_err() {
+                        tracing::debug!(service = %service_name, "Keepalive: send failed, connection likely closed");
+                        break;
+                    }
+                    tracing::trace!(service = %service_name, "Keepalive: sent ping");
+                } else {
+                    break;
+                }
+            }
+        }));
+    }
+
     /// Handle a WebSocket write error by clearing connection state.
-    fn handle_ws_error(&mut self) {
-        self.ws_writer = None;
+    async fn handle_ws_error(&mut self) {
+        *self.ws_writer.lock().await = None;
         self.ws_reader = None;
         *self.current_context_id.lock().unwrap() = None;
         self.token_streaming = false;
+        if let Some(task) = self.keepalive_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.reader_task.take() {
             task.abort();
         }
@@ -894,50 +948,160 @@ impl Processor for ElevenLabsTTSService {
         ctx: &ProcessorContext,
     ) {
         match frame {
-            // ----- Token streaming: LLM response lifecycle -----
+            // ----- LLM response lifecycle (one context per turn) -----
             FrameEnum::LLMFullResponseStart(_) => {
                 // Capture downstream sender on first call.
                 if self.down_tx.is_none() {
                     self.down_tx = Some(ctx.downstream_sender());
                 }
 
-                // Auto-connect and spawn reader (needed for TextFrame sentence mode too).
+                // Auto-connect and spawn reader.
                 if let Err(e) = self.connect().await {
                     ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
                     return;
                 }
                 self.ensure_reader_spawned();
 
-                // Pass through — actual TTS work happens in TextFrame (sentence mode)
-                // or LLMTextFrame (token streaming mode, when no SentenceAggregator).
+                // Open a single context for this entire LLM turn.
+                // All TextFrames (from SentenceAggregator) will append to this context.
+                let context_id = generate_context_id();
+                *self.current_context_id.lock().unwrap() = Some(context_id.clone());
+
+                let init = ElevenLabsWsContextInit {
+                    text: " ".to_string(),
+                    context_id: context_id.clone(),
+                    voice_settings: self.build_voice_settings(),
+                    generation_config: self.build_generation_config(),
+                };
+                let send_result = {
+                    let mut guard = self.ws_writer.lock().await;
+                    if let Some(ref mut writer) = *guard {
+                        match serde_json::to_string(&init) {
+                            Ok(json) => writer.send(WsMessage::Text(json)).await,
+                            Err(_) => Ok(()),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(e) = send_result {
+                    tracing::error!(service = %self.name, "Failed to send context init: {e}");
+                    self.handle_ws_error().await;
+                    return;
+                }
+
+                self.token_streaming = true;
+                tracing::debug!(
+                    service = %self.name,
+                    context_id = %context_id,
+                    "Opened TTS context for LLM turn"
+                );
+
+                ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+                    context_id,
+                ))));
                 ctx.send_downstream(frame);
             }
 
-            FrameEnum::LLMText(ref t) => {
-                if self.token_streaming && !t.text.is_empty() {
+            // TextFrame from SentenceAggregator — append to the turn's context.
+            FrameEnum::Text(ref t) if !t.text.is_empty() => {
+                if self.token_streaming {
                     let ctx_id = self.current_context_id.lock().unwrap().clone();
                     if let Some(ref cid) = ctx_id {
                         let text_msg = ElevenLabsWsText {
                             text: t.text.clone(),
                             context_id: cid.clone(),
                         };
-                        let send_result = if let Some(ref mut writer) = self.ws_writer {
-                            match serde_json::to_string(&text_msg) {
-                                Ok(json) => writer.send(WsMessage::Text(json)).await,
-                                Err(_) => Ok(()),
+                        let send_result = {
+                            let mut guard = self.ws_writer.lock().await;
+                            if let Some(ref mut writer) = *guard {
+                                match serde_json::to_string(&text_msg) {
+                                    Ok(json) => writer.send(WsMessage::Text(json)).await,
+                                    Err(_) => Ok(()),
+                                }
+                            } else {
+                                Ok(())
                             }
-                        } else {
-                            Ok(())
                         };
                         if let Err(e) = send_result {
-                            tracing::error!(service = %self.name, "Failed to send LLM text: {e}");
-                            self.handle_ws_error();
+                            tracing::error!(service = %self.name, "Failed to send TTS text: {e}");
+                            self.handle_ws_error().await;
+                            return;
+                        }
+                        tracing::debug!(
+                            service = %self.name,
+                            text = %t.text,
+                            context_id = %cid,
+                            "Appended text to TTS context"
+                        );
+                    }
+                    // TextFrame consumed by TTS — not forwarded downstream.
+                } else {
+                    // Standalone TextFrame outside LLM cycle — one-shot context.
+                    if self.down_tx.is_none() {
+                        self.down_tx = Some(ctx.downstream_sender());
+                    }
+                    if let Err(e) = self.connect().await {
+                        ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
+                        return;
+                    }
+                    self.ensure_reader_spawned();
+
+                    let context_id = generate_context_id();
+                    *self.current_context_id.lock().unwrap() = Some(context_id.clone());
+
+                    let init = ElevenLabsWsContextInit {
+                        text: " ".to_string(),
+                        context_id: context_id.clone(),
+                        voice_settings: self.build_voice_settings(),
+                        generation_config: self.build_generation_config(),
+                    };
+                    let text_msg = ElevenLabsWsText {
+                        text: t.text.clone(),
+                        context_id: context_id.clone(),
+                    };
+                    let flush = ElevenLabsWsFlush {
+                        text: " ".to_string(),
+                        context_id: context_id.clone(),
+                        flush: true,
+                    };
+
+                    for json in [
+                        serde_json::to_string(&init),
+                        serde_json::to_string(&text_msg),
+                        serde_json::to_string(&flush),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let send_result = {
+                            let mut guard = self.ws_writer.lock().await;
+                            if let Some(ref mut writer) = *guard {
+                                writer.send(WsMessage::Text(json)).await
+                            } else {
+                                break;
+                            }
+                        };
+                        if let Err(e) = send_result {
+                            tracing::error!(service = %self.name, "Failed to send TTS message: {e}");
+                            self.handle_ws_error().await;
+                            return;
                         }
                     }
+
+                    tracing::debug!(
+                        service = %self.name,
+                        text = %t.text,
+                        context_id = %context_id,
+                        "Sent one-shot TTS request"
+                    );
+                    ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
+                        context_id,
+                    ))));
                 }
-                ctx.send_downstream(frame);
             }
 
+            // LLMFullResponseEnd — flush the turn's context.
             FrameEnum::LLMFullResponseEnd(_) => {
                 if self.token_streaming {
                     let ctx_id = self.current_context_id.lock().unwrap().clone();
@@ -947,90 +1111,26 @@ impl Processor for ElevenLabsTTSService {
                             context_id: cid.clone(),
                             flush: true,
                         };
-                        let send_result = if let Some(ref mut writer) = self.ws_writer {
-                            match serde_json::to_string(&flush) {
-                                Ok(json) => writer.send(WsMessage::Text(json)).await,
-                                Err(_) => Ok(()),
+                        let send_result = {
+                            let mut guard = self.ws_writer.lock().await;
+                            if let Some(ref mut writer) = *guard {
+                                match serde_json::to_string(&flush) {
+                                    Ok(json) => writer.send(WsMessage::Text(json)).await,
+                                    Err(_) => Ok(()),
+                                }
+                            } else {
+                                Ok(())
                             }
-                        } else {
-                            Ok(())
                         };
                         if let Err(e) = send_result {
                             tracing::error!(service = %self.name, "Failed to send flush: {e}");
-                            self.handle_ws_error();
+                            self.handle_ws_error().await;
                         }
                     }
                     self.token_streaming = false;
-                    tracing::debug!(service = %self.name, "Flushed token streaming context");
+                    tracing::debug!(service = %self.name, "Flushed TTS context (LLM turn complete)");
                 }
                 ctx.send_downstream(frame);
-            }
-
-            // ----- Sentence mode (legacy): complete text in one frame -----
-            FrameEnum::Text(ref t) if !t.text.is_empty() => {
-                if self.down_tx.is_none() {
-                    self.down_tx = Some(ctx.downstream_sender());
-                }
-                if let Err(e) = self.connect().await {
-                    ctx.send_upstream(FrameEnum::Error(ErrorFrame::new(e, false)));
-                    return;
-                }
-                self.ensure_reader_spawned();
-
-                let context_id = generate_context_id();
-                *self.current_context_id.lock().unwrap() = Some(context_id.clone());
-
-                // Send init + text + flush in one shot.
-                let init = ElevenLabsWsContextInit {
-                    text: " ".to_string(),
-                    context_id: context_id.clone(),
-                    voice_settings: self.build_voice_settings(),
-                    generation_config: self.build_generation_config(),
-                };
-                let text_msg = ElevenLabsWsText {
-                    text: t.text.clone(),
-                    context_id: context_id.clone(),
-                };
-                let flush = ElevenLabsWsFlush {
-                    text: " ".to_string(),
-                    context_id: context_id.clone(),
-                    flush: true,
-                };
-
-                for json in [
-                    serde_json::to_string(&init),
-                    serde_json::to_string(&text_msg),
-                    serde_json::to_string(&flush),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    let send_result = if let Some(ref mut writer) = self.ws_writer {
-                        writer.send(WsMessage::Text(json)).await
-                    } else {
-                        break;
-                    };
-                    if let Err(e) = send_result {
-                        tracing::error!(
-                            service = %self.name,
-                            "Failed to send TTS message: {e}"
-                        );
-                        self.handle_ws_error();
-                        return;
-                    }
-                }
-
-                tracing::debug!(
-                    service = %self.name,
-                    text = %t.text,
-                    context_id = %context_id,
-                    "Sent TTS request (sentence mode)"
-                );
-
-                ctx.send_downstream(FrameEnum::TTSStarted(TTSStartedFrame::new(Some(
-                    context_id,
-                ))));
-                // TTSStopped comes from the reader task when isFinal is received.
             }
 
             // ----- Lifecycle -----
@@ -1058,13 +1158,16 @@ impl Processor for ElevenLabsTTSService {
                         context_id: cid.clone(),
                         close_context: true,
                     };
-                    let send_result = if let Some(ref mut writer) = self.ws_writer {
-                        match serde_json::to_string(&close_msg) {
-                            Ok(json) => writer.send(WsMessage::Text(json)).await,
-                            Err(_) => Ok(()),
+                    let send_result = {
+                        let mut guard = self.ws_writer.lock().await;
+                        if let Some(ref mut writer) = *guard {
+                            match serde_json::to_string(&close_msg) {
+                                Ok(json) => writer.send(WsMessage::Text(json)).await,
+                                Err(_) => Ok(()),
+                            }
+                        } else {
+                            Ok(())
                         }
-                    } else {
-                        Ok(())
                     };
                     match send_result {
                         Ok(()) => {
