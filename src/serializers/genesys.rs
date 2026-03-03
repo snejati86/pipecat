@@ -613,10 +613,7 @@ impl FrameSerializer for GenesysFrameSerializer {
             // EndFrame and CancelFrame are ignored (lifecycle managed via protocol).
             FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
             other => {
-                warn!(
-                    "GenesysFrameSerializer: unsupported frame type '{}'",
-                    other
-                );
+                warn!("GenesysFrameSerializer: unsupported frame type '{}'", other);
                 None
             }
         }
@@ -804,7 +801,7 @@ impl GenesysFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // -----------------------------------------------------------------------
     // Constructor tests
     // -----------------------------------------------------------------------

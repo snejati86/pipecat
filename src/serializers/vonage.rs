@@ -324,10 +324,7 @@ impl FrameSerializer for VonageFrameSerializer {
             // EndFrame and CancelFrame are ignored (hang-up is done externally).
             FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
             other => {
-                warn!(
-                    "VonageFrameSerializer: unsupported frame type '{}'",
-                    other
-                );
+                warn!("VonageFrameSerializer: unsupported frame type '{}'", other);
                 None
             }
         }
@@ -356,7 +353,7 @@ impl FrameSerializer for VonageFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // -----------------------------------------------------------------------
     // Constructor tests
     // -----------------------------------------------------------------------

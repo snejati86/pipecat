@@ -349,7 +349,7 @@ impl FrameSerializer for PlivoFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // -----------------------------------------------------------------------
     // mu-law codec unit tests
     // -----------------------------------------------------------------------

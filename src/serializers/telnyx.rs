@@ -310,10 +310,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
             // EndFrame and CancelFrame are ignored (hang-up is done externally).
             FrameEnum::End(_) | FrameEnum::Cancel(_) => None,
             other => {
-                warn!(
-                    "TelnyxFrameSerializer: unsupported frame type '{}'",
-                    other
-                );
+                warn!("TelnyxFrameSerializer: unsupported frame type '{}'", other);
                 None
             }
         }
@@ -377,7 +374,7 @@ impl FrameSerializer for TelnyxFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // -----------------------------------------------------------------------
     // Mu-law codec tests
     // -----------------------------------------------------------------------

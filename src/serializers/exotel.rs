@@ -466,7 +466,7 @@ impl FrameSerializer for ExotelFrameSerializer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // -----------------------------------------------------------------------
     // Mu-law codec unit tests
     // -----------------------------------------------------------------------

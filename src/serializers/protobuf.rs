@@ -556,10 +556,7 @@ mod tests {
     fn test_roundtrip_end_frame() {
         let serializer = ProtobufFrameSerializer::new();
         let frame = FrameEnum::from(EndFrame::new());
-        assert!(matches!(
-            roundtrip(&serializer, &frame),
-            FrameEnum::End(_)
-        ));
+        assert!(matches!(roundtrip(&serializer, &frame), FrameEnum::End(_)));
     }
 
     #[test]
@@ -587,8 +584,7 @@ mod tests {
     #[test]
     fn test_roundtrip_error_frame() {
         let serializer = ProtobufFrameSerializer::new();
-        let frame =
-            FrameEnum::from(ErrorFrame::new("something went wrong".to_string(), false));
+        let frame = FrameEnum::from(ErrorFrame::new("something went wrong".to_string(), false));
 
         match &roundtrip(&serializer, &frame) {
             FrameEnum::Error(ef) => {
@@ -686,8 +682,7 @@ mod tests {
         let serializer = ProtobufFrameSerializer::new();
         let audio_data = vec![1u8, 2, 3, 4];
 
-        let input_frame =
-            FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
+        let input_frame = FrameEnum::from(InputAudioRawFrame::new(audio_data.clone(), 16000, 1));
         let input_deserialized = roundtrip(&serializer, &input_frame);
 
         let output_frame = FrameEnum::from(OutputAudioRawFrame::new(audio_data, 16000, 1));
